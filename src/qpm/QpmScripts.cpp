@@ -1,5 +1,6 @@
 #include "QpmScripts.h"
 #include "QpmJson.h"
+#include "QpmManifest.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -21,14 +22,6 @@ namespace qpm
 {
     namespace
     {
-        std::string readFile(const fs::path &p)
-        {
-            std::ifstream f(p, std::ios::binary);
-            std::ostringstream ss;
-            ss << f.rdbuf();
-            return ss.str();
-        }
-
         std::wstring utf8ToWide(const std::string &s)
         {
             if (s.empty())
@@ -43,10 +36,11 @@ namespace qpm
     int runScript(const std::string &projectDirStr, const std::string &scriptName)
     {
         fs::path projectDir = fs::absolute(projectDirStr);
-        fs::path pkgJsonPath = projectDir / "package.json";
-        if (!fs::exists(pkgJsonPath))
+        fs::path manifestPath = findManifest(projectDir);
+        if (manifestPath.empty())
         {
-            std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+            std::cerr << "[qpm] no package.qon, package.json or requirements.txt found in "
+                      << projectDir.string() << "\n"
                       << "[qpm] run `qpm init` to create one\n";
             return 1;
         }
@@ -54,11 +48,11 @@ namespace qpm
         JsonValue pkgJson;
         try
         {
-            pkgJson = JsonValue::parse(readFile(pkgJsonPath));
+            pkgJson = loadManifest(manifestPath).data;
         }
         catch (const std::exception &e)
         {
-            std::cerr << "[qpm] failed to parse package.json: " << e.what() << "\n";
+            std::cerr << "[qpm] failed to parse " << e.what() << "\n";
             return 1;
         }
 

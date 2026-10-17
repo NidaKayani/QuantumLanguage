@@ -1,5 +1,6 @@
 #include "QpmResolver.h"
 #include "QpmJson.h"
+#include "QpmManifest.h"
 #include "QpmHttp.h"
 #include "QpmRegistry.h"
 #include "QpmSemver.h"
@@ -430,19 +431,19 @@ namespace qpm
     int runInstall(const InstallOptions &opts)
     {
         fs::path projectDir = fs::absolute(opts.projectDir);
-        fs::path pkgJsonPath = projectDir / "package.json";
-        bool existed = fs::exists(pkgJsonPath);
+        fs::path manifestPath = findManifest(projectDir);
+        bool existed = !manifestPath.empty();
 
-        JsonValue pkgJson;
+        Manifest manifest;
         if (existed)
         {
             try
             {
-                pkgJson = JsonValue::parse(readFile(pkgJsonPath));
+                manifest = loadManifest(manifestPath);
             }
             catch (const std::exception &e)
             {
-                std::cerr << "[qpm] failed to parse package.json: " << e.what() << "\n";
+                std::cerr << "[qpm] failed to parse " << e.what() << "\n";
                 return 1;
             }
         }
@@ -450,14 +451,16 @@ namespace qpm
         {
             if (opts.addPackages.empty())
             {
-                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                std::cerr << "[qpm] no package.qon, package.json or requirements.txt found in "
+                          << projectDir.string() << "\n"
                           << "[qpm] run `qpm init` to create one, or `qpm i <pkg>` to add a dependency\n";
                 return 1;
             }
-            pkgJson = JsonValue::makeObject();
-            pkgJson.set("name", projectDir.filename().string());
-            pkgJson.set("version", "1.0.0");
-            std::cout << "[qpm] no package.json found — creating a minimal one\n";
+            manifest.path = projectDir / "package.json";
+            manifest.data = JsonValue::makeObject();
+            manifest.data.set("name", projectDir.filename().string());
+            manifest.data.set("version", "1.0.0");
+            std::cout << "[qpm] no manifest found — creating a minimal package.json\n";
         }
 
         bool pkgJsonDirty = !existed;
@@ -505,16 +508,14 @@ namespace qpm
                     recordedRange = "latest";
             }
 
-            if (!pkgJson.has("dependencies"))
-                pkgJson.set("dependencies", JsonValue::makeObject());
-            JsonValue deps = pkgJson.get("dependencies");
-            deps.set(name, recordedRange);
-            pkgJson.set("dependencies", deps);
+            setDependency(manifest, name, recordedRange);
             pkgJsonDirty = true;
         }
 
         if (pkgJsonDirty)
-            writeFile(pkgJsonPath, pkgJson.stringify(2) + "\n");
+            writeFile(manifest.path, serializeManifest(manifest));
+
+        const JsonValue &pkgJson = manifest.data;
 
         JsonValue dependencies = pkgJson.get("dependencies");
         JsonValue devDependencies = pkgJson.get("devDependencies");

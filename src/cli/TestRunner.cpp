@@ -5,6 +5,7 @@
 #include "Parser.h"
 #include "Vm.h"
 #include "Error.h"
+#include "../qpm/QpmManifest.h"
 
 #include <algorithm>
 #include <chrono>
@@ -154,9 +155,10 @@ int runSingleFileForTest(const std::string &path)
 }
 
 // The package a test file belongs to: the nearest directory at or above it,
-// within the tested tree, that holds a package.json. Package files use paths
+// within the tested tree, that holds a manifest (package.qon, package.json or
+// requirements.txt). Package files use paths
 // relative to their package root (`data/sales.csv`, `../quantum-test`) — the
-// directory their package.json scripts run them from — so the runner runs
+// directory their manifest scripts run them from — so the runner runs
 // them there too. Empty for a file outside any package.
 static fs::path packageRootFor(const fs::path &file, const fs::path &testRoot)
 {
@@ -168,7 +170,7 @@ static fs::path packageRootFor(const fs::path &file, const fs::path &testRoot)
         fs::path rel = dir.lexically_relative(root);
         if (rel.empty() || *rel.begin() == "..")
             return {}; // left the tested tree
-        if (fs::is_regular_file(dir / "package.json", ec))
+        if (qpm::hasManifest(dir))
             return dir;
         if (dir == root || dir == dir.parent_path())
             return {};
