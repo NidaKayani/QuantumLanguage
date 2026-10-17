@@ -12,6 +12,10 @@ namespace qpm
     // Registry API base, always ending in '/' (e.g. "http://localhost:8000/api/registry/").
     std::string registryBaseUrl();
 
+    // Where `qpm install` looks up a package the registry answers 404 for:
+    // QPM_UPSTREAM if set, else the npm registry. "" when QPM_UPSTREAM=none.
+    std::string upstreamRegistryUrl();
+
     // Token for the current registry: the QPM_TOKEN environment variable if
     // set, else the one `qpm login` saved, else "".
     std::string authToken();

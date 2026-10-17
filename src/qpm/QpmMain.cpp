@@ -63,6 +63,8 @@ namespace
             "\n"
             "Environment:\n"
             "  QPM_REGISTRY   registry API base (default http://localhost:8000/api/registry/)\n"
+            "  QPM_UPSTREAM   where install looks up packages the registry doesn't have\n"
+            "                 (default https://registry.npmjs.org/, \"none\" to turn off)\n"
             "  QPM_TOKEN      auth token, overrides the one saved by `qpm login`\n"
             "\n"
             "qpm downloads packages straight from the registry — no npm or Node.js\n"

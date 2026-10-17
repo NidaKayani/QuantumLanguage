@@ -107,6 +107,66 @@ namespace qpm
             }
         }
 
+        // This machine as Node's process.platform / process.arch name it — the
+        // values npm packages list in their "os" / "cpu" fields.
+        std::string hostOs()
+        {
+#if defined(_WIN32)
+            return "win32";
+#elif defined(__APPLE__)
+            return "darwin";
+#elif defined(__linux__)
+            return "linux";
+#else
+            return "";
+#endif
+        }
+
+        std::string hostCpu()
+        {
+#if defined(_M_ARM64) || defined(__aarch64__)
+            return "arm64";
+#elif defined(_M_X64) || defined(__x86_64__)
+            return "x64";
+#elif defined(_M_IX86) || defined(__i386__)
+            return "ia32";
+#else
+            return "";
+#endif
+        }
+
+        // npm's check for an "os" / "cpu" field (npm-install-checks): the first
+        // entry naming `current` decides ("!name" excludes it); otherwise only a
+        // list made entirely of exclusions allows it. A missing field allows all.
+        bool platformListAllows(const JsonValue *field, const std::string &current)
+        {
+            std::vector<std::string> list;
+            if (field && field->isString())
+                list.push_back(field->asString());
+            else if (field && field->isArray())
+                for (const auto &e : field->array())
+                    list.push_back(e.asString());
+
+            if (list.size() == 1 && list[0] == "any")
+                return true;
+            size_t negated = 0;
+            for (const auto &entry : list)
+            {
+                bool negate = !entry.empty() && entry[0] == '!';
+                if ((negate ? entry.substr(1) : entry) == current)
+                    return !negate;
+                if (negate)
+                    ++negated;
+            }
+            return negated == list.size();
+        }
+
+        bool platformAllows(const JsonValue &versionMeta)
+        {
+            return platformListAllows(versionMeta.find("os"), hostOs()) &&
+                   platformListAllows(versionMeta.find("cpu"), hostCpu());
+        }
+
         // A single-line terminal spinner that ticks on a background thread
         // while the calling thread blocks on a network call. stop() always
         // joins the thread before returning, so by the time the caller does
@@ -165,11 +225,12 @@ namespace qpm
             std::map<std::string, JsonValue> metaCache;          // name -> registry doc
             std::map<std::string, std::string> tarballCache;     // "name@version" -> inflated tar bytes
             std::set<std::string> expandedDeps;                  // "name@version" already had children enqueued
-            std::map<std::string, std::string> previousResolved; // lock key -> resolved URL, from a prior qpm-lock.json
+            std::map<std::string, JsonValue> previousLock;       // lock key -> entry, from a prior qpm-lock.json
             JsonValue lockPackages = JsonValue::makeObject();
             int installedCount = 0;
             int upToDateCount = 0;
             int failedCount = 0;
+            std::set<std::string> platformSkipped;               // lock keys of optional deps built for another os/cpu
         };
 
         const JsonValue *fetchMeta(ResolveState &st, const std::string &name, std::string &error)
@@ -178,8 +239,13 @@ namespace qpm
             if (it != st.metaCache.end())
                 return &it->second;
 
-            std::string url = registryBaseUrl() + urlEncodeComponent(name);
-            HttpResponse resp = httpGet(url, "application/vnd.npm.install-v1+json");
+            const char *accept = "application/vnd.npm.install-v1+json";
+            HttpResponse resp = httpGet(registryBaseUrl() + urlEncodeComponent(name), accept);
+            // The QPM registry hosts Quantum packages; a package it has never
+            // heard of (react, vite, ...) comes from the upstream npm registry.
+            std::string upstream = upstreamRegistryUrl();
+            if (resp.error.empty() && resp.status == 404 && !upstream.empty() && upstream != registryBaseUrl())
+                resp = httpGet(upstream + urlEncodeComponent(name), accept);
             if (!resp.ok())
             {
                 error = "failed to fetch metadata for " + name + " (" +
@@ -300,13 +366,14 @@ namespace qpm
             return true;
         }
 
-        void installTransitive(ResolveState &st, const std::string &name, const std::string &range,
-                                const fs::path &parentPkgDir);
+        void installDependencies(ResolveState &st, const JsonValue &pkg, const fs::path &pkgDir);
 
         // Places `name` satisfying `range` either by reusing an already-chosen
         // root version, claiming the root slot, or nesting under parentPkgDir.
+        // An `optional` dependency that is built for another os/cpu is skipped,
+        // and one that fails to install is a warning instead of a failure (npm).
         bool placeAndExpand(ResolveState &st, const std::string &name, const std::string &range,
-                             const fs::path &parentPkgDir, bool isRootLevel)
+                             const fs::path &parentPkgDir, bool isRootLevel, bool optional)
         {
             auto rootIt = st.rootChosen.find(name);
             if (!isRootLevel && rootIt != st.rootChosen.end())
@@ -329,15 +396,14 @@ namespace qpm
                 st.lockPackages.set(lockKey, entry);
             };
 
-            auto expandChildren = [&](const std::string &version, const JsonValue *depsObj)
+            auto expandChildren = [&](const std::string &version, const JsonValue *pkgMeta)
             {
                 std::string key = name + "@" + version;
                 if (st.expandedDeps.count(key))
                     return;
                 st.expandedDeps.insert(key);
-                if (depsObj && depsObj->isObject())
-                    for (const auto &m : depsObj->object())
-                        installTransitive(st, m.first, m.second.asString(), destDir);
+                if (pkgMeta)
+                    installDependencies(st, *pkgMeta, destDir);
             };
 
             // Fast path: already correctly installed on disk from a previous
@@ -357,50 +423,80 @@ namespace qpm
                 catch (...)
                 {
                 }
-                auto prev = st.previousResolved.find(lockKey);
-                recordLock(diskVersion, prev != st.previousResolved.end() ? prev->second : "");
-                expandChildren(diskVersion, diskPkg.find("dependencies"));
+                auto prev = st.previousLock.find(lockKey);
+                recordLock(diskVersion, prev != st.previousLock.end() ? prev->second.get("resolved").asString() : "");
+                expandChildren(diskVersion, &diskPkg);
                 return true;
+            }
+
+            // An optional dependency the last install already found to be for
+            // another os/cpu: skip it without asking the registry again.
+            if (optional)
+            {
+                auto prev = st.previousLock.find(lockKey);
+                SemVer prevVersion;
+                if (prev != st.previousLock.end() && prev->second.get("optional").asBool() &&
+                    !platformAllows(prev->second) &&
+                    SemVer::tryParse(prev->second.get("version").asString(), prevVersion) &&
+                    SemVerRange(range).satisfies(prevVersion))
+                {
+                    st.lockPackages.set(lockKey, prev->second);
+                    st.platformSkipped.insert(lockKey);
+                    return false;
+                }
             }
 
             Spinner spinner("resolving " + name + (range.empty() ? "" : " " + range) + " ...");
             std::string opError;
 
+            auto fail = [&](const std::string &message)
+            {
+                spinner.stop("");
+                if (optional)
+                {
+                    std::cerr << "[qpm] skipping optional dependency: " << message << "\n";
+                    return false;
+                }
+                std::cerr << "[qpm] " << message << "\n";
+                ++st.failedCount;
+                return false;
+            };
+
             const JsonValue *meta = fetchMeta(st, name, opError);
             if (!meta)
-            {
-                spinner.stop("");
-                std::cerr << "[qpm] " << opError << "\n";
-                ++st.failedCount;
-                return false;
-            }
+                return fail(opError);
             std::string version = resolveVersion(*meta, range);
             if (version.empty())
-            {
-                spinner.stop("");
-                std::cerr << "[qpm] no version of " << name << " satisfies \"" << range << "\"\n";
-                ++st.failedCount;
-                return false;
-            }
+                return fail("no version of " + name + " satisfies \"" + range + "\"");
 
             const JsonValue *verMeta = meta->find("versions");
             verMeta = verMeta ? verMeta->find(version) : nullptr;
-            std::string tarballUrl = verMeta ? verMeta->get("dist").get("tarball").asString() : "";
-            if (tarballUrl.empty())
+            if (optional && verMeta && !platformAllows(*verMeta))
             {
+                // e.g. esbuild lists a binary package for every os/cpu and
+                // expects only the one matching this machine to be installed.
+                // Locked with its os/cpu (as npm does) so the next install can
+                // skip it offline.
                 spinner.stop("");
-                std::cerr << "[qpm] no tarball URL for " << name << "@" << version << "\n";
-                ++st.failedCount;
+                JsonValue entry = JsonValue::makeObject();
+                entry.set("version", version);
+                entry.set("resolved", verMeta->get("dist").get("tarball").asString());
+                entry.set("optional", true);
+                if (const JsonValue *os = verMeta->find("os"))
+                    entry.set("os", *os);
+                if (const JsonValue *cpu = verMeta->find("cpu"))
+                    entry.set("cpu", *cpu);
+                st.lockPackages.set(lockKey, entry);
+                st.platformSkipped.insert(lockKey);
                 return false;
             }
 
+            std::string tarballUrl = verMeta ? verMeta->get("dist").get("tarball").asString() : "";
+            if (tarballUrl.empty())
+                return fail("no tarball URL for " + name + "@" + version);
+
             if (!downloadAndExtract(st, name, version, tarballUrl, destDir, opError))
-            {
-                spinner.stop("");
-                std::cerr << "[qpm] " << opError << "\n";
-                ++st.failedCount;
-                return false;
-            }
+                return fail(opError);
 
             if (useRoot)
                 st.rootChosen[name] = version;
@@ -411,20 +507,30 @@ namespace qpm
             spinner.stop(resultLine);
 
             recordLock(version, tarballUrl);
-            const JsonValue *deps = verMeta ? verMeta->find("dependencies") : nullptr;
-            expandChildren(version, deps);
+            expandChildren(version, verMeta);
             return true;
         }
 
-        void installTransitive(ResolveState &st, const std::string &name, const std::string &range,
-                                const fs::path &parentPkgDir)
+        // Installs a package's "dependencies" and "optionalDependencies". As in
+        // npm, an optionalDependencies entry overrides a same-named dependencies one.
+        void installDependencies(ResolveState &st, const JsonValue &pkg, const fs::path &pkgDir)
         {
-            placeAndExpand(st, name, range, parentPkgDir, /*isRootLevel=*/false);
+            const JsonValue *deps = pkg.find("dependencies");
+            const JsonValue *optDeps = pkg.find("optionalDependencies");
+            bool hasOptDeps = optDeps && optDeps->isObject();
+
+            if (deps && deps->isObject())
+                for (const auto &m : deps->object())
+                    if (!(hasOptDeps && optDeps->has(m.first)))
+                        placeAndExpand(st, m.first, m.second.asString(), pkgDir, /*isRootLevel=*/false, /*optional=*/false);
+            if (hasOptDeps)
+                for (const auto &m : optDeps->object())
+                    placeAndExpand(st, m.first, m.second.asString(), pkgDir, /*isRootLevel=*/false, /*optional=*/true);
         }
 
-        bool installRootLevel(ResolveState &st, const std::string &name, const std::string &range)
+        bool installRootLevel(ResolveState &st, const std::string &name, const std::string &range, bool optional)
         {
-            return placeAndExpand(st, name, range, st.projectDir, /*isRootLevel=*/true);
+            return placeAndExpand(st, name, range, st.projectDir, /*isRootLevel=*/true, optional);
         }
     } // namespace
 
@@ -481,7 +587,7 @@ namespace qpm
                 const JsonValue *packages = oldLock.find("packages");
                 if (packages && packages->isObject())
                     for (const auto &m : packages->object())
-                        st.previousResolved[m.first] = m.second.get("resolved").asString();
+                        st.previousLock[m.first] = m.second;
             }
             catch (...)
             {
@@ -518,18 +624,24 @@ namespace qpm
         const JsonValue &pkgJson = manifest.data;
 
         JsonValue dependencies = pkgJson.get("dependencies");
+        JsonValue optionalDependencies = pkgJson.get("optionalDependencies");
         JsonValue devDependencies = pkgJson.get("devDependencies");
 
         std::cout << "[qpm] installing dependencies for " << pkgJson.get("name").asString(projectDir.filename().string()) << "\n";
 
         if (dependencies.isObject())
             for (const auto &m : dependencies.object())
-                installRootLevel(st, m.first, m.second.asString());
+                if (!optionalDependencies.has(m.first))
+                    installRootLevel(st, m.first, m.second.asString(), /*optional=*/false);
+
+        if (optionalDependencies.isObject())
+            for (const auto &m : optionalDependencies.object())
+                installRootLevel(st, m.first, m.second.asString(), /*optional=*/true);
 
         if (opts.includeDev && devDependencies.isObject())
             for (const auto &m : devDependencies.object())
                 if (!st.rootChosen.count(m.first))
-                    installRootLevel(st, m.first, m.second.asString());
+                    installRootLevel(st, m.first, m.second.asString(), /*optional=*/false);
 
         JsonValue lockDoc = JsonValue::makeObject();
         lockDoc.set("lockfileVersion", 1);
@@ -538,6 +650,8 @@ namespace qpm
 
         std::cout << "\n[qpm] " << st.installedCount << " package(s) installed, "
                   << st.upToDateCount << " already up to date";
+        if (!st.platformSkipped.empty())
+            std::cout << ", " << st.platformSkipped.size() << " optional skipped (other platforms)";
         if (st.failedCount > 0)
             std::cout << ", " << st.failedCount << " failed to resolve";
         std::cout << "\n";

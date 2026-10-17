@@ -29,7 +29,11 @@ namespace qpm
     {
     public:
         explicit SemVerRange(const std::string &rangeStr);
-        bool satisfies(const SemVer &v) const;
+        // includePrerelease=false applies npm's default prerelease rule: a
+        // version with a prerelease tag only matches if a comparator in the
+        // same AND-group carries a prerelease tag on the same major.minor.patch
+        // — so "^1.0.0-beta.2" accepts 1.0.0-beta.2, never 1.1.0-alpha.
+        bool satisfies(const SemVer &v, bool includePrerelease = true) const;
         bool isAny() const { return isAny_; }
 
     private:
@@ -39,9 +43,9 @@ namespace qpm
         bool isAny_ = false;
     };
 
-    // Highest version in `versions` satisfying `range`. Prerelease versions
-    // are excluded unless the range itself pins that exact major.minor.patch
-    // with a prerelease tag. Returns "" if nothing matches.
+    // Highest version in `versions` satisfying `range`, with prerelease
+    // versions matched by npm's rule (see SemVerRange::satisfies).
+    // Returns "" if nothing matches.
     std::string maxSatisfying(const std::vector<std::string> &versions, const std::string &range);
 
 } // namespace qpm

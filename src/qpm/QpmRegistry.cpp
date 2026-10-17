@@ -131,6 +131,16 @@ namespace qpm
         return base;
     }
 
+    std::string upstreamRegistryUrl()
+    {
+        std::string base = envOr("QPM_UPSTREAM", "https://registry.npmjs.org/");
+        if (base == "none")
+            return "";
+        if (base.back() != '/')
+            base += '/';
+        return base;
+    }
+
     std::string authToken()
     {
         std::string fromEnv = envOr("QPM_TOKEN", "");

@@ -356,10 +356,10 @@ namespace qpm
             isAny_ = true;
     }
 
-    bool SemVerRange::satisfies(const SemVer &v) const
+    bool SemVerRange::satisfies(const SemVer &v, bool includePrerelease) const
     {
         if (isAny_)
-            return true;
+            return includePrerelease || !v.hasPrerelease();
         for (const auto &group : groups_)
         {
             bool ok = true;
@@ -374,8 +374,16 @@ namespace qpm
                 else if (c.first == "=") pass = cmp == 0;
                 if (!pass) { ok = false; break; }
             }
-            if (ok)
+            if (!ok)
+                continue;
+            if (includePrerelease || !v.hasPrerelease())
                 return true;
+            // npm only lets a prerelease through when this group opted into
+            // prereleases of the same major.minor.patch (node-semver testSet).
+            for (const auto &c : group)
+                if (c.second.hasPrerelease() && c.second.major == v.major &&
+                    c.second.minor == v.minor && c.second.patch == v.patch)
+                    return true;
         }
         return false;
     }
@@ -383,41 +391,17 @@ namespace qpm
     std::string maxSatisfying(const std::vector<std::string> &versions, const std::string &range)
     {
         SemVerRange r(range);
-        // Does the range itself pin an exact prerelease version? If so, allow
-        // matching prereleases with that same major.minor.patch (npm semantics).
-        SemVer pinnedPre;
-        bool hasPinnedPre = false;
-        {
-            SemVer maybe;
-            if (SemVer::tryParse(trim(range), maybe) && maybe.hasPrerelease())
-            {
-                pinnedPre = maybe;
-                hasPinnedPre = true;
-            }
-        }
-
-        const SemVer *best = nullptr;
         SemVer bestVal;
         std::string bestStr;
         for (const auto &vs : versions)
         {
             SemVer v;
-            if (!SemVer::tryParse(vs, v))
+            if (!SemVer::tryParse(vs, v) || !r.satisfies(v, /*includePrerelease=*/false))
                 continue;
-            if (v.hasPrerelease())
-            {
-                bool allowed = hasPinnedPre && v.major == pinnedPre.major &&
-                                v.minor == pinnedPre.minor && v.patch == pinnedPre.patch;
-                if (!allowed)
-                    continue;
-            }
-            if (!r.satisfies(v))
-                continue;
-            if (!best || compareSemVer(v, bestVal) > 0)
+            if (bestStr.empty() || compareSemVer(v, bestVal) > 0)
             {
                 bestVal = v;
                 bestStr = vs;
-                best = &bestVal;
             }
         }
         return bestStr;
