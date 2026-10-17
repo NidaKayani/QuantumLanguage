@@ -2,6 +2,7 @@
 #include "QpmGzip.h"
 #include "QpmHttp.h"
 #include "QpmJson.h"
+#include "QpmManifest.h"
 #include "QpmRegistry.h"
 #include "QpmSemver.h"
 #include "QpmTar.h"
@@ -402,37 +403,41 @@ namespace qpm
         struct Package
         {
             JsonValue manifest;
+            std::string manifestFile; // "package.qon", "package.json" or "requirements.txt"
             std::string name, version;
             std::string tarballName; // "<name>-<version>.tgz", scope folded in
             std::string tgz;
             std::string readme;
         };
 
-        // Reads and validates package.json. Prints the problem and returns false on failure.
+        // Reads and validates the project manifest. Prints the problem and returns false on failure.
         bool readManifest(const fs::path &projectDir, Package &pkg)
         {
-            std::string text;
-            if (!readFile(projectDir / "package.json", text))
+            fs::path manifestPath = findManifest(projectDir);
+            if (manifestPath.empty())
             {
-                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                std::cerr << "[qpm] no package.qon, package.json or requirements.txt found in "
+                          << projectDir.string() << "\n"
                           << "[qpm] run `qpm init` to create one\n";
                 return false;
             }
             try
             {
-                pkg.manifest = JsonValue::parse(text);
+                pkg.manifest = loadManifest(manifestPath).data;
             }
             catch (const std::exception &e)
             {
-                std::cerr << "[qpm] failed to parse package.json: " << e.what() << "\n";
+                std::cerr << "[qpm] failed to parse " << e.what() << "\n";
                 return false;
             }
+            pkg.manifestFile = manifestPath.filename().string();
 
             pkg.name = pkg.manifest.get("name").asString();
             pkg.version = pkg.manifest.get("version").asString();
             if (pkg.name.empty())
             {
-                std::cerr << "[qpm] package.json needs a \"name\"\n";
+                std::cerr << "[qpm] " << pkg.manifestFile << " needs a \"name\""
+                          << (pkg.manifestFile == "package.json" ? "" : " (`name = ...` under [package])") << "\n";
                 return false;
             }
             std::string problem = nameProblem(pkg.name);
@@ -444,7 +449,7 @@ namespace qpm
             SemVer sv;
             if (!SemVer::tryParse(pkg.version, sv))
             {
-                std::cerr << "[qpm] package.json \"version\" must be a semver version like 1.0.0 (got \""
+                std::cerr << "[qpm] " << pkg.manifestFile << " \"version\" must be a semver version like 1.0.0 (got \""
                           << pkg.version << "\")\n";
                 return false;
             }
@@ -466,8 +471,21 @@ namespace qpm
 
             std::vector<TarEntry> entries;
             size_t unpackedSize = 0;
+            // Registry consumers (npm, qpm) only read package.json, so a
+            // package.qon / requirements.txt project ships a generated one.
+            bool generatePkgJson = pkg.manifestFile != "package.json";
+            if (generatePkgJson)
+            {
+                TarEntry entry{"package.json", pkg.manifest.stringify(2) + "\n"};
+                unpackedSize += entry.data.size();
+                std::cout << "  " << std::setw(9) << formatSize(entry.data.size()) << "  package.json (from "
+                          << pkg.manifestFile << ")\n";
+                entries.push_back(std::move(entry));
+            }
             for (const auto &rel : files)
             {
+                if (generatePkgJson && rel == "package.json")
+                    continue;
                 TarEntry entry{rel, ""};
                 if (!readFile(projectDir / fs::u8path(rel), entry.data))
                 {
@@ -596,7 +614,7 @@ namespace qpm
             return 1;
         if (pkg.manifest.get("private").asBool())
         {
-            std::cerr << "[qpm] " << pkg.name << " has \"private\": true in package.json, so it can't be published\n";
+            std::cerr << "[qpm] " << pkg.name << " has \"private\": true in " << pkg.manifestFile << ", so it can't be published\n";
             return 1;
         }
         if (!buildTarball(projectDir, pkg))

@@ -31,6 +31,7 @@ private:
         std::string name;
         int depth;       // scope depth at declaration
         bool isCaptured; // promoted to upvalue
+        std::string cType = ""; // declared C/C++ type ("double", "Calculator"), if any
     };
 
     struct CompilerState
@@ -136,6 +137,35 @@ private:
     // Helper: emit variable load/store based on scope resolution
     void emitLoad(const std::string &name, int line);
     void emitStore(const std::string &name, int line);
+
+    // ── C/C++ static types ────────────────────────────────────────────────────
+    // Numbers carry no int/double distinction at runtime, but an ostream
+    // prints them differently (a double holding 1e6 as "1e+06", an int as
+    // "1000000"), so `cout << x` / `ss << x` pass along what the declarations
+    // say about x.
+    std::vector<std::string> pendingParamCTypes_; // for the next compileFunction
+    std::unordered_map<std::string, std::string> globalCTypes_;
+    std::unordered_map<std::string, std::string> fnReturnCTypes_; // free functions
+    // class → method → return type, and class → field → type
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> classMethodCTypes_;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> classFieldCTypes_;
+    std::vector<std::string> classStack_; // classes whose methods are being compiled
+    void collectCTypes(ASTNode &node);
+    // The declared C/C++ type of a variable or (inside a method) a field, or "".
+    std::string declaredCType(const std::string &name);
+    // 'f' = statically a C/C++ floating-point value, 'i' = an integer, 0 = unknown.
+    char numericKind(ASTNode &expr);
+    // How `cin >> target` should extract (see the __cin__ native): 1 a
+    // double, 2 an integer, 3 a single char, 0 by the target's current value.
+    int cinKind(ASTNode &target);
+
+    // GET_SUPER operand: "<class>\x1f<method>" inside a method of <class>, so
+    // the VM starts from that class's base (not the instance's), which keeps
+    // super chains through three or more classes from recursing.
+    std::string superKey(const std::string &method) const
+    {
+        return classStack_.empty() ? method : classStack_.back() + '\x1f' + method;
+    }
 
     // Unpacks a "[a,b]" loop-variable pattern held in local `slot`.
     void emitPatternLocals(int slot, const std::string &pattern, int line);

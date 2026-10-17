@@ -3,6 +3,7 @@
 #include "Lexer.h"
 #include "Parser.h"
 #include "qpm/QpmJson.h"
+#include "qpm/QpmManifest.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -291,15 +292,17 @@ namespace
         std::vector<fs::path> searchDirs; // package directories, in order
     };
 
-    // <root>/node_modules, then each of the root package.json's
-    // "quantum.paths" entries (relative to <root>).
+    // <root>/node_modules, then each of the root manifest's (package.qon,
+    // package.json or requirements.txt) "quantum.paths" entries (relative to <root>).
     UseOptions useOptionsFor(const fs::path &entryDir)
     {
         UseOptions opts;
         opts.root = entryDir;
+        fs::path manifestPath;
         for (fs::path dir = entryDir;; dir = dir.parent_path())
         {
-            if (isFile(dir / "package.json"))
+            manifestPath = qpm::findManifest(dir);
+            if (!manifestPath.empty())
             {
                 opts.root = dir;
                 break;
@@ -308,13 +311,11 @@ namespace
                 break;
         }
         opts.searchDirs.push_back(opts.root / "node_modules");
-        std::string text;
-        if (readFile(opts.root / "package.json", text))
+        if (!manifestPath.empty())
         {
-            stripUtf8Bom(text);
             try
             {
-                auto manifest = qpm::JsonValue::parse(text);
+                auto manifest = qpm::loadManifest(manifestPath).data;
                 auto paths = manifest.get("quantum").get("paths");
                 if (paths.isArray())
                     for (const auto &p : paths.array())
@@ -329,22 +330,20 @@ namespace
         return opts;
     }
 
-    // A package's entry file: its package.json "main", else index.sa.
+    // A package's entry file: its manifest's "main", else index.sa.
     fs::path packageMain(const fs::path &pkgDir)
     {
-        fs::path manifestPath = pkgDir / "package.json";
-        std::string text;
-        if (!isFile(manifestPath) || !readFile(manifestPath, text))
+        fs::path manifestPath = qpm::findManifest(pkgDir);
+        if (manifestPath.empty())
             return pkgDir / "index.sa";
-        stripUtf8Bom(text);
         qpm::JsonValue meta;
         try
         {
-            meta = qpm::JsonValue::parse(text);
+            meta = qpm::loadManifest(manifestPath).data;
         }
         catch (const std::exception &e)
         {
-            throw ParseError("invalid package.json at " + manifestPath.generic_string() + ": " + e.what(), 0, 0);
+            throw ParseError("invalid manifest at " + manifestPath.generic_string() + ": " + e.what(), 0, 0);
         }
         auto main = meta.get("main");
         if (main.isString())

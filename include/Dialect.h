@@ -12,7 +12,8 @@
 //
 // Set the QUANTUM_DEBUG_RUBY environment variable to dump the translated
 // source to stderr before it is compiled — the primary debugging tool for
-// this layer.
+// this layer. QUANTUM_DEBUG_CPP dumps the output of the C++ structure pass
+// (spliced includes, lowered namespaces, merged member definitions).
 
 #include <string>
 #include <vector>
@@ -43,3 +44,15 @@ const std::vector<std::string> &rubyEnumerableModuleSource();
 // True if the source defines a function named main ("main" followed by "(",
 // not part of a longer identifier).
 bool definesMainFunction(const std::string &src);
+
+// True if the source defines a C-style `int main(` (or void/auto) and never
+// calls main() itself.
+bool definesCStyleMain(const std::string &src);
+
+// C++ project structure (src/dialect/CppDialect.cpp): splices in local
+// `#include "x.h"` headers plus their x.sa/x.cpp implementation files, lowers
+// namespaces, and moves out-of-class member definitions (`T Cls::f() {}`)
+// into their class. `path` locates the included files; `*multiFile` is set
+// when at least one local file was spliced in.
+std::string applyCppDialect(const std::string &source, const std::string &path,
+                            bool *multiFile = nullptr);

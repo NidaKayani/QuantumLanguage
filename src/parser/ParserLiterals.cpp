@@ -26,6 +26,35 @@ ASTNodePtr Parser::parsePrimary() {
   if (tok.type == TokenType::STRING) {
     auto s = tok.value;
     consume();
+    // Adjacent string literals concatenate ("a" "b" → "ab"), as in C/C++,
+    // Python and Ruby. Across line breaks only when the expression visibly
+    // continues after the run (`;`, `<<`, `,` or a closing bracket follows),
+    // so string statements on consecutive lines stay separate:
+    //   std::cout << "1. Add\n"
+    //                "2. Subtract\n";
+    while (true) {
+      if (check(TokenType::STRING)) {
+        s += consume().value;
+        continue;
+      }
+      size_t j = pos;
+      while (j < tokens.size() && tokens[j].type == TokenType::NEWLINE)
+        ++j;
+      if (j == pos || j >= tokens.size() || tokens[j].type != TokenType::STRING)
+        break;
+      size_t k = j;
+      while (k < tokens.size() && (tokens[k].type == TokenType::STRING ||
+                                   tokens[k].type == TokenType::NEWLINE))
+        ++k;
+      if (k >= tokens.size())
+        break;
+      TokenType after = tokens[k].type;
+      if (after != TokenType::SEMICOLON && after != TokenType::LSHIFT &&
+          after != TokenType::COMMA && after != TokenType::RPAREN &&
+          after != TokenType::RBRACKET && after != TokenType::RBRACE)
+        break;
+      pos = j; // past the line breaks; the next round takes the string
+    }
     return std::make_unique<ASTNode>(StringLiteral{s}, ln);
   }
   if (tok.type == TokenType::BOOL_TRUE) {
@@ -585,7 +614,11 @@ ASTNodePtr Parser::parsePrimary() {
   case TokenType::COUT:
   case TokenType::CIN: {
     auto name = tok.value;
+    bool isCin = tok.type == TokenType::CIN;
     consume();
+    // `if (cin >> x)`, `while (cin >> a >> b)`, `cin.fail()` in an expression
+    if (isCin && (check(TokenType::RSHIFT) || check(TokenType::DOT)))
+      return parseCinExpr(ln);
     return std::make_unique<ASTNode>(Identifier{name}, ln);
   }
   default:
@@ -930,8 +963,10 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
       // Ruby-style keyword argument: name: expr — equivalent to name=expr.
       // Only `IDENT :` at the very start of an argument is a keyword; a
       // ternary's `:` always follows an expression, never begins an argument,
-      // so this cannot collide with `cond ? a : b`.
-      if (la < tokens.size() && tokens[la].type == TokenType::COLON) {
+      // so this cannot collide with `cond ? a : b`. `IDENT ::` is C++ scope
+      // resolution (`f(Color::Red)`), not a keyword.
+      if (la < tokens.size() && tokens[la].type == TokenType::COLON &&
+          !(la + 1 < tokens.size() && tokens[la + 1].type == TokenType::COLON)) {
         std::string kwName = consume().value; // save keyword name
         while (check(TokenType::NEWLINE))
           consume();

@@ -141,6 +141,10 @@ struct VarDecl
     bool isPointer = false; // int* p = ...
     bool isExported = false;
     bool cTyped = false;    // declared C-style (`int x = ...`), not `let x: int`
+    // C++ class member of object/container type (`vector<int> v;`, `Foo f;`):
+    // its initializer runs per instance, at construction, instead of once.
+    bool perInstance = false;
+    bool isStatic = false; // C++ `static` data member: one value shared by the class
 };
 
 struct FunctionDecl
@@ -154,6 +158,7 @@ struct FunctionDecl
     ASTNodePtr body;              // BlockStmt
     bool isExported = false;
     std::vector<std::string> cppParamTypes; // C++ param types, for overloads
+    std::string cReturnType; // C/C++ declared return type ("double"), for stream formatting
     // Declared with Python's `def`: a name the body assigns before reading
     // it is a local of the function (Compiler::compileFunction).
     bool pythonScope = false;
