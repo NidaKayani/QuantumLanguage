@@ -9,6 +9,7 @@ build_ninja/
 *.dylib
 
 # Compiler output
+application.log
 compile_error.txt
 compile_errors.txt
 error.log
