@@ -2,7 +2,9 @@
 #include "Error.h"
 #include "Vm.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -11,12 +13,211 @@ Compiler::Compiler() : current_(nullptr) {}
 std::shared_ptr<Chunk> Compiler::compile(ASTNode &root) {
   CompilerState top("<script>");
   current_ = &top;
+  collectCTypes(root);
   if (root.is<BlockStmt>())
     compileBlock(root.as<BlockStmt>());
   else
     compileNode(root);
   emit(Op::RETURN_NIL, 0, 0);
   return top.chunk;
+}
+
+// ─── C/C++ static types (see Compiler.h) ─────────────────────────────────────
+
+// Return types of free functions and methods, and field types, declared
+// anywhere in the program — calls may precede the definitions.
+void Compiler::collectCTypes(ASTNode &node) {
+  if (node.is<BlockStmt>()) {
+    for (auto &st : node.as<BlockStmt>().statements)
+      if (st)
+        collectCTypes(*st);
+  } else if (node.is<FunctionDecl>()) {
+    auto &fd = node.as<FunctionDecl>();
+    if (!fd.cReturnType.empty())
+      fnReturnCTypes_[fd.name] = fd.cReturnType;
+  } else if (node.is<ClassDecl>()) {
+    auto &cd = node.as<ClassDecl>();
+    auto &methods = classMethodCTypes_[cd.name];
+    auto &fields = classFieldCTypes_[cd.name];
+    auto member = [&](ASTNodePtr &m) {
+      if (!m)
+        return;
+      if (m->is<FunctionDecl>() && !m->as<FunctionDecl>().cReturnType.empty())
+        methods[m->as<FunctionDecl>().name] = m->as<FunctionDecl>().cReturnType;
+      else if (m->is<VarDecl>() && !m->as<VarDecl>().typeHint.empty())
+        fields[m->as<VarDecl>().name] = m->as<VarDecl>().typeHint;
+      else if (m->is<ClassDecl>())
+        collectCTypes(*m);
+    };
+    for (auto &f : cd.fields)
+      member(f);
+    for (auto &m : cd.methods)
+      member(m);
+    // Inherited members (a base class is declared before its subclasses).
+    if (!cd.base.empty()) {
+      for (auto &[k, v] : classMethodCTypes_[cd.base])
+        methods.emplace(k, v);
+      for (auto &[k, v] : classFieldCTypes_[cd.base])
+        fields.emplace(k, v);
+    }
+  }
+}
+
+std::string Compiler::declaredCType(const std::string &name) {
+  for (CompilerState *st = current_; st; st = st->enclosing)
+    for (auto it = st->locals.rbegin(); it != st->locals.rend(); ++it)
+      if (it->name == name)
+        return it->cType;
+  if (!classStack_.empty()) {
+    auto c = classFieldCTypes_.find(classStack_.back());
+    if (c != classFieldCTypes_.end()) {
+      auto f = c->second.find(name);
+      if (f != c->second.end())
+        return f->second;
+    }
+  }
+  auto g = globalCTypes_.find(name);
+  return g == globalCTypes_.end() ? "" : g->second;
+}
+
+static char cTypeKind(std::string t) {
+  for (const char *q : {"const ", "static ", "constexpr ", "volatile "})
+    while (t.rfind(q, 0) == 0)
+      t.erase(0, std::string(q).size());
+  if (t.find('*') != std::string::npos || t.find('[') != std::string::npos)
+    return 0;
+  if (t == "double" || t == "float" || t == "long double")
+    return 'f';
+  static const std::set<std::string> ints = {
+      "int", "long", "short", "unsigned", "signed", "size_t", "ssize_t", "ptrdiff_t",
+      "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t"};
+  if (ints.count(t) || t.rfind("unsigned ", 0) == 0 || t.rfind("signed ", 0) == 0 ||
+      t.rfind("long ", 0) == 0 || t.rfind("short ", 0) == 0)
+    return t.find("double") != std::string::npos ? 'f' : 'i';
+  return 0;
+}
+
+int Compiler::cinKind(ASTNode &target) {
+  std::string type;
+  if (target.is<Identifier>())
+    type = declaredCType(target.as<Identifier>().name);
+  else if ((target.is<MemberExpr>() || target.is<ArrowExpr>()) && !classStack_.empty()) {
+    auto &obj = target.is<MemberExpr>() ? *target.as<MemberExpr>().object : *target.as<ArrowExpr>().object;
+    const std::string &member =
+        target.is<MemberExpr>() ? target.as<MemberExpr>().member : target.as<ArrowExpr>().member;
+    if (obj.is<Identifier>() && (obj.as<Identifier>().name == "self" || obj.as<Identifier>().name == "this")) {
+      auto c = classFieldCTypes_.find(classStack_.back());
+      if (c != classFieldCTypes_.end() && c->second.count(member))
+        type = c->second.at(member);
+    }
+  } else if (target.is<IndexExpr>() && target.as<IndexExpr>().object->is<Identifier>()) {
+    type = declaredCType(target.as<IndexExpr>().object->as<Identifier>().name);
+    while (!type.empty() && (type.back() == '*' || type.back() == ']' || type.back() == '['))
+      type.pop_back();
+  }
+  if (type.rfind("const ", 0) == 0)
+    type.erase(0, 6);
+  if (type == "char")
+    return 3;
+  switch (cTypeKind(type)) {
+  case 'f':
+    return 1;
+  case 'i':
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+char Compiler::numericKind(ASTNode &e) {
+  // The class a (pointer-)typed object expression refers to, if known.
+  auto classOf = [&](ASTNode &obj) -> std::string {
+    if (!obj.is<Identifier>())
+      return "";
+    const std::string &n = obj.as<Identifier>().name;
+    if (n == "self" || n == "this")
+      return classStack_.empty() ? "" : classStack_.back();
+    std::string t = declaredCType(n);
+    while (!t.empty() && (t.back() == '*' || t.back() == '&'))
+      t.pop_back();
+    return t;
+  };
+  auto lookup = [](auto &table, const std::string &cls, const std::string &name) -> std::string {
+    auto c = table.find(cls);
+    if (c == table.end())
+      return "";
+    auto m = c->second.find(name);
+    return m == c->second.end() ? "" : m->second;
+  };
+
+  if (e.is<Identifier>())
+    return cTypeKind(declaredCType(e.as<Identifier>().name));
+  if (e.is<NumberLiteral>()) {
+    double v = e.as<NumberLiteral>().value;
+    return std::isfinite(v) && std::floor(v) != v ? 'f' : 0;
+  }
+  if (e.is<BinaryExpr>()) {
+    auto &b = e.as<BinaryExpr>();
+    if (b.op != "+" && b.op != "-" && b.op != "*" && b.op != "/" && b.op != "%")
+      return 0;
+    char l = numericKind(*b.left), r = numericKind(*b.right);
+    if (l == 'f' || r == 'f')
+      return b.op == "%" ? 0 : 'f';
+    return l == 'i' && r == 'i' ? 'i' : 0;
+  }
+  if (e.is<UnaryExpr>()) {
+    auto &u = e.as<UnaryExpr>();
+    return (u.op == "-" || u.op == "+") ? numericKind(*u.operand) : 0;
+  }
+  if (e.is<TernaryExpr>()) {
+    auto &t = e.as<TernaryExpr>();
+    char a = numericKind(*t.thenExpr), b = numericKind(*t.elseExpr);
+    if (a == 'f' || b == 'f')
+      return 'f';
+    return a == 'i' && b == 'i' ? 'i' : 0;
+  }
+  if (e.is<MemberExpr>())
+    return cTypeKind(lookup(classFieldCTypes_, classOf(*e.as<MemberExpr>().object),
+                            e.as<MemberExpr>().member));
+  if (e.is<ArrowExpr>())
+    return cTypeKind(lookup(classFieldCTypes_, classOf(*e.as<ArrowExpr>().object),
+                            e.as<ArrowExpr>().member));
+  if (e.is<IndexExpr>() && e.as<IndexExpr>().object->is<Identifier>()) {
+    // double arr[N] / double *p: the element type
+    std::string t = declaredCType(e.as<IndexExpr>().object->as<Identifier>().name);
+    while (!t.empty() && (t.back() == '*' || t.back() == ']' || t.back() == '['))
+      t.pop_back();
+    return cTypeKind(t);
+  }
+  if (e.is<CallExpr>()) {
+    auto &callee = *e.as<CallExpr>().callee;
+    if (callee.is<Identifier>()) {
+      const std::string &n = callee.as<Identifier>().name;
+      static const std::set<std::string> floating = {
+          "_double_", "_float_", "sqrt", "pow", "exp", "log", "log10", "log2", "sin", "cos",
+          "tan", "asin", "acos", "atan", "atan2", "floor", "ceil", "round", "fabs", "fmod",
+          "hypot", "cbrt", "trunc", "stod", "stof", "atof"};
+      static const std::set<std::string> integral = {
+          "_int_", "_long_", "_short_", "__c_int__", "stoi", "stol", "stoll", "atoi", "atol"};
+      if (floating.count(n))
+        return 'f';
+      if (integral.count(n))
+        return 'i';
+      auto f = fnReturnCTypes_.find(n);
+      if (f != fnReturnCTypes_.end())
+        return cTypeKind(f->second);
+      if (!classStack_.empty()) // an implicit this->method()
+        return cTypeKind(lookup(classMethodCTypes_, classStack_.back(), n));
+      return 0;
+    }
+    if (callee.is<MemberExpr>())
+      return cTypeKind(lookup(classMethodCTypes_, classOf(*callee.as<MemberExpr>().object),
+                              callee.as<MemberExpr>().member));
+    if (callee.is<ArrowExpr>())
+      return cTypeKind(lookup(classMethodCTypes_, classOf(*callee.as<ArrowExpr>().object),
+                              callee.as<ArrowExpr>().member));
+  }
+  return 0;
 }
 
 void Compiler::beginScope() { current_->scopeDepth++; }

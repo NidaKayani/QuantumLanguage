@@ -179,6 +179,46 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
 
 // ─── Binary / unary execution ────────────────────────────────────────────────
 
+// A C++ free operator function (`bool operator==(const P&, const P&)`),
+// lowered by the dialect pass to the global __op__<stem>__<Class>: keyed by
+// the streamed (right) operand for << and >>, by the left operand otherwise,
+// and found through the class's bases.
+bool VM::callFreeOperator(Op op, const QuantumValue &L, const QuantumValue &R, QuantumValue &out)
+{
+    const char *stem = nullptr;
+    switch (op)
+    {
+    case Op::ADD:    stem = "add";    break;
+    case Op::SUB:    stem = "sub";    break;
+    case Op::MUL:    stem = "mul";    break;
+    case Op::DIV:    stem = "div";    break;
+    case Op::MOD:    stem = "mod";    break;
+    case Op::LT:     stem = "lt";     break;
+    case Op::GT:     stem = "gt";     break;
+    case Op::LTE:    stem = "le";     break;
+    case Op::GTE:    stem = "ge";     break;
+    case Op::EQ:     stem = "eq";     break;
+    case Op::NEQ:    stem = "ne";     break;
+    case Op::LSHIFT: stem = "lshift"; break;
+    case Op::RSHIFT: stem = "rshift"; break;
+    default:
+        return false;
+    }
+    const QuantumValue &key = (op == Op::LSHIFT || op == Op::RSHIFT) ? R : L;
+    if (!key.isInstance())
+        return false;
+    for (auto *k = key.asInstance()->klass.get(); k; k = k->base.get())
+    {
+        const std::string fn = std::string("__op__") + stem + "__" + k->name;
+        if (globals->has(fn))
+        {
+            out = invokeCallable(globals->get(fn), {L, R});
+            return true;
+        }
+    }
+    return false;
+}
+
 QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue &R_in, int line)
 {
     QuantumValue L = L_in;
@@ -276,6 +316,15 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         }
     }
 
+    // A free C++ operator function, lowered by the dialect pass to
+    // __op__<stem>__<Class>.
+    if (freeOperators_ && (L.isInstance() || R.isInstance()))
+    {
+        QuantumValue result;
+        if (callFreeOperator(op, L, R, result))
+            return result;
+    }
+
     // String concatenation
     if (op == Op::ADD && (L.isString() || R.isString()))
         return QuantumValue(L.toString() + R.toString());
@@ -371,7 +420,7 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         }
         return QuantumValue(l * r);
     case Op::DIV:
-        if (r == 0)
+        if (r == 0 && !cppNumerics_)
             throw RuntimeError("Division by zero", line);
         return QuantumValue(l / r);
     case Op::MOD:
@@ -781,11 +830,247 @@ void VM::callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line)
     push(std::move(result));
 }
 
+void VM::initInstanceFields(const QuantumValue &instVal)
+{
+    auto inst = instVal.asInstance();
+    std::vector<QuantumClass *> chain;
+    for (auto *k = inst->klass.get(); k; k = k->base.get())
+        if (!k->fieldInits.empty())
+            chain.push_back(k);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        for (auto &[name, init] : (*it)->fieldInits)
+            inst->fields[name] = invokeCallable(QuantumValue(init), {instVal});
+}
+
+bool VM::findStaticMember(const QuantumValue &classVal, const std::string &name, QuantumValue &out)
+{
+    if (!classVal.isClass())
+        return false;
+    for (auto *k = classVal.asClass().get(); k; k = k->base.get())
+    {
+        auto m = k->staticMethods.find(name);
+        if (m != k->staticMethods.end())
+        {
+            auto bm = std::make_shared<QuantumBoundMethod>();
+            bm->method = m->second;
+            bm->self = classVal;
+            out = QuantumValue(bm);
+            return true;
+        }
+        auto f = k->staticFields.find(name);
+        if (f != k->staticFields.end())
+        {
+            out = f->second;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VM::findScopedMember(const std::string &name, const QuantumValue &self, QuantumValue &out)
+{
+    size_t sep = name.rfind("::");
+    if (sep == std::string::npos || sep == 0 || sep + 2 >= name.size())
+        return false;
+    const std::string prefix = name.substr(0, sep);
+    if (!globals->has(prefix))
+        return false;
+    QuantumValue owner = globals->get(prefix);
+    if (!owner.isClass())
+        return false;
+    const std::string member = name.substr(sep + 2);
+    // Base::method() from a subclass method: the base's version, on this object
+    if (self.isInstance())
+    {
+        bool related = false;
+        for (auto *k = self.asInstance()->klass.get(); k && !related; k = k->base.get())
+            related = k == owner.asClass().get();
+        if (related)
+            for (auto *k = owner.asClass().get(); k; k = k->base.get())
+            {
+                auto mit = k->methods.find(member);
+                if (mit != k->methods.end())
+                {
+                    auto bm = std::make_shared<QuantumBoundMethod>();
+                    bm->method = mit->second;
+                    bm->self = self;
+                    out = QuantumValue(bm);
+                    return true;
+                }
+            }
+    }
+    return findStaticMember(owner, member, out);
+}
+
+const QuantumValue *VM::frameSelf(const CallFrame &frame) const
+{
+    auto &params = frame.closure->chunk->params;
+    if (params.empty() || params[0] != "self" || frame.stackBase >= stack_.size())
+        return nullptr;
+    return &stack_[frame.stackBase];
+}
+
+// A static member of the class whose method is running (in a static method,
+// `self` is the class itself).
+bool VM::implicitStaticMember(const CallFrame &frame, const std::string &name, QuantumValue &out)
+{
+    const QuantumValue *self = frameSelf(frame);
+    if (!self)
+        return false;
+    if (self->isInstance())
+        return findStaticMember(QuantumValue(self->asInstance()->klass), name, out);
+    return self->isClass() && findStaticMember(*self, name, out);
+}
+
+bool VM::pushImplicitStaticMember(const CallFrame &frame, const std::string &name)
+{
+    QuantumValue member;
+    if (!implicitStaticMember(frame, name, member))
+        return false;
+    push(member);
+    return true;
+}
+
+// After the ordinary lookups miss: `Cls::member`, a static method called
+// unqualified, or a static member read inside a static method.
+bool VM::pushCppMember(const std::string &name, const CallFrame &frame)
+{
+    const QuantumValue *self = frameSelf(frame);
+    QuantumValue member;
+    if ((name.find("::") != std::string::npos &&
+         findScopedMember(name, self ? *self : QuantumValue(), member)) ||
+        implicitStaticMember(frame, name, member))
+    {
+        push(member);
+        return true;
+    }
+    return false;
+}
+
+bool VM::pushStaticMember(const std::shared_ptr<QuantumClass> &klass, const std::string &name)
+{
+    QuantumValue member;
+    if (!findStaticMember(QuantumValue(klass), name, member))
+        return false;
+    push(member);
+    return true;
+}
+
+// BIND_METHOD names marked by the compiler: a per-instance field initializer
+// (kFieldInitPrefix) or a static member (kStaticPrefix).
+bool VM::bindCppMember(QuantumValue &classVal, const std::string &name, const QuantumValue &fn)
+{
+    auto klass = classVal.asClass();
+    if (fn.isClosure() && name.rfind(kFieldInitPrefix, 0) == 0)
+    {
+        klass->fieldInits.push_back({name.substr(kFieldInitPrefix.size()), fn.asFunction()});
+        return true;
+    }
+    if (name.rfind(kStaticPrefix, 0) != 0)
+        return false;
+    std::string member = name.substr(kStaticPrefix.size());
+    if (fn.isClosure())
+        klass->staticMethods[member] = fn.asFunction();
+    else
+    {
+        klass->staticFields[member] = fn;
+        klass->staticNames.insert(member);
+        staticDataMembers_ = true;
+    }
+    return true;
+}
+
+// GET_SUPER: the base class's version of a method, bound to self. The operand
+// is "<class>\x1f<method>" inside a method of <class> (Compiler::superKey):
+// the lookup starts from that class's base, not the instance's, so a chain of
+// super calls through three or more classes doesn't recurse.
+void VM::getSuper(const std::string &operand, int line)
+{
+    std::string method = operand;
+    QuantumValue selfVal = pop();
+    if (!selfVal.isInstance())
+        throw RuntimeError("super: self is not an instance", line);
+
+    std::string ownerName;
+    size_t sep = method.find('\x1f');
+    if (sep != std::string::npos)
+    {
+        ownerName = method.substr(0, sep);
+        method = method.substr(sep + 1);
+    }
+    auto base = selfVal.asInstance()->klass->base;
+    if (!ownerName.empty())
+        for (auto *k = selfVal.asInstance()->klass.get(); k; k = k->base.get())
+            if (k->name == ownerName)
+            {
+                base = k->base;
+                break;
+            }
+    if (!base)
+        throw RuntimeError("super: class has no base class", line);
+
+    std::string lookupMethod = method;
+    if (method == "__init__")
+        lookupMethod = "init";
+    else if (method == "__str__" || method == "toString")
+        lookupMethod = "__str__";
+
+    for (auto *k = base.get(); k; k = k->base.get())
+    {
+        auto it = k->methods.find(lookupMethod);
+        if (it == k->methods.end())
+            it = k->methods.find(method);
+        if (it != k->methods.end())
+        {
+            auto bm = std::make_shared<QuantumBoundMethod>();
+            bm->method = it->second;
+            bm->self = selfVal;
+            push(QuantumValue(bm));
+            return;
+        }
+    }
+    push(QuantumValue());
+}
+
+bool VM::storeCppStaticMember(const std::string &name, const CallFrame &frame, const QuantumValue &value)
+{
+    const QuantumValue *self = frameSelf(frame);
+    QuantumClass *owner = nullptr;
+    std::string member = name;
+    // written from a method of its class (not shadowed by an instance field)
+    if (staticDataMembers_ && self && (self->isInstance() || self->isClass()) &&
+        !(self->isInstance() && self->asInstance()->fields.count(name)))
+        for (auto *k = self->isInstance() ? self->asInstance()->klass.get() : self->asClass().get();
+             k && !owner; k = k->base.get())
+            if (k->staticNames.count(name))
+                owner = k;
+    // `Cls::member = value`
+    size_t sep = name.rfind("::");
+    if (!owner && sep != std::string::npos && sep > 0 && globals->has(name.substr(0, sep)))
+    {
+        QuantumValue cls = globals->get(name.substr(0, sep));
+        if (cls.isClass())
+        {
+            member = name.substr(sep + 2);
+            for (auto *k = cls.asClass().get(); k && !owner; k = k->base.get())
+                if (k->staticNames.count(member) || k->staticFields.count(member))
+                    owner = k;
+            if (!owner)
+                owner = cls.asClass().get();
+        }
+    }
+    if (!owner)
+        return false;
+    owner->staticFields[member] = value;
+    return true;
+}
+
 void VM::callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line)
 {
     auto inst = std::make_shared<QuantumInstance>();
     inst->klass = klass;
     inst->env = std::make_shared<Environment>(globals);
+    initInstanceFields(QuantumValue(inst));
 
     // Look for __init__ / init / constructor
     auto *k = klass.get();

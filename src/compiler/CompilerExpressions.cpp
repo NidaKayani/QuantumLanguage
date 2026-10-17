@@ -7,6 +7,16 @@
 
 void Compiler::compileBinary(BinaryExpr &e, int line)
 {
+    // `stream << x` with x a C/C++ double: formatted as a double would be
+    // (VM native __shl_float__; any other left operand shifts as usual).
+    if (e.op == "<<" && numericKind(*e.right) == 'f')
+    {
+        emitLoad("__shl_float__", line);
+        compileExpr(*e.left);
+        compileExpr(*e.right);
+        emit(Op::CALL, 2, line);
+        return;
+    }
     if (e.op == "and" || e.op == "&&")
     {
         compileExpr(*e.left);
@@ -291,6 +301,25 @@ void Compiler::compileAssign(AssignExpr &e, int line)
 
 void Compiler::compileCall(CallExpr &e, int line)
 {
+    // `cout << x` segment (Parser::parseStreamInsertions): tell __cout__
+    // whether x is declared a double (1) or an integer (2).
+    if (e.callee->is<Identifier>() && e.callee->as<Identifier>().name == "__cout__" &&
+        !e.args.empty() && e.args.size() <= 2)
+    {
+        if (char kind = numericKind(*e.args[0]))
+        {
+            if (e.args.size() == 1)
+                e.args.push_back(std::make_unique<ASTNode>(StringLiteral{""}, line));
+            e.args.push_back(std::make_unique<ASTNode>(NumberLiteral{kind == 'f' ? 1.0 : 2.0}, line));
+        }
+    }
+    // `cin >> x` (Parser::parseCinExpr): extract as x's declared type.
+    if (e.callee->is<Identifier>() && e.callee->as<Identifier>().name == "__cin__" &&
+        e.args.size() == 1)
+    {
+        if (int kind = cinKind(*e.args[0]))
+            e.args.push_back(std::make_unique<ASTNode>(NumberLiteral{static_cast<double>(kind)}, line));
+    }
     // Keyword-argument names of the values pushed so far ("" = positional);
     // emitted as Op::KW_NAMES before the CALL when any name is present.
     std::vector<std::string> kwNames;
@@ -418,7 +447,7 @@ void Compiler::compileCall(CallExpr &e, int line)
         if (superExpr.method.empty())
         {
             emitLoad("self", line);
-            emit(Op::GET_SUPER, addStr("__init__"), line);
+            emit(Op::GET_SUPER, addStr(superKey("__init__")), line);
             int argCount = 0;
             for (auto &arg : e.args)
                 argCount += emitArgValues(*arg);
@@ -434,7 +463,7 @@ void Compiler::compileCall(CallExpr &e, int line)
         {
             // Load self (slot 0), GET_SUPER method, push args, CALL
             emitLoad("self", line);
-            emit(Op::GET_SUPER, addStr(mem.member), line);
+            emit(Op::GET_SUPER, addStr(superKey(mem.member)), line);
             int argCount = 0;
             for (auto &arg : e.args)
                 argCount += emitArgValues(*arg);
@@ -447,7 +476,7 @@ void Compiler::compileCall(CallExpr &e, int line)
             if (superCall.callee->is<SuperExpr>() && superCall.callee->as<SuperExpr>().method.empty())
             {
                 emitLoad("self", line);
-                emit(Op::GET_SUPER, addStr(mem.member), line);
+                emit(Op::GET_SUPER, addStr(superKey(mem.member)), line);
                 int argCount = 0;
                 for (auto &arg : e.args)
                     argCount += emitArgValues(*arg);
@@ -755,7 +784,7 @@ void Compiler::compileSuper(SuperExpr &e, int line)
     // For super.method() calls, compileCall handles it directly.
     emitLoad("self", line);
     if (!e.method.empty())
-        emit(Op::GET_SUPER, addStr(e.method), line);
+        emit(Op::GET_SUPER, addStr(superKey(e.method)), line);
 }
 
 void Compiler::compileNew(NewExpr &e, int line)

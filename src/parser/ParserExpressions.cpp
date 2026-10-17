@@ -284,6 +284,9 @@ ASTNodePtr Parser::parseShift()
         auto op = consume().value;
         skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseAddSub();
+        // `stream << endl` on a stream other than cout (ostringstream, ofstream)
+        if (op == "<<" && right->is<Identifier>() && right->as<Identifier>().name == "endl")
+            right = std::make_unique<ASTNode>(StringLiteral{"\n"}, ln);
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
     return left;

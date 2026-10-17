@@ -155,6 +155,10 @@ std::shared_ptr<Chunk> Compiler::compileFunction(
       localName.erase(0, 1);
     declareLocal(localName, line);
   }
+  // Declared C/C++ parameter types (set by the caller for this function only).
+  for (size_t i = 0; i < pendingParamCTypes_.size() && i < fnState.locals.size(); ++i)
+    fnState.locals[i].cType = pendingParamCTypes_[i];
+  pendingParamCTypes_.clear();
 
   fnState.chunk->params = params;
   fnState.chunk->paramIsRef =

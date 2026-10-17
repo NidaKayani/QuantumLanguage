@@ -141,17 +141,22 @@ struct StreamState
     char fill = ' ';
 };
 
-std::string formatNumber(double v, const StreamState &st)
+// `kind`: what the program declared the value as — 1 a double/float (always
+// printed the floating-point way, so 1e6 → "1e+06"), 2 an integer (whole
+// numbers ignore fixed/scientific, as for a C++ int), 0 unknown.
+std::string formatNumber(double v, const StreamState &st, int kind = 0)
 {
     bool integral = std::isfinite(v) && std::floor(v) == v && std::fabs(v) < 1e15;
     std::ostringstream out;
-    if (st.base != 10 && integral)
+    if (st.base != 10 && integral && kind != 1)
         out << (st.base == 16 ? std::hex : std::oct) << static_cast<long long>(v);
+    else if (kind == 2 && integral)
+        out << static_cast<long long>(v);
     else if (st.fixed)
         out << std::fixed << std::setprecision(st.precision) << v;
     else if (st.scientific)
         out << std::scientific << std::setprecision(st.precision) << v;
-    else if (integral)
+    else if (integral && kind != 1)
         out << static_cast<long long>(v); // an int prints as an int
     else
         out << std::setprecision(st.precision) << v; // ostream default (%g)
@@ -203,6 +208,23 @@ void VM::sortValues(Array &arr, const QuantumValue &key, const QuantumValue &cmp
         arr[i] = items[i].second;
 }
 
+bool VM::userStreamText(const QuantumValue &v, std::string &out)
+{
+    if (!freeOperators_ || !v.isInstance())
+        return false;
+    for (auto *k = v.asInstance()->klass.get(); k; k = k->base.get())
+    {
+        const std::string fn = "__op__lshift__" + k->name;
+        if (!globals->has(fn))
+            continue;
+        QuantumValue stream = globals->get("ostringstream").asNative()->fn({});
+        invokeCallable(globals->get(fn), {stream, v});
+        out = (*stream.asDict())["str"].asNative()->fn({}).toString();
+        return true;
+    }
+    return false;
+}
+
 void VM::registerStlNatives()
 {
     // ── C++ ostream formatting (see Parser::parseStreamInsertions) ─────────
@@ -215,7 +237,7 @@ void VM::registerStlNatives()
             n->fn = std::move(fn);
             globals->define(name, QuantumValue(n));
         };
-        nat("__cout__", [st](std::vector<QuantumValue> a) -> QuantumValue
+        nat("__cout__", [st, this](std::vector<QuantumValue> a) -> QuantumValue
             {
             QuantumValue v = arg(a, 0);
             // A bare manipulator name that is not a variable: cout << fixed
@@ -244,8 +266,12 @@ void VM::registerStlNatives()
             if (v.isBool())
                 s = st->boolalpha ? (v.asBool() ? "true" : "false") : (v.asBool() ? "1" : "0");
             else if (v.isNumber())
-                s = formatNumber(v.asNumber(), *st);
-            else
+            {
+                // a[2]: the declared kind (Compiler::compileCall) — 1 double, 2 integer
+                int kind = a.size() > 2 && a[2].isNumber() ? (int)a[2].asNumber() : 0;
+                s = formatNumber(v.asNumber(), *st, kind);
+            }
+            else if (!userStreamText(v, s)) // the class's own operator<<, if any
                 s = v.toString();
             if ((int)s.size() < st->width)
             {
@@ -267,6 +293,67 @@ void VM::registerStlNatives()
             for (auto &v : a) std::cerr << v.toString();
             std::cerr.flush();
             return QuantumValue(); });
+
+        // std::ostringstream / std::stringstream (output side): a Dict with a
+        // "write" native, which `ss << a << b` streams into (see Op::LSHIFT),
+        // formatting values the way cout does; ss.str() returns the text and
+        // ss.str("") replaces it.
+        auto stringStream = [this](std::vector<QuantumValue> a) -> QuantumValue
+        {
+            auto buf = std::make_shared<std::string>(
+                a.empty() || a[0].isNil() ? std::string() : a[0].toString());
+            auto method = [](const std::string &name, QuantumNativeFunc fn)
+            {
+                auto n = std::make_shared<QuantumNative>();
+                n->name = name;
+                n->fn = std::move(fn);
+                return QuantumValue(n);
+            };
+            auto d = std::make_shared<Dict>();
+            (*d)["write"] = method("ostringstream.write", [buf, this](std::vector<QuantumValue> v) -> QuantumValue
+                                   {
+                if (v.empty() || v[0].isNil()) return QuantumValue();
+                std::string text;
+                if (v[0].isBool()) *buf += v[0].asBool() ? "1" : "0";
+                else if (v[0].isNumber()) *buf += formatNumber(v[0].asNumber(), StreamState{});
+                else if (userStreamText(v[0], text)) *buf += text; // the class's operator<<
+                else *buf += v[0].toString();
+                return QuantumValue(); });
+            (*d)["str"] = method("ostringstream.str", [buf](std::vector<QuantumValue> v) -> QuantumValue
+                                 {
+                if (!v.empty()) { *buf = v[0].toString(); return QuantumValue(); }
+                return QuantumValue(*buf); });
+            (*d)["clear"] = method("ostringstream.clear", [](std::vector<QuantumValue>) -> QuantumValue
+                                   { return QuantumValue(); });
+            return QuantumValue(d);
+        };
+        nat("ostringstream", stringStream);
+        nat("stringstream", stringStream);
+
+        // `L << x` where x is declared a C/C++ double (Compiler::compileBinary):
+        // a stream gets x formatted as a double; anything else behaves like
+        // Op::LSHIFT.
+        nat("__shl_float__", [this](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            QuantumValue L = arg(a, 0), R = arg(a, 1);
+            if (L.isDict())
+            {
+                auto d = L.asDict();
+                auto it = d->find("write");
+                if (it != d->end() && it->second.isNative())
+                {
+                    QuantumValue text = R.isNumber()
+                        ? QuantumValue(formatNumber(R.asNumber(), StreamState{}, 1)) : R;
+                    it->second.asNative()->fn({text});
+                    return L;
+                }
+            }
+            if (L.isArray())
+            {
+                L.asArray()->push_back(R);
+                return L;
+            }
+            return execBinary(Op::LSHIFT, L, R, 0); });
     }
 
     auto reg = [&](const std::string &name, QuantumNativeFunc fn, bool weak = true)

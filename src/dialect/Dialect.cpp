@@ -25,8 +25,10 @@ bool hasSupportedExt(const std::string &path)
 }
 
 // C/C++ programs only define main() — append a call so the program executes
-// after its top-level declarations load. Ruby files are first normalized into
-// the common Quantum syntax and then use the normal compiler/VM pipeline.
+// after its top-level declarations load (for .sa, only in a multi-file C++
+// project: a C-style `int main(` in a file that splices in local headers).
+// Ruby files are first normalized into the common Quantum syntax and then use
+// the normal compiler/VM pipeline.
 std::string applyDialect(std::string source, const std::string &path)
 {
     std::string ext = fileExtLower(path);
@@ -37,6 +39,16 @@ std::string applyDialect(std::string source, const std::string &path)
         (unsigned char)source[1] == 0xBB && (unsigned char)source[2] == 0xBF)
         source.erase(0, 3);
 
+    // C++ project structure first (local #includes, namespaces, out-of-class
+    // member definitions), so the spliced-in files see every later pass.
+    bool cppProject = false;
+    if (ext == ".c" || ext == ".cpp" || ext == ".sa")
+    {
+        source = applyCppDialect(source, path, &cppProject);
+        if (std::getenv("QUANTUM_DEBUG_CPP"))
+            std::cerr << "----- C++ structure pass -----\n" << source << "----- end -----\n";
+    }
+
     if (ext == ".rb")
         source = applyRubyDialect(source, /*strict=*/true);
     else if (ext == ".sa")
@@ -44,8 +56,11 @@ std::string applyDialect(std::string source, const std::string &path)
     if ((ext == ".rb" || ext == ".sa") && std::getenv("QUANTUM_DEBUG_RUBY"))
         std::cerr << "----- translated -----\n" << source << "----- end -----\n";
 
+    // __cpp_runtime__() switches the VM to C/C++ arithmetic rules first.
     if ((ext == ".c" || ext == ".cpp") && definesMainFunction(source))
-        source += "\nmain()\n";
+        source += "\n__cpp_runtime__()\nmain()\n";
+    else if (ext == ".sa" && cppProject && definesCStyleMain(source))
+        source += "\n__cpp_runtime__()\nmain()\n";
 
     return source;
 }

@@ -37,19 +37,24 @@ void Compiler::compileVarDecl(VarDecl &s, int line)
     else
         emit(Op::LOAD_NIL, 0, line);
 
+    const std::string cType = s.typeHint + (s.isPointer ? "*" : "");
     if (current_->scopeDepth == 0)
     {
         emit(s.isConst ? Op::DEFINE_CONST : Op::DEFINE_GLOBAL, addStr(s.name), line);
+        if (!s.typeHint.empty())
+            globalCTypes_[s.name] = cType;
     }
     else
     {
         declareLocal(s.name, line);
+        current_->locals.back().cType = cType;
         emit(Op::DEFINE_LOCAL, static_cast<int>(current_->locals.size()) - 1, line);
     }
 }
 
 void Compiler::compileFunctionDecl(FunctionDecl &s, int line)
 {
+    pendingParamCTypes_ = s.cppParamTypes;
     auto fnChunk = compileFunction(s.name, s.params, s.paramIsRef, s.defaultArgs, s.body.get(), line,
                                    s.pythonScope);
     auto closureTpl = std::make_shared<Closure>(fnChunk);
@@ -99,11 +104,45 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         if (member->is<VarDecl>())
         {
             auto &field = member->as<VarDecl>();
+            if (field.perInstance && field.initializer)
+            {
+                // fn(self) { return <initializer> } — run by the VM for every
+                // new instance (VM::initInstanceFields); the class itself
+                // keeps nil as the field's fallback value.
+                BlockStmt body;
+                body.statements.push_back(std::make_unique<ASTNode>(
+                    ReturnStmt{std::move(field.initializer)}, member->line));
+                ASTNode bodyNode(std::move(body), member->line);
+                auto fnChunk = compileFunction("<init " + field.name + ">", {"self"}, {false}, {},
+                                               &bodyNode, member->line);
+                field.initializer = std::move(
+                    bodyNode.as<BlockStmt>().statements[0]->as<ReturnStmt>().value);
+                emit(Op::LOAD_NIL, 0, member->line);
+                emit(Op::BIND_METHOD, addStr(field.name), member->line);
+                emit(Op::LOAD_CONST, addConst(QuantumValue(std::make_shared<Closure>(fnChunk))), member->line);
+                emit(fnChunk->upvalueCount > 0 ? Op::MAKE_CLOSURE : Op::MAKE_FUNCTION, 0, member->line);
+                emit(Op::BIND_METHOD, addStr(kFieldInitPrefix + field.name), member->line);
+                return true;
+            }
+            const std::string &t = field.typeHint;
+            const bool numeric = t == "double" || t == "float" || t == "size_t" ||
+                                 t.rfind("int", 0) == 0 || t.rfind("long", 0) == 0 ||
+                                 t.rfind("short", 0) == 0 || t.rfind("unsigned", 0) == 0 ||
+                                 t.rfind("signed", 0) == 0;
             if (field.initializer)
                 compileExpr(*field.initializer);
+            else if (field.isStatic && !field.isPointer && t == "bool")
+                emit(Op::LOAD_FALSE, 0, member->line);
+            else if (field.isStatic && !field.isPointer && t == "string")
+                emit(Op::LOAD_CONST, addConst(QuantumValue(std::string(""))), member->line);
+            else if (field.isStatic && !field.isPointer && numeric)
+                emit(Op::LOAD_CONST, addConst(QuantumValue(0.0)), member->line); // statics are zero-initialised
             else
                 emit(Op::LOAD_NIL, 0, member->line);
-            emit(Op::BIND_METHOD, addStr(field.name), member->line);
+            // A C++ `static` data member is shared by every instance (the VM
+            // routes implicit writes from methods to the class).
+            emit(Op::BIND_METHOD, addStr(field.isStatic ? kStaticPrefix + field.name : field.name),
+                 member->line);
             return true;
         }
         if (member->is<ExprStmt>() &&
@@ -130,9 +169,17 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
     for (auto &field : s.fields)
         bindClassField(field);
 
-    for (auto &method : s.methods)
+    // Static methods compile the same way; their `self` is the class itself
+    // (bound by the VM from QuantumClass::staticMethods).
+    std::vector<std::pair<ASTNodePtr *, bool>> allMethods;
+    for (auto &m : s.methods)
+        allMethods.push_back({&m, false});
+    for (auto &m : s.staticMethods)
+        allMethods.push_back({&m, true});
+    for (auto &[methodPtr, isStaticMethod] : allMethods)
     {
-        if (bindClassField(method))
+        auto &method = *methodPtr;
+        if (!isStaticMethod && bindClassField(method))
             continue;
         if (!method->is<FunctionDecl>())
             continue;
@@ -167,8 +214,14 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         for (auto &d : fd.defaultArgs)
             methodDefaults.push_back(std::move(d));
 
+        // Parameter C types line up with methodParams (after `self`).
+        pendingParamCTypes_.assign(1, "");
+        for (size_t i = startIndex; i < fd.cppParamTypes.size(); ++i)
+            pendingParamCTypes_.push_back(fd.cppParamTypes[i]);
+        classStack_.push_back(s.name);
         auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, methodDefaults, fd.body.get(),
                                        method->line, fd.pythonScope);
+        classStack_.pop_back();
         // Hand the default expressions back to the AST node that owns them.
         for (size_t i = 0; i < fd.defaultArgs.size(); ++i)
             fd.defaultArgs[i] = std::move(methodDefaults[methodDefaults.size() - fd.defaultArgs.size() + i]);
@@ -179,7 +232,7 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         // that only works if the method is created with MAKE_CLOSURE so its
         // upvalue cells exist. Plain methods keep the cheaper MAKE_FUNCTION.
         emit(fnChunk->upvalueCount > 0 ? Op::MAKE_CLOSURE : Op::MAKE_FUNCTION, 0, method->line);
-        emit(Op::BIND_METHOD, addStr(fd.name), method->line);
+        emit(Op::BIND_METHOD, addStr(isStaticMethod ? kStaticPrefix + fd.name : fd.name), method->line);
     }
 
     if (current_->scopeDepth == 0)

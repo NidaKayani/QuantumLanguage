@@ -130,6 +130,14 @@ private:
     // per parameter, so callClosure must not re-collect varargs.
     bool kwArranged_ = false;
     std::vector<bool> kwPassed_;
+    // Set by __cpp_runtime__() at the start of a C/C++ program: `/` follows
+    // IEEE arithmetic (x / 0.0 → inf) instead of raising, as in C/C++.
+    bool cppNumerics_ = false;
+    // Set once a global named __op__* (a lowered C++ free operator function)
+    // is defined, so operators on instances only look those up when they exist.
+    bool freeOperators_ = false;
+    // Set once a class binds a C++ static data member (QuantumClass::staticNames).
+    bool staticDataMembers_ = false;
     // Reorders the `argCount` values on top of the stack, named by `names`,
     // into `closure`'s parameter order: keywords bind by name, unmatched
     // ones fill a **kwargs dict (or remaining slots), extras a *args array.
@@ -173,6 +181,32 @@ private:
     void callClosure(std::shared_ptr<Closure> closure, int argCount, int line);
     void callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line);
     void callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line);
+    // Gives a new instance its own C++ member objects (QuantumClass::fieldInits,
+    // base classes first) before the constructor runs.
+    void initInstanceFields(const QuantumValue &instVal);
+    // Static member `name` of a class or its bases: a static method (bound with
+    // the class as `self`) or a class-level value. False when there is none.
+    bool findStaticMember(const QuantumValue &classVal, const std::string &name, QuantumValue &out);
+    // `Cls::member` with no global of that literal name (enum constants are
+    // globals): the class's static member, or — inside a method of that class
+    // (or a subclass) — its instance method bound to `self`.
+    bool findScopedMember(const std::string &name, const QuantumValue &self, QuantumValue &out);
+    // `cout << obj` for a class with a C++ `operator<<` (lowered to the
+    // global __op__lshift__<Class>): the text that operator writes.
+    bool userStreamText(const QuantumValue &v, std::string &out);
+    // C++ member resolution for the run loop's LOAD_GLOBAL / STORE_GLOBAL /
+    // GET_MEMBER / BIND_METHOD / GET_SUPER, kept out of VM::run so its hot
+    // paths (and the cost of the NameError an implicit field read throws
+    // through it) stay as they were. The push* helpers push what they find.
+    const QuantumValue *frameSelf(const CallFrame &frame) const; // slot 0 of a method, or null
+    bool implicitStaticMember(const CallFrame &frame, const std::string &name, QuantumValue &out);
+    bool pushImplicitStaticMember(const CallFrame &frame, const std::string &name);
+    bool pushCppMember(const std::string &name, const CallFrame &frame);
+    bool pushStaticMember(const std::shared_ptr<QuantumClass> &klass, const std::string &name);
+    bool storeCppStaticMember(const std::string &name, const CallFrame &frame, const QuantumValue &value);
+    bool bindCppMember(QuantumValue &classVal, const std::string &name, const QuantumValue &fn);
+    void getSuper(const std::string &operand, int line);
+    bool callFreeOperator(Op op, const QuantumValue &L, const QuantumValue &R, QuantumValue &out);
     // Calls any callable (closure, bound method, native) to completion from
     // native code — e.g. a JS replace() callback — and returns its result.
     QuantumValue invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args);

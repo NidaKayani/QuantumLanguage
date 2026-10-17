@@ -40,6 +40,9 @@ private:
     // return type). Set for the next parseFunctionDecl by nextFnIsCpp_.
     std::vector<bool> fnIsCpp_;
     bool nextFnIsCpp_ = false;
+    // The C/C++ return type consumed before the next parseFunctionDecl
+    // ("double", "int*") → FunctionDecl::cReturnType.
+    std::string nextFnReturnType_;
     // > 0 inside a Python `def` body, where a method name shared with JS
     // takes its Python meaning: `s.replace(a, b)` replaces every occurrence.
     int pyDepth_ = 0;
@@ -71,6 +74,7 @@ private:
     ASTNodePtr parseFunctionDecl();
     ASTNodePtr parseClassDecl();
     ASTNodePtr parseIfStmt();
+    ASTNodePtr parseCondition(); // `if` / `while` condition (see definition)
     ASTNodePtr parseWhileStmt();
     ASTNodePtr parseForStmt();
     ASTNodePtr parseSwitchStmt(); // C/C++/JS switch — desugared to if-chain
@@ -80,6 +84,7 @@ private:
     ASTNodePtr parseCoutStmt(); // cout << x << y << endl
     std::vector<ASTNodePtr> parseStreamInsertions(); // the `<< a << b` chain
     ASTNodePtr parseCinStmt();  // cin >> x >> y
+    ASTNodePtr parseCinExpr(int ln); // after `cin`: >> targets, or .method(...)
     ASTNodePtr parseImportStmt(bool isFrom = false);
     ASTNodePtr parseExprStmt();
     ASTNodePtr parseCTypeVarDecl(const std::string &typeHint); // int x = ...  / int* p = ...

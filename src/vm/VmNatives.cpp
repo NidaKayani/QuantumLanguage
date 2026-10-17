@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -138,6 +139,86 @@ void VM::registerNatives()
         std::string line;
         std::getline(std::cin, line);
         return QuantumValue(line); });
+
+    // C++ `cin >> target` (see Parser::parseCinExpr): __cin__(current value
+    // [, declared kind]) extracts from std::cin the way C++ does for the
+    // target's declared type (Compiler::cinKind: 1 double, 2 integer — "3.7"
+    // gives 3 and leaves ".7" — 3 char), else a token typed like the current
+    // value: a number for a numeric variable, a string otherwise. A failed
+    // read sets a number to 0 / leaves the target unchanged and puts std::cin
+    // in the failed state, so `if (cin >> x)` is false until cin.clear().
+    reg("__cin__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (g_testMode) return defaultTestInputValue({}, true);
+        QuantumValue prev = args.empty() ? QuantumValue() : args[0];
+        if (std::cin.fail()) return prev;
+        int kind = args.size() > 1 && args[1].isNumber() ? (int)args[1].asNumber() : 0;
+        if (kind == 2)
+        {
+            long long n = 0;
+            if (std::cin >> n) return QuantumValue(static_cast<double>(n));
+            return QuantumValue(0.0);
+        }
+        if (kind == 3)
+        {
+            char c = 0;
+            if (std::cin >> c) return QuantumValue(std::string(1, c));
+            return prev;
+        }
+        if (kind == 1 || prev.isNumber() || prev.isBool())
+        {
+            double d = 0;
+            if (std::cin >> d) return QuantumValue(d);
+            return QuantumValue(0.0);
+        }
+        std::string tok;
+        if (!(std::cin >> tok)) return prev;
+        if (prev.isNil())
+        {
+            // An untyped target (`auto`, an undeclared name): a number if
+            // the whole token is one.
+            char *end = nullptr;
+            double d = std::strtod(tok.c_str(), &end);
+            if (!tok.empty() && end && *end == '\0') return QuantumValue(d);
+        }
+        return QuantumValue(tok); });
+    reg("__cin_good__", [](std::vector<QuantumValue>) -> QuantumValue
+        { return QuantumValue(g_testMode || !std::cin.fail()); });
+    // Emitted before main() of a C/C++ program (applyDialect).
+    reg("__cpp_runtime__", [this](std::vector<QuantumValue>) -> QuantumValue
+        {
+        cppNumerics_ = true;
+        return QuantumValue(); });
+    // Whether a C++ member's declared type can be default-constructed: a
+    // class or a library constructor (vector, map, ...), not an enum.
+    reg("__constructible__", [](std::vector<QuantumValue> a) -> QuantumValue
+        { return QuantumValue(!a.empty() && (a[0].isClass() || a[0].isNative())); });
+    // cin.clear() / cin.ignore(...) / cin.fail() / cin.good() / cin.eof() /
+    // cin.get(); args = {method name, whether it was given arguments}.
+    reg("__cin_method__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        std::string m = args.empty() ? "" : args[0].toString();
+        bool hasArgs = args.size() > 1 && args[1].isTruthy();
+        if (m == "fail" || m == "bad") return QuantumValue(!g_testMode && std::cin.fail());
+        if (m == "good") return QuantumValue(g_testMode || std::cin.good());
+        if (m == "eof") return QuantumValue(!g_testMode && std::cin.eof());
+        if (g_testMode) return QuantumValue();
+        if (m == "clear")
+            std::cin.clear();
+        else if (m == "ignore")
+        {
+            // ignore(n, '\n') — in practice "discard the rest of the line"
+            if (hasArgs)
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            else
+                std::cin.ignore();
+        }
+        else if (m == "get" && !hasArgs)
+        {
+            int c = std::cin.get();
+            return QuantumValue(static_cast<double>(c));
+        }
+        return QuantumValue(); });
     reg("await", [this](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue();
@@ -253,7 +334,18 @@ void VM::registerNatives()
         if (args.empty()) return QuantumValue(std::string(""));
         return QuantumValue(args[0].toString()); };
     reg("str", strNat);
-    reg("string", strNat);
+    // C++ std::string(count, ch) repeats a character; otherwise like str().
+    reg("string", [strNat](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() == 2 && args[0].isNumber() && (args[1].isString() || args[1].isNumber()))
+        {
+            char ch = args[1].isString()
+                          ? (args[1].asString().empty() ? ' ' : args[1].asString()[0])
+                          : static_cast<char>(args[1].asNumber());
+            double n = args[0].asNumber();
+            return QuantumValue(std::string(n > 0 ? static_cast<size_t>(n) : 0, ch));
+        }
+        return strNat(args); });
     reg("_string_", strNat);
     reg("_char_", strNat);
     reg("hex", [](std::vector<QuantumValue> args) -> QuantumValue

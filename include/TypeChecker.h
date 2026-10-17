@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <memory>
 
 class StaticTypeError : public std::runtime_error
@@ -41,4 +42,7 @@ public:
 
 private:
     std::shared_ptr<TypeEnv> globalEnv;
+    // C/C++ enum type names (seen through their constants, `Color::Red`):
+    // numbers in the VM, so an int initializes them.
+    std::set<std::string> enumTypes;
 };

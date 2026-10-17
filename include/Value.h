@@ -3,6 +3,7 @@
 #include <vector>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <functional>
 #include <variant>
@@ -267,6 +268,13 @@ private:
 
 // ─── Class & Instance ────────────────────────────────────────────────────────
 
+// BIND_METHOD name prefix marking a per-instance field initializer (a C++
+// member object such as `vector<int> v;`), stored in QuantumClass::fieldInits.
+inline const std::string kFieldInitPrefix = "__fieldinit__:";
+// BIND_METHOD name prefix marking a `static` member: a method goes to
+// QuantumClass::staticMethods, a data member to staticFields + staticNames.
+inline const std::string kStaticPrefix = "__static__:";
+
 struct QuantumClass
 {
     std::string name;
@@ -274,6 +282,12 @@ struct QuantumClass
     std::unordered_map<std::string, std::shared_ptr<Closure>> methods;
     std::unordered_map<std::string, std::shared_ptr<Closure>> staticMethods;
     std::unordered_map<std::string, QuantumValue> staticFields;
+    // (field, fn(self) -> initial value), run in declaration order for every
+    // new instance before its constructor.
+    std::vector<std::pair<std::string, std::shared_ptr<Closure>>> fieldInits;
+    // staticFields entries that are C++ `static` data members (shared by all
+    // instances) rather than default values of per-instance fields.
+    std::unordered_set<std::string> staticNames;
 };
 
 struct QuantumInstance

@@ -139,6 +139,8 @@ void VM::runFrame(size_t stopDepth)
             const std::string &name = consts[instr.operand].asString();
             globals->define(name, pop());
             weakGlobals_.erase(name); // a user definition replaces a weak builtin
+            if (name.compare(0, 6, "__op__") == 0)
+                freeOperators_ = true; // a C++ free operator (see VM::execBinary)
             break;
         }
         case Op::DEFINE_CONST:
@@ -183,6 +185,9 @@ void VM::runFrame(size_t stopDepth)
                     if (isMethod)
                         break;
                 }
+                // a static member of the class whose method this is
+                if (pushImplicitStaticMember(frame, name))
+                    break;
             }
             try
             {
@@ -237,7 +242,9 @@ void VM::runFrame(size_t stopDepth)
                         }
                     }
                 }
-                if (!found)
+                // C++: `Cls::member`, a static method called unqualified, or
+                // a static member read inside a static method
+                if (!found && !pushCppMember(name, frame))
                     push(QuantumValue()); // return nil for missing
             }
             break;
@@ -251,7 +258,12 @@ void VM::runFrame(size_t stopDepth)
             bool inMethod = !params.empty() && params[0] == "self" &&
                             frame.stackBase < stack_.size() &&
                             stack_[frame.stackBase].isInstance();
-            if (inMethod && (!globals->has(name) || weakGlobals_.count(name)))
+            bool notGlobal = !globals->has(name) || weakGlobals_.count(name);
+            // A C++ static data member (or `Cls::member = v`): held by the class
+            if (notGlobal && (staticDataMembers_ || name.find("::") != std::string::npos) &&
+                storeCppStaticMember(name, frame, peek(0)))
+                break;
+            if (inMethod && notGlobal)
                 stack_[frame.stackBase].asInstance()->setField(name, peek(0));
             else if (globals->has(name))
                 globals->set(name, peek(0));
@@ -536,6 +548,7 @@ void VM::runFrame(size_t stopDepth)
                 inst->klass = klass;
                 inst->env = std::make_shared<Environment>(globals);
                 QuantumValue instVal(inst);
+                initInstanceFields(instVal);
 
                 auto *k = klass.get();
                 bool initFound = false;
@@ -892,7 +905,11 @@ void VM::runFrame(size_t stopDepth)
                 if (found)
                     break;
 
-                // 3. Unknown name on an instance -> nil, matching Ruby's
+                // 3. A static method called through an object: obj.count()
+                if (pushStaticMember(inst->klass, name))
+                    break;
+
+                // 4. Unknown name on an instance -> nil, matching Ruby's
                 // (and Python's) "unset attribute reads as nil" semantics.
                 // Falling through to the builtin-method wrapper below would
                 // instead yield a truthy native object for a plain field
@@ -915,12 +932,9 @@ void VM::runFrame(size_t stopDepth)
                     push(cm->second);
                     break;
                 }
-                auto fi = klass->staticFields.find(name);
-                if (fi != klass->staticFields.end())
-                {
-                    push(fi->second);
+                // static methods / class-level values, including inherited ones
+                if (pushStaticMember(klass, name))
                     break;
-                }
             }
 
             // Dict: check stored keys first (enables console.log, module objects, etc.)
@@ -1103,6 +1117,8 @@ void VM::runFrame(size_t stopDepth)
             if (!classVal.isClass())
                 throw RuntimeError("BIND_METHOD: top is not a class", line);
 
+            if (bindCppMember(classVal, methodName, fn))
+                break; // a per-instance field initializer or a static member
             if (fn.isClosure())
                 classVal.asClass()->methods[methodName] = fn.asFunction();
             else
@@ -1161,6 +1177,7 @@ void VM::runFrame(size_t stopDepth)
             inst->klass = klass;
             inst->env = std::make_shared<Environment>(globals);
             QuantumValue instVal(inst);
+            initInstanceFields(instVal);
 
             auto *k = klass.get();
             bool initFound = false;
@@ -1194,44 +1211,8 @@ void VM::runFrame(size_t stopDepth)
         }
 
         case Op::GET_SUPER:
-        {
-            const std::string &method = consts[instr.operand].asString();
-            QuantumValue selfVal = pop();
-            if (!selfVal.isInstance())
-                throw RuntimeError("super: self is not an instance", line);
-
-            auto base = selfVal.asInstance()->klass->base;
-            if (!base)
-                throw RuntimeError("super: class has no base class", line);
-
-            std::string lookupMethod = method;
-            if (method == "__init__")
-                lookupMethod = "init";
-            else if (method == "__str__" || method == "toString")
-                lookupMethod = "__str__";
-
-            auto *k = base.get();
-            bool superFound = false;
-            while (k && !superFound)
-            {
-                auto it = k->methods.find(lookupMethod);
-                if (it == k->methods.end())
-                    it = k->methods.find(method);
-                if (it != k->methods.end())
-                {
-                    auto bm = std::make_shared<QuantumBoundMethod>();
-                    bm->method = it->second;
-                    bm->self = selfVal;
-                    push(QuantumValue(bm));
-                    superFound = true;
-                }
-                if (!superFound)
-                    k = k->base.get();
-            }
-            if (!superFound)
-                push(QuantumValue());
+            getSuper(consts[instr.operand].asString(), line);
             break;
-        }
 
         // ── Exceptions ────────────────────────────────────────────────────
         case Op::PUSH_HANDLER:
