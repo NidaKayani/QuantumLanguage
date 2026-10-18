@@ -8,6 +8,7 @@
 // dependencies' own scripts (`qpm run` / `qpm start`) still shells out to
 // whatever the script names — same as npm, qpm doesn't include a JS engine.
 
+#include "QpmBuild.h"
 #include "QpmPublish.h"
 #include "QpmRegistry.h"
 #include "QpmResolver.h"
@@ -23,6 +24,7 @@
 #include <windows.h>
 #endif
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -46,6 +48,13 @@ namespace
             "  qpm i / qpm add             aliases for `qpm install`\n"
             "  qpm run <script>            runs a manifest \"scripts\" entry\n"
             "  qpm start                   shorthand for `qpm run start`\n"
+            "  qpm build                   runs the \"build\" script, or builds a C/C++ project\n"
+            "                              (CMakeLists.txt / Makefile / plain sources) natively\n"
+            "  qpm build [name] --run      builds, then runs the program (args after --)\n"
+            "  qpm build --debug           debug build (default --release)\n"
+            "  qpm build --clean           removes the build outputs\n"
+            "  qpm build --cmake | --make | --direct   picks how a C/C++ project is built\n"
+            "  qpm build -j <n> / -v       parallel compiles / print each command\n"
             "  qpm publish                 packs this package and uploads it to the registry\n"
             "  qpm publish --dry-run       shows what would be published, uploads nothing\n"
             "  qpm publish --token <t>     publish with this token instead of the saved login\n"
@@ -95,6 +104,52 @@ namespace
             }
         }
         return qpm::runPublish(opts);
+    }
+
+    int runBuildCommand(const std::vector<std::string> &args, const std::string &cwd)
+    {
+        qpm::BuildOptions opts;
+        opts.projectDir = cwd;
+        const char *usage = "[qpm] usage: qpm build [name] [--run] [--debug|--release] [--clean]"
+                            " [--cmake|--make|--direct] [-j <n>] [-v] [-- <program args>]\n";
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            if (a == "--")
+            {
+                opts.runArgs.assign(args.begin() + static_cast<std::ptrdiff_t>(i) + 1, args.end());
+                opts.run = true;
+                break;
+            }
+            if (a == "--run" || a == "-r")
+                opts.run = true;
+            else if (a == "--debug")
+                opts.release = false;
+            else if (a == "--release")
+                opts.release = true;
+            else if (a == "--clean")
+                opts.clean = true;
+            else if (a == "--verbose" || a == "-v")
+                opts.verbose = true;
+            else if (a == "--cmake")
+                opts.backend = qpm::BuildBackend::CMake;
+            else if (a == "--make")
+                opts.backend = qpm::BuildBackend::Make;
+            else if (a == "--direct")
+                opts.backend = qpm::BuildBackend::Direct;
+            else if ((a == "-j" || a == "--jobs") && i + 1 < args.size())
+                opts.jobs = std::atoi(args[++i].c_str());
+            else if (a.size() > 2 && a.compare(0, 2, "-j") == 0)
+                opts.jobs = std::atoi(a.c_str() + 2);
+            else if (!a.empty() && a[0] != '-' && opts.target.empty())
+                opts.target = a;
+            else
+            {
+                std::cerr << "[qpm] unknown build option: " << a << "\n" << usage;
+                return 1;
+            }
+        }
+        return qpm::runBuild(opts);
     }
 }
 
@@ -147,6 +202,8 @@ int main(int argc, char *argv[])
 
     if (cmd == "start")
         return qpm::runScript(cwd, "start");
+    if (cmd == "build")
+        return runBuildCommand(args, cwd);
     if (cmd == "init")
     {
         bool yes = false;

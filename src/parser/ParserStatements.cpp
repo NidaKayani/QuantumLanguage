@@ -413,10 +413,10 @@ ASTNodePtr Parser::parseStatement()
         while (lookahead < tokens.size() && (isCTypeKeyword(tokens[lookahead].type) ||
                                              tokens[lookahead].type == TokenType::CONST))
             ++lookahead;
-        // Skip pointer/reference qualifiers between type and name: int* funcName, int& ref
+        // Skip pointer/reference qualifiers between type and name: int* funcName, int& ref, char** p
         while (lookahead < tokens.size() &&
                (tokens[lookahead].type == TokenType::STAR || tokens[lookahead].type == TokenType::BIT_AND ||
-                tokens[lookahead].type == TokenType::CONST))
+                tokens[lookahead].type == TokenType::POWER || tokens[lookahead].type == TokenType::CONST))
             ++lookahead;
         // Also accept keyword tokens used as function names (e.g. "input", "display", "print")
         auto isValidFuncName = [&](TokenType t)
@@ -483,10 +483,13 @@ ASTNodePtr Parser::parseStatement()
                     consume(); // eat return type keywords + const
                 }
                 // Also eat any pointer/reference qualifiers: int* funcName → eat *
-                while (check(TokenType::STAR) || check(TokenType::BIT_AND) || check(TokenType::CONST))
+                while (check(TokenType::STAR) || check(TokenType::POWER) || check(TokenType::BIT_AND) ||
+                       check(TokenType::CONST))
                 {
                     if (check(TokenType::STAR))
                         retType += "*";
+                    else if (check(TokenType::POWER))
+                        retType += "**";
                     consume();
                 }
                 nextFnIsCpp_ = true;
@@ -972,6 +975,23 @@ ASTNodePtr Parser::parseStatement()
                         if (hasStructKeyword)
                             consume(); // eat 'struct'
                         std::string retType = consume().value; // eat return type (e.g. 'Node')
+                        // Template arguments of the return type: vector<int> make(...)
+                        if (check(TokenType::LT))
+                        {
+                            int tdepth = 0;
+                            while (!atEnd())
+                            {
+                                if (check(TokenType::LT))
+                                    tdepth++;
+                                else if (check(TokenType::GT))
+                                    tdepth--;
+                                else if (check(TokenType::RSHIFT))
+                                    tdepth -= 2;
+                                consume();
+                                if (tdepth <= 0)
+                                    break;
+                            }
+                        }
                         while (check(TokenType::STAR) || check(TokenType::BIT_AND) || check(TokenType::CONST))
                         {
                             if (check(TokenType::STAR))
@@ -1083,6 +1103,7 @@ ASTNodePtr Parser::parseStatement()
                         }
                         else if (match(TokenType::ASSIGN))
                         {
+                            skipNewlines(); // the value may start on the next line
                             BraceInitScope braceInit(braceInitDepth_);
                             init = parseExpr();
                         }
@@ -1352,7 +1373,10 @@ ASTNodePtr Parser::parseVarDecl(bool isConst)
 
     ASTNodePtr init;
     if (match(TokenType::ASSIGN))
+    {
+        skipNewlines(); // the value may start on the next line
         init = parseExpr();
+    }
 
     // Multi-var: const W = 60, H = 24  /  let x = 1, y = 2
     if (check(TokenType::COMMA))
@@ -1383,7 +1407,10 @@ ASTNodePtr Parser::parseVarDecl(bool isConst)
 
             ASTNodePtr init2;
             if (match(TokenType::ASSIGN))
+            {
+                skipNewlines();
                 init2 = parseExpr();
+            }
             block->as<BlockStmt>().statements.push_back(
                 std::make_unique<ASTNode>(VarDecl{isConst, n2, std::move(init2), h2}, ln));
         }
@@ -2080,6 +2107,7 @@ ASTNodePtr Parser::parseClassDecl()
                         }
                         if (match(TokenType::ASSIGN))
                         {
+                            skipNewlines(); // the value may start on the next line
                             BraceInitScope braceInit(braceInitDepth_);
                             init = parseExpr();
                         }
@@ -3080,8 +3108,9 @@ ASTNodePtr Parser::parseForStmt()
                 initNode = std::make_unique<ASTNode>(ExprStmt{std::move(expr)}, ln);
             }
         }
-        while (check(TokenType::SEMICOLON))
-            consume();
+        // Exactly one ';' per clause: in `for (;;)` the second one ends the
+        // (empty) condition.
+        match(TokenType::SEMICOLON);
 
         // ── Condition ─────────────────────────────────────────────────────
         ASTNodePtr condition;
@@ -3089,8 +3118,7 @@ ASTNodePtr Parser::parseForStmt()
             condition = parseExpr();
         else
             condition = std::make_unique<ASTNode>(BoolLiteral{true}, ln); // infinite if omitted
-        while (check(TokenType::SEMICOLON))
-            consume();
+        match(TokenType::SEMICOLON);
 
         // ── Post expression ───────────────────────────────────────────────
         ASTNodePtr postNode;

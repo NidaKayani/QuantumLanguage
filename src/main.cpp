@@ -23,6 +23,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -168,6 +169,10 @@ int main(int argc, char *argv[])
     }
     if (arg == "--check" && argc >= 3)
         return checkFile(argv[2]);
+    // `quantum build [name] [--run] ...` builds a native C/C++ project — the
+    // same command as `qpm build`.
+    if (arg == "build")
+        return runQpm(std::vector<std::string>(argv + 1, argv + argc), exePath);
     if (arg == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
     // Hidden: run one file in this process for the batch runner (child worker).
@@ -209,8 +214,9 @@ int main(int argc, char *argv[])
     // Default: compile any supported source file → <file>.exe → run.
     // .js/.py/.rb/.c/.cpp compile through the same multi-syntax front-end as .sa,
     // so no node/python/gcc/g++ is required and the produced .exe is standalone.
+    // Arguments after the file go to the program: quantum app.cpp -c "..."
     if (hasSupportedExt(arg))
-        return bundleAndRun(arg, exePath);
+        return bundleAndRun(arg, exePath, std::vector<std::string>(argv + 2, argv + argc));
 
     std::cerr << "[Error] Unsupported file type: " << arg << "\n";
     std::cerr << "Supported: .sa, .js, .py, .rb, .c, .cpp (run natively on the Quantum VM)\n";

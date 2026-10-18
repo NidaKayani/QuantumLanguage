@@ -404,13 +404,21 @@ void Compiler::compileFor(ForStmt &s, int line)
 
 void Compiler::compileReturn(ReturnStmt &s, int line)
 {
+    // leaving try bodies: their handlers go first (the VM also drops any a
+    // returning frame left behind)
     if (s.value)
     {
         compileExpr(*s.value);
+        for (int i = 0; i < current_->tryDepth; ++i)
+            emit(Op::POP_HANDLER, 0, line);
         emit(Op::RETURN, 0, line);
     }
     else
+    {
+        for (int i = 0; i < current_->tryDepth; ++i)
+            emit(Op::POP_HANDLER, 0, line);
         emit(Op::RETURN_NIL, 0, line);
+    }
 }
 
 void Compiler::compilePrint(PrintStmt &s, int line)
@@ -459,8 +467,10 @@ void Compiler::compileImport(ImportStmt &s, int line)
 void Compiler::compileTry(TryStmt &s, int line)
 {
     size_t handlerJump = emitJump(Op::PUSH_HANDLER, line);
+    ++current_->tryDepth;
     if (s.body)
         compileNode(*s.body);
+    --current_->tryDepth;
     emit(Op::POP_HANDLER, 0, line);
     size_t afterHandlers = emitJump(Op::JUMP, line);
     patchJump(handlerJump);

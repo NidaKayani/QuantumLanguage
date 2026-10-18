@@ -15,6 +15,7 @@
 // this layer. QUANTUM_DEBUG_CPP dumps the output of the C++ structure pass
 // (spliced includes, lowered namespaces, merged member definitions).
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -56,3 +57,10 @@ bool definesCStyleMain(const std::string &src);
 // when at least one local file was spliced in.
 std::string applyCppDialect(const std::string &source, const std::string &path,
                             bool *multiFile = nullptr);
+
+// Include lookup shared by the typed C/C++ front-end: `#include "name"` from
+// `from` (next to it, then include/ folders up to the project root), and the
+// implementation file of a header (x.h -> x.cpp, include/l/x.hpp -> src/x.cpp),
+// or an empty path.
+std::filesystem::path cppResolveInclude(const std::string &name, const std::filesystem::path &from);
+std::filesystem::path cppImplementationOf(const std::filesystem::path &header);

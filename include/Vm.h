@@ -10,6 +10,15 @@
 #include <functional>
 #include <string>
 
+// A C++ `throw` from code compiled by the typed C/C++ front-end: carries the
+// thrown value to the handler (VM::runFrame pushes it instead of a message).
+struct CppThrow : public QuantumError
+{
+    QuantumValue value;
+    explicit CppThrow(QuantumValue v)
+        : QuantumError("CppThrow", v.isString() ? v.asString() : std::string("C++ exception")), value(std::move(v)) {}
+};
+
 // ─── Upvalue (heap cell for captured variables) ───────────────────────────────
 // While the captured variable is still live, the upvalue refers to its stack
 // slot by index — never by address: the stack is a std::deque, and inserting
@@ -153,6 +162,7 @@ private:
     // ── Native registration ───────────────────────────────────────────────────
     void registerNatives();
     void registerStlNatives(); // <algorithm>-style free functions (VmStl.cpp)
+    void registerCppNatives(); // runtime of the typed C/C++ front-end (VmCpp.cpp)
     void registerJsRuntimeNatives(); // URL, window, encodeURIComponent (VmJsRuntime.cpp)
     // Globals that yield to a same-named member inside a method: common
     // identifiers like `next`/`count`/`find` registered as STL algorithms

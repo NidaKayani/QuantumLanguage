@@ -1,5 +1,6 @@
 #include "Vm.h"
 #include "Error.h"
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <cmath>
@@ -45,6 +46,7 @@ VM::VM()
     globals = std::make_shared<Environment>();
     registerNatives();
     registerStlNatives();
+    registerCppNatives();
     registerJsRuntimeNatives();
 }
 
@@ -350,6 +352,21 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         return QuantumValue(valuesEqual(L, R));
     if (op == Op::NEQ)
         return QuantumValue(!valuesEqual(L, R));
+
+    // Two strings order lexicographically ("apple" < "banana"), as in Python,
+    // JavaScript and C++ — not by their numeric value.
+    if (L.isString() && R.isString() &&
+        (op == Op::LT || op == Op::GT || op == Op::LTE || op == Op::GTE))
+    {
+        int c = L.asString().compare(R.asString());
+        switch (op)
+        {
+        case Op::LT: return QuantumValue(c < 0);
+        case Op::GT: return QuantumValue(c > 0);
+        case Op::LTE: return QuantumValue(c <= 0);
+        default: return QuantumValue(c >= 0);
+        }
+    }
 
     // Numeric arithmetic
     double l = 0, r = 0;

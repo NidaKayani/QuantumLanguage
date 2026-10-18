@@ -74,6 +74,83 @@ bool isHeaderExt(const fs::path &p)
     return ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx" || ext == ".h++";
 }
 
+// A folder that holds a whole project: include lookups stop climbing here.
+bool isProjectRoot(const fs::path &dir)
+{
+    std::error_code ec;
+    for (const char *marker : {"CMakeLists.txt", "Makefile", "makefile", "package.json", "package.qon", ".git"})
+        if (fs::exists(dir / marker, ec))
+            return true;
+    return false;
+}
+
+// `#include "x"` is looked up next to the including file, then (for the
+// usual include/ + src/ layout, `#include "minidb/value.hpp"` from tests/)
+// in each folder above it and that folder's include/, up to the project root.
+fs::path findInclude(const std::string &name, const fs::path &from)
+{
+    std::error_code ec;
+    const fs::path rel = fs::u8path(name);
+    fs::path dir = fs::absolute(from, ec).parent_path();
+    if (fs::is_regular_file(dir / rel, ec))
+        return dir / rel;
+    for (int up = 0; up < 8 && !dir.empty(); ++up)
+    {
+        if (up > 0 && fs::is_regular_file(dir / rel, ec))
+            return dir / rel;
+        if (fs::is_regular_file(dir / "include" / rel, ec))
+            return dir / "include" / rel;
+        fs::path parent = dir.parent_path();
+        if (isProjectRoot(dir) || parent == dir)
+            break;
+        dir = parent;
+    }
+    return {};
+}
+
+// The implementation file of a header: next to it (local.h → local.cpp), or
+// for include/<lib>/name.hpp in the project's src/ (src/name.cpp,
+// src/<lib>/name.cpp).
+fs::path findImplementation(const fs::path &header)
+{
+    static const char *const exts[] = {".sa", ".cpp", ".cc", ".cxx", ".c"};
+    std::error_code ec;
+    for (const char *ext : exts)
+    {
+        fs::path impl = header;
+        impl.replace_extension(ext);
+        if (fs::is_regular_file(impl, ec))
+            return impl;
+    }
+    // Climb to the project root, remembering the path below an include/ folder.
+    const fs::path abs = fs::absolute(header, ec);
+    fs::path dir = abs.parent_path(), root, belowInclude;
+    for (int up = 0; up < 8 && !dir.empty(); ++up)
+    {
+        if (belowInclude.empty() && dir.filename() == "include")
+            belowInclude = abs.lexically_relative(dir);
+        fs::path parent = dir.parent_path();
+        if (isProjectRoot(dir) || parent == dir)
+        {
+            root = dir;
+            break;
+        }
+        dir = parent;
+    }
+    if (root.empty() || belowInclude.empty())
+        return {};
+    std::vector<fs::path> stems = {belowInclude, belowInclude.filename()};
+    for (const char *base : {"src", "source", "lib", ""})
+        for (fs::path stem : stems)
+            for (const char *ext : exts)
+            {
+                fs::path impl = (*base ? root / base : root) / stem.replace_extension(ext);
+                if (fs::is_regular_file(impl, ec))
+                    return impl;
+            }
+    return {};
+}
+
 struct IncludeState
 {
     std::set<std::string> seen;  // files already spliced in (include-once)
@@ -91,9 +168,9 @@ std::string expandIncludes(const std::string &src, const fs::path &file, Include
         std::smatch m;
         if (std::regex_match(line, m, includeRe))
         {
-            fs::path target = file.parent_path() / fs::u8path(m[1].str());
+            fs::path target = findInclude(m[1].str(), file);
             std::error_code ec;
-            if (fs::is_regular_file(target, ec))
+            if (!target.empty())
             {
                 std::string key = pathKey(target);
                 if (!st.seen.count(key))
@@ -103,19 +180,14 @@ std::string expandIncludes(const std::string &src, const fs::path &file, Include
                     out += "\n";
                     if (isHeaderExt(target))
                     {
-                        for (const char *ext : {".sa", ".cpp", ".cc", ".cxx", ".c"})
+                        fs::path impl = findImplementation(target);
+                        if (!impl.empty())
                         {
-                            fs::path impl = target;
-                            impl.replace_extension(ext);
-                            if (fs::is_regular_file(impl, ec))
+                            std::string ik = pathKey(impl);
+                            if (!st.queued.count(ik))
                             {
-                                std::string ik = pathKey(impl);
-                                if (!st.queued.count(ik))
-                                {
-                                    st.queued.insert(ik);
-                                    st.impls.push_back(impl);
-                                }
-                                break;
+                                st.queued.insert(ik);
+                                st.impls.push_back(impl);
                             }
                         }
                     }
@@ -254,6 +326,77 @@ std::vector<Tok> scan(const std::string &s)
         ++i;
     }
     return out;
+}
+
+// ─── Names that are Quantum keywords but plain identifiers in C/C++ ───────
+//
+// `std::ifstream in(path)`, `enum class Kind { None }`, `const Node& self`:
+// the shared lexer would read these names as keywords. A word is renamed
+// (everywhere, `obj.in` included) only when the C/C++ code declares it — a
+// variable, parameter, member or enumerator — so Quantum syntax that a .cpp
+// file may also use (`let a = 10`, `for x in xs`) keeps its meaning.
+
+void renameKeywordClashes(std::string &s)
+{
+    static const std::set<std::string> clashes = {
+        "let", "fn", "def", "extends", "self", "elif", "in", "of", "raise",
+        "except", "finally", "as", "with", "from", "is", "nil", "null",
+        "undefined", "None", "True", "False"};
+    // Words before a name that make it an expression, not a declaration.
+    static const std::set<std::string> notTypes = {
+        "return", "case", "else", "throw", "new", "delete", "sizeof", "typeid", "goto",
+        "using", "namespace", "operator", "co_return", "co_yield", "co_await", "do"};
+    if (s.find_first_of("abcdefghijklmnopqrstuvwxyzNTF") == std::string::npos)
+        return;
+    std::vector<Tok> toks = scan(s);
+    auto is = [&](size_t i, const char *text)
+    { return i < toks.size() && toks[i].text == text; };
+
+    std::set<std::string> declared;
+    for (size_t i = 0; i < toks.size(); ++i)
+    {
+        // enum [class|struct] [Name] [: type] { a, b = 1, ... }
+        if (toks[i].kind == Tok::Ident && toks[i].text == "enum")
+        {
+            size_t j = i + 1;
+            while (j < toks.size() && !is(j, "{") && !is(j, ";"))
+                ++j;
+            if (!is(j, "{"))
+                continue;
+            for (++j; j < toks.size() && !is(j, "}"); ++j)
+                if (toks[j].kind == Tok::Ident && clashes.count(toks[j].text) && (is(j - 1, "{") || is(j - 1, ",")))
+                    declared.insert(toks[j].text);
+            continue;
+        }
+        if (toks[i].kind != Tok::Ident || !clashes.count(toks[i].text) || i == 0 || i + 1 >= toks.size())
+            continue;
+        // Type before it (`ifstream in`, `Node* self`, `vector<int> of`), then
+        // ( ) ; = , [ { after it.
+        const Tok &prev = toks[i - 1];
+        bool typeBefore = (prev.kind == Tok::Ident && !notTypes.count(prev.text) && !clashes.count(prev.text)) ||
+                          prev.text == "*" || prev.text == "&" || prev.text == ">";
+        const std::string &next = toks[i + 1].text;
+        bool declEnd = next == "(" || next == ")" || next == ";" || next == "=" || next == "," || next == "[" ||
+                       next == "{";
+        bool pythonFor = i >= 2 && toks[i - 2].text == "for"; // for x in (...)
+        if (typeBefore && declEnd && !pythonFor)
+            declared.insert(toks[i].text);
+    }
+    if (declared.empty())
+        return;
+
+    std::string out;
+    size_t last = 0;
+    for (const Tok &t : toks)
+    {
+        if (t.kind != Tok::Ident || !declared.count(t.text))
+            continue;
+        out.append(s, last, t.begin - last);
+        out += "__kw_" + t.text;
+        last = t.end;
+    }
+    out.append(s, last, std::string::npos);
+    s = std::move(out);
 }
 
 struct Scanned
@@ -853,6 +996,101 @@ std::map<std::string, ClassInfo> findClasses(const Scanned &s)
     return out;
 }
 
+// ─── Enums nested in a class ──────────────────────────────────────────────
+//
+//   struct Expr { enum class Kind { A, B }; Kind k = Kind::A; };
+//     → enum class Expr__Kind { A, B };
+//       struct Expr { Expr__Kind k = Expr__Kind::A; };
+//
+// and Expr::Kind becomes Expr__Kind everywhere, the way namespaces lower.
+
+bool hoistNestedEnums(std::string &src)
+{
+    if (src.find("enum") == std::string::npos)
+        return false;
+    Scanned s(src);
+    std::vector<Edit> edits;
+    std::set<std::pair<std::string, std::string>> qualified; // (class, enum)
+    for (const auto &c : findClasses(s))
+    {
+        const std::string &cls = c.first;
+        const size_t open = c.second.open, close = c.second.close;
+        const int level = s.depth[open] + 1;
+        std::map<std::string, std::string> local; // Kind → Expr__Kind
+        std::vector<std::pair<size_t, size_t>> removed;
+        std::string hoisted;
+        for (size_t k = open + 1; k < close; ++k)
+        {
+            if (!s.is(k, "enum") || s.depth[k] != level)
+                continue;
+            size_t n = k + 1;
+            if (s.is(n, "class") || s.is(n, "struct"))
+                ++n;
+            if (!s.ident(n))
+                continue; // anonymous enum: its enumerators stay members
+            size_t b = n + 1;
+            while (b < close && !s.is(b, "{") && !s.is(b, ";"))
+                ++b;
+            if (!s.is(b, "{") || s.match[b] < 0 || !s.is((size_t)s.match[b] + 1, ";"))
+                continue; // `enum E { ... } e;` declares a member too: leave it
+            const size_t e = (size_t)s.match[b], semi = e + 1;
+            const std::string flat = cls + "__" + s.t[n].text;
+            local[s.t[n].text] = flat;
+            qualified.insert({cls, s.t[n].text});
+            hoisted += s.text(k, n - 1) + " " + flat + " " + s.text(n + 1, e) + ";\n";
+            edits.push_back({s.t[k].begin, s.t[semi].end, ""});
+            removed.push_back({k, semi});
+            k = semi;
+        }
+        if (local.empty())
+            continue;
+        // Unqualified uses inside the class (`Kind kind = Kind::A;`) and in
+        // its out-of-class member definitions (`... Expr::f(Kind k) { ... }`).
+        auto renameIn = [&](size_t first, size_t last)
+        {
+            for (size_t k = first; k <= last && k < s.size(); ++k)
+            {
+                bool inRemoved = false;
+                for (const auto &r : removed)
+                    inRemoved = inRemoved || (k >= r.first && k <= r.second);
+                if (inRemoved || !s.ident(k) || !local.count(s.t[k].text) || s.is(k - 1, "::") ||
+                    s.is(k - 1, ".") || s.is(k - 1, "->"))
+                    continue;
+                edits.push_back({s.t[k].begin, s.t[k].end, local[s.t[k].text]});
+            }
+        };
+        renameIn(open + 1, close - 1);
+        for (size_t k = 0; k + 3 < s.size(); ++k)
+        {
+            if (s.depth[k] != 0 || !s.is(k, cls.c_str()) || !s.is(k + 1, "::") || s.is(k - 1, "::"))
+                continue;
+            size_t paren = k + 2;
+            while (paren < k + 6 && paren < s.size() && !s.is(paren, "(") && !s.is(paren, ";") &&
+                   !s.is(paren, "{"))
+                ++paren;
+            if (!s.is(paren, "("))
+                continue;
+            size_t body = bodyAfterParams(s, paren);
+            if (body)
+                renameIn(paren, (size_t)s.match[body]);
+        }
+        // The hoisted enums go right before `struct Expr`.
+        size_t kw = open;
+        while (kw > 0 && !((s.is(kw, "struct") || s.is(kw, "class")) && s.is(kw + 1, cls.c_str())))
+            --kw;
+        edits.push_back({s.t[kw].begin, s.t[kw].begin, hoisted});
+    }
+    if (qualified.empty())
+        return false;
+    // Qualified uses anywhere: Expr::Kind → Expr__Kind
+    for (size_t k = 0; k + 2 < s.size(); ++k)
+        if (s.ident(k) && s.is(k + 1, "::") && s.ident(k + 2) && qualified.count({s.t[k].text, s.t[k + 2].text}) &&
+            !s.is(k - 1, "::"))
+            edits.push_back({s.t[k].begin, s.t[k + 2].end, s.t[k].text + "__" + s.t[k + 2].text});
+    src = applyEdits(src, edits);
+    return true;
+}
+
 // The member name a definition names after "Cls::" at index i — "f", "~Cls",
 // or "operator+" — and the index just past it.
 std::pair<std::string, size_t> memberNameAt(const Scanned &s, size_t i)
@@ -1349,6 +1587,10 @@ std::string applyCppDialect(const std::string &source, const std::string &path, 
         }
     }
 
+    const std::string ext = fileExtLower(path);
+    if (ext == ".c" || ext == ".cpp")
+        renameKeywordClashes(out);
+
     if (out.find("namespace") != std::string::npos)
     {
         splitNestedNamespaces(out);
@@ -1357,6 +1599,11 @@ std::string applyCppDialect(const std::string &source, const std::string &path, 
         {
         }
     }
+
+    // Before the member merge, so `Expr::Kind Expr::kind()` reads as one
+    // return type.
+    if (out.find("enum") != std::string::npos)
+        hoistNestedEnums(out);
 
     if (out.find("::") != std::string::npos)
     {
@@ -1383,4 +1630,16 @@ bool definesCStyleMain(const std::string &src)
             !s.is(i - 1, "*") && !s.is(i - 1, "&") && !s.is(i - 1, "::"))
             return false;
     return true;
+}
+
+// ─── Shared with the typed front-end (src/cpp/CppLex.cpp) ─────────────────
+
+std::filesystem::path cppResolveInclude(const std::string &name, const std::filesystem::path &from)
+{
+    return findInclude(name, from);
+}
+
+std::filesystem::path cppImplementationOf(const std::filesystem::path &header)
+{
+    return isHeaderExt(header) ? findImplementation(header) : std::filesystem::path();
 }

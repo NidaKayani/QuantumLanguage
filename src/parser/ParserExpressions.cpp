@@ -123,6 +123,7 @@ ASTNodePtr Parser::parseAssignment()
         check(TokenType::MOD_ASSIGN))
     {
         auto op = consume().value;
+        skipNewlines(); // the value may start on the next line
         auto right = parseAssignment();
         return std::make_unique<ASTNode>(AssignExpr{op, std::move(left), std::move(right)}, ln);
     }

@@ -42,6 +42,7 @@ private:
         int scopeDepth = 0;
         CompilerState *enclosing = nullptr;
         bool isFunction = false;
+        int tryDepth = 0; // enclosing try bodies (each holds a pushed handler)
 
         explicit CompilerState(const std::string &name, CompilerState *enc = nullptr)
             : chunk(std::make_shared<Chunk>()), enclosing(enc)
@@ -180,6 +181,7 @@ private:
         // the body without running its endScope(), so they must discard the
         // locals it pushed themselves — everything deeper than this.
         int scopeDepth = 0;
+        int tryDepth = 0; // try bodies open where the loop starts
     };
     std::vector<LoopInfo> loops_;
 

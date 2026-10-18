@@ -54,6 +54,28 @@ static std::string shellExec(const std::string &p)
 
 namespace fs = std::filesystem;
 
+// One command-line argument quoted the way CommandLineToArgvW reads it back.
+static std::string quoteWinArg(const std::string &a)
+{
+    if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos)
+        return a;
+    std::string out = "\"";
+    size_t backslashes = 0;
+    for (char c : a)
+    {
+        if (c == '\\')
+        {
+            ++backslashes;
+            continue;
+        }
+        out.append(c == '"' ? backslashes * 2 + 1 : backslashes, '\\');
+        backslashes = 0;
+        out += c;
+    }
+    out.append(backslashes * 2, '\\');
+    return out + "\"";
+}
+
 // ─── Executable path ──────────────────────────────────────────────────────────
 
 std::string getExecutablePath()
@@ -158,7 +180,7 @@ static std::string findStubPath(const std::string &quantumExePath)
 // copy of quantum_stub.exe, writes <name>.exe next to the source file,
 // then launches it and waits.
 
-int bundleAndRun(const std::string &path, const std::string &exePath)
+int bundleAndRun(const std::string &path, const std::string &exePath, const std::vector<std::string> &runArgs)
 {
     // 1. Read source
     std::ifstream src(path);
@@ -174,15 +196,15 @@ int bundleAndRun(const std::string &path, const std::string &exePath)
 
     // 2. Compile
     std::shared_ptr<Chunk> chunk;
+    std::string compiled;
     try
     {
-        chunk = compileSource(applyDialect(ss.str(), path), path, false);
+        compiled = applyDialect(ss.str(), path);
+        chunk = compileSource(compiled, path, false);
     }
     catch (const ParseError &e)
     {
-        std::cout << Colors::RED << Colors::BOLD << "\n  X ParseError" << Colors::RESET
-                  << " in " << path << " at line " << e.line << ":" << e.col
-                  << "\n    " << e.what() << "\n\n";
+        printParseError(std::cout, path, ss.str(), compiled, e);
         std::cout.flush();
         return 1;
     }
@@ -271,6 +293,8 @@ int bundleAndRun(const std::string &path, const std::string &exePath)
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::string cmd = "\"" + outName + "\"";
+    for (const auto &a : runArgs)
+        cmd += " " + quoteWinArg(a);
 
     if (!CreateProcessA(NULL, const_cast<char *>(cmd.c_str()),
                         NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
@@ -289,6 +313,8 @@ int bundleAndRun(const std::string &path, const std::string &exePath)
     return (int)exitCode;
 #else
     std::string cmd = shellExec(outName);
+    for (const auto &a : runArgs)
+        cmd += " '" + a + "'";
     int rc = std::system(cmd.c_str());
     if (rc == -1)
     {
@@ -303,3 +329,43 @@ int bundleAndRun(const std::string &path, const std::string &exePath)
 #endif
 }
 
+
+// ─── `quantum build` → qpm build ──────────────────────────────────────────────
+// Native C/C++ builds live in qpm (src/qpm/QpmBuild.cpp); `quantum build ...`
+// runs the qpm next to this executable (or on PATH) with the same arguments.
+
+int runQpm(const std::vector<std::string> &args, const std::string &exePath)
+{
+    fs::path qpm = fs::path(exePath).parent_path() / (std::string("qpm") + EXE_EXT);
+    std::error_code ec;
+    if (!fs::is_regular_file(qpm, ec))
+        qpm = "qpm"; // resolved through PATH
+#ifdef _WIN32
+    std::string cmd = quoteWinArg(qpm.string());
+    for (const auto &a : args)
+        cmd += " " + quoteWinArg(a);
+    std::vector<char> buf(cmd.begin(), cmd.end());
+    buf.push_back('\0');
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::cout.flush();
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+    {
+        std::cerr << Colors::RED << "[Error] " << Colors::RESET << "couldn't run qpm (" << qpm.string()
+                  << "); it ships next to quantum.exe\n";
+        return 1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(code);
+#else
+    std::string cmd = shellExec(qpm.string());
+    for (const auto &a : args)
+        cmd += " '" + a + "'";
+    return std::system(cmd.c_str()) == 0 ? 0 : 1;
+#endif
+}
