@@ -1556,7 +1556,12 @@ void VM::registerCppNatives()
         {
         DictP d = stream(arg(a, 0));
         std::string k = str(arg(a, 1));
-        if (bget(d, "fail")) return k == "s" ? S("") : N(0);
+        // Test mode feeds cin nothing, so every read fails. A failed numeric
+        // read yields 1 there rather than C++'s 0 (as __cin__ does) so
+        // arithmetic on the value doesn't divide by zero; the stream still
+        // fails, so `while (cin >> x)` loops end.
+        QV failedNum = N(g_testMode && sget(d, "__stream") == "cin" ? 1 : 0);
+        if (bget(d, "fail")) return k == "s" ? S("") : failedNum;
         if (k == "c")
         {
             skipWs(d);
@@ -1565,7 +1570,7 @@ void VM::registerCppNatives()
             return N(c);
         }
         std::string w = readWord(d);
-        if (w.empty()) { setFail(d, true); return k == "s" ? S("") : N(0); }
+        if (w.empty()) { setFail(d, true); return k == "s" ? S("") : failedNum; }
         if (k == "s" || k == "?") return S(w);
         char *end = nullptr;
         double r = (k == "d" || k == "f") ? std::strtod(w.c_str(), &end) : (double)std::strtoll(w.c_str(), &end, 10);
