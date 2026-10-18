@@ -1,6 +1,7 @@
 #include "Vm.h"
 #include "Error.h"
 #include "Disassembler.h"
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <unordered_set>
@@ -620,6 +621,10 @@ void VM::runFrame(size_t stopDepth)
                 break;
             }
 
+            if (std::getenv("QUANTUM_DEBUG_CPPFE"))
+                throw TypeError("Cannot call value of type " + callee.typeName() + " in " +
+                                    frame.closure->chunk->name + " @" + std::to_string(frame.ip - 1),
+                                line);
             throw TypeError("Cannot call value of type " + callee.typeName(), line);
         }
 
@@ -629,6 +634,9 @@ void VM::runFrame(size_t stopDepth)
             size_t base = frame.stackBase;
             closeUpvalues(base);
             frames_.pop_back();
+            // handlers of try blocks the function returned from inside of
+            while (!handlers_.empty() && handlers_.back().frameDepth > frames_.size())
+                handlers_.pop_back();
             // Trim stack back to base - 1 to remove the callee slot
             while (stack_.size() > base - 1)
                 stack_.pop_back();
@@ -648,6 +656,8 @@ void VM::runFrame(size_t stopDepth)
             size_t base = frame.stackBase;
             closeUpvalues(base);
             frames_.pop_back();
+            while (!handlers_.empty() && handlers_.back().frameDepth > frames_.size())
+                handlers_.pop_back();
             // Trim stack back to base - 1 to remove the callee slot
             while (stack_.size() > base - 1)
                 stack_.pop_back();
@@ -1347,7 +1357,12 @@ void VM::runFrame(size_t stopDepth)
             closeUpvalues(h.stackDepth);
             while (stack_.size() > h.stackDepth)
                 stack_.pop_back();
-            push(QuantumValue(std::string(e.what())));
+            if (auto *thrown = dynamic_cast<CppThrow *>(&e))
+                push(thrown->value);
+            else if (e.line > 0 && std::getenv("QUANTUM_DEBUG_CPPFE"))
+                push(QuantumValue(std::string(e.what()) + " (line " + std::to_string(e.line) + ")"));
+            else
+                push(QuantumValue(std::string(e.what())));
             if (!frames_.empty())
                 frames_.back().ip = h.catchIp;
         }

@@ -7,7 +7,12 @@
 #include "TypeChecker.h"
 #include "Disassembler.h"
 #include "Error.h"
+#include "cpp/Cpp.h"
+
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 
 // Shared with src/vm/VmNatives.cpp (declared extern there).
 bool g_testMode = false;
@@ -19,6 +24,38 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
                                      const std::string &sourcePath,
                                      bool debug)
 {
+    // C/C++: the typed front-end (src/cpp/) when the program is within its
+    // subset; otherwise the dialect pipeline below.
+    const std::string ext = fileExtLower(sourcePath);
+    if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx") && !std::getenv("QUANTUM_OLD_CPP"))
+    {
+        std::ifstream in(sourcePath, std::ios::binary);
+        if (in)
+        {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            try
+            {
+                ASTNodePtr program = cpp::compileProgram(sourcePath, ss.str());
+                Compiler compiler;
+                auto chunk = compiler.compile(*program);
+                if (debug)
+                    disassembleChunk(*chunk, std::cerr);
+                return chunk;
+            }
+            catch (const cpp::LinkError &l)
+            {
+                throw QuantumError("LinkError", l.what());
+            }
+            catch (const cpp::Unsupported &u)
+            {
+                if (std::getenv("QUANTUM_DEBUG_CPPFE"))
+                    std::cerr << "[cppfe] falling back: " << u.what() << " (" << (u.file.empty() ? sourcePath : u.file)
+                              << ":" << u.line << ")\n";
+            }
+        }
+    }
+
     Lexer lexer(source);
     auto tokens = lexer.tokenize();
     Parser parser(std::move(tokens));

@@ -4,7 +4,11 @@
 
 #include "Opcode.h"
 #include <memory>
+#include <ostream>
 #include <string>
+#include <vector>
+
+class ParseError;
 
 // ─── Console output ───────────────────────────────────────────────────────
 void printBanner();
@@ -16,6 +20,13 @@ void printHelp(const char *prog);
 void runFile(const std::string &path, bool debug = false);
 // Parse + type-check only. Returns a process exit code.
 int checkFile(const std::string &path);
+
+// Prints a ParseError with the code it points at. `written` is the file as
+// written, `compiled` the text after applyDialect(): when the dialect passes
+// renumbered lines (a C++ program assembled from its #includes), the line is
+// reported where it sits in `written`, or flagged as coming from an include.
+void printParseError(std::ostream &os, const std::string &path, const std::string &written,
+                     const std::string &compiled, const ParseError &e);
 
 // ─── REPL ─────────────────────────────────────────────────────────────────
 void runREPL(bool debug = false);
@@ -38,5 +49,10 @@ std::string getExecutablePath();
 // Reads bytecode appended to an .exe by the bundler, or nullptr if absent.
 std::shared_ptr<Chunk> loadEmbeddedBytecode(const std::string &exePath);
 // Compiles `path`, copies quantum_stub.exe, appends the bytecode payload,
-// then runs the result. Returns a process exit code.
-int bundleAndRun(const std::string &path, const std::string &exePath);
+// then runs the result with `runArgs`. Returns a process exit code.
+int bundleAndRun(const std::string &path, const std::string &exePath,
+                 const std::vector<std::string> &runArgs = {});
+
+// Runs `qpm <args...>` (the qpm next to this executable, else on PATH) on
+// this console — `quantum build` is `qpm build`. Returns its exit code.
+int runQpm(const std::vector<std::string> &args, const std::string &exePath);

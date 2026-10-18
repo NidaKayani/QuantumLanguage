@@ -32,6 +32,8 @@ void TypeChecker::check(const ASTNodePtr& node) {
 static bool typeCompatible(const std::string& declared, const std::string& found) {
     if (declared == found) return true;
     if ((declared == "str" || declared == "String") && found == "string") return true;
+    if (declared == "char" && found == "string") return true; // const char* s = "..."
+
     static const char* numeric[] = {"int", "float", "double", "long", "short", "unsigned",
                                     "unsigned int", "long long", "unsigned long", "size_t",
                                     "char", "number", "bool"};

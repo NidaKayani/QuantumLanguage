@@ -307,6 +307,7 @@ void Compiler::beginLoop(int startIp) {
   loops_.push_back({});
   loops_.back().loopStart = startIp;
   loops_.back().scopeDepth = current_->scopeDepth;
+  loops_.back().tryDepth = current_->tryDepth;
 }
 
 // Locals live on the value stack, so leaving a loop body early has to discard
@@ -329,6 +330,9 @@ void Compiler::emitBreak(int line) {
     return;
   }
   emitLoopExitPops(line);
+  // leaving try bodies inside the loop: drop their handlers
+  for (int i = loops_.back().tryDepth; i < current_->tryDepth; ++i)
+    emit(Op::POP_HANDLER, 0, line);
   loops_.back().breakJumps.push_back(emitJump(Op::JUMP, line));
 }
 
@@ -338,6 +342,8 @@ void Compiler::emitContinue(int line) {
     return;
   }
   emitLoopExitPops(line);
+  for (int i = loops_.back().tryDepth; i < current_->tryDepth; ++i)
+    emit(Op::POP_HANDLER, 0, line);
   loops_.back().continueJumps.push_back(emitJump(Op::JUMP, line));
 }
 

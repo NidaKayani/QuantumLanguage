@@ -191,18 +191,58 @@ ASTNodePtr Parser::parsePrimary() {
   }
 
   if (tok.type == TokenType::LBRACKET) {
-    // C++ lambda: [captures](params) { body }
+    // C++ lambda: [captures](params) specifiers { body }, or [captures] { body }
     // Detect by scanning: matching ']' then '(' ... ')' then '{'.
     // The capture list is discarded — Quantum closures capture automatically.
     size_t la = pos + 1;
     int bdepth = 1;
+    bool captureLike = true, hasCaptureMark = la < tokens.size() &&
+                                              tokens[la].type == TokenType::RBRACKET;
     while (la < tokens.size() && bdepth > 0) {
-      if (tokens[la].type == TokenType::LBRACKET)
+      TokenType t = tokens[la].type;
+      if (t == TokenType::LBRACKET)
         bdepth++;
-      else if (tokens[la].type == TokenType::RBRACKET)
+      else if (t == TokenType::RBRACKET)
         bdepth--;
+      else if (t == TokenType::BIT_AND || t == TokenType::ASSIGN || t == TokenType::THIS)
+        hasCaptureMark = true;
+      else if (t != TokenType::IDENTIFIER && t != TokenType::COMMA && t != TokenType::STAR)
+        captureLike = false;
       la++;
     }
+    // Between ')' and '{': mutable / noexcept / constexpr / -> ReturnType.
+    auto skipSpecifiers = [&](size_t p) {
+      while (p < tokens.size() && tokens[p].type == TokenType::NEWLINE)
+        p++;
+      while (p < tokens.size() && tokens[p].type == TokenType::IDENTIFIER &&
+             (tokens[p].value == "mutable" || tokens[p].value == "noexcept" ||
+              tokens[p].value == "constexpr" || tokens[p].value == "consteval"))
+        p++;
+      if (p < tokens.size() && tokens[p].type == TokenType::ARROW) {
+        p++;
+        while (p < tokens.size() && tokens[p].type != TokenType::LBRACE &&
+               tokens[p].type != TokenType::SEMICOLON && tokens[p].type != TokenType::NEWLINE &&
+               tokens[p].type != TokenType::RPAREN)
+          p++;
+      }
+      while (p < tokens.size() && tokens[p].type == TokenType::NEWLINE)
+        p++;
+      return p;
+    };
+    auto parseLambdaBody = [&](std::vector<std::string> params,
+                               std::vector<ASTNodePtr> defaultArgs,
+                               std::vector<std::string> paramTypes, int ln2) {
+      const size_t bodyAt = skipSpecifiers(pos);
+      while (pos < bodyAt)
+        consume();
+      auto body = parseBlock();
+      LambdaExpr le;
+      le.params = std::move(params);
+      le.paramTypes = std::move(paramTypes);
+      le.defaultArgs = std::move(defaultArgs);
+      le.body = std::move(body);
+      return std::make_unique<ASTNode>(std::move(le), ln2);
+    };
     if (bdepth == 0 && la < tokens.size() &&
         tokens[la].type == TokenType::LPAREN) {
       size_t la2 = la + 1;
@@ -214,8 +254,7 @@ ASTNodePtr Parser::parsePrimary() {
           pdepth--;
         la2++;
       }
-      while (la2 < tokens.size() && tokens[la2].type == TokenType::NEWLINE)
-        la2++;
+      la2 = skipSpecifiers(la2);
       if (pdepth == 0 && la2 < tokens.size() &&
           tokens[la2].type == TokenType::LBRACE) {
         int ln2 = tok.line;
@@ -224,15 +263,20 @@ ASTNodePtr Parser::parsePrimary() {
         std::vector<ASTNodePtr> defaultArgs;
         std::vector<std::string> paramTypes;
         auto params = parseParamList(nullptr, &defaultArgs, &paramTypes);
-        skipNewlines();
-        auto body = parseBlock();
-        LambdaExpr le;
-        le.params = std::move(params);
-        le.paramTypes = std::move(paramTypes);
-        le.defaultArgs = std::move(defaultArgs);
-        le.body = std::move(body);
-        return std::make_unique<ASTNode>(std::move(le), ln2);
+        return parseLambdaBody(std::move(params), std::move(defaultArgs),
+                               std::move(paramTypes), ln2);
       }
+    }
+    // `[&] { ... }`: no parameter list. Only a capture-shaped list ([], [&],
+    // [=], [this], [&x, y]) with the '{' on the same line, so `[x] {` in
+    // other syntaxes stays an array.
+    if (bdepth == 0 && captureLike && hasCaptureMark && la < tokens.size() &&
+        (tokens[la].type == TokenType::LBRACE ||
+         (tokens[la].type == TokenType::IDENTIFIER && tokens[la].value == "mutable"))) {
+      int ln2 = tok.line;
+      while (pos < la)
+        consume(); // discard '[captures]'
+      return parseLambdaBody({}, {}, {}, ln2);
     }
     return parseArrayLiteral();
   }
@@ -1056,16 +1100,21 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
     while ((isCTypeKeyword(current().type) || check(TokenType::CONST)) &&
            pos + 1 < tokens.size() &&
            (isCTypeKeyword(tokens[pos + 1].type) || tokens[pos + 1].type == TokenType::IDENTIFIER ||
-            tokens[pos + 1].type == TokenType::STAR || tokens[pos + 1].type == TokenType::BIT_AND)) {
+            tokens[pos + 1].type == TokenType::STAR || tokens[pos + 1].type == TokenType::BIT_AND ||
+            tokens[pos + 1].type == TokenType::AND_AND || tokens[pos + 1].type == TokenType::POWER)) {
       if (isCTypeKeyword(current().type))
         cppType += (cppType.empty() ? "" : " ") + current().value;
       consume(); // eat return/param type keyword or const
       hasCType = true;
     }
     if (hasCType) {
-      while (check(TokenType::STAR) || check(TokenType::BIT_AND)) {
+      // `**` lexes as the power operator: here it is two pointer stars.
+      while (check(TokenType::STAR) || check(TokenType::POWER) || check(TokenType::BIT_AND) ||
+             check(TokenType::AND_AND)) {
         if (check(TokenType::STAR))
           cppType += "*";
+        else if (check(TokenType::POWER))
+          cppType += "**";
         consume(); // eat pointer/ref qualifier on type
       }
     }
@@ -1098,8 +1147,10 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
     if (check(TokenType::IDENTIFIER)) {
       // Peek ahead past any * and & qualifiers to find the actual name token
       size_t la = pos + 1;
+      bool templated = false;
       // Skip template arguments <...> in lookahead
       if (la < tokens.size() && tokens[la].type == TokenType::LT) {
+        templated = true;
         // Skip over template: unique_ptr<int[]>, shared_ptr<Foo>, etc.
         int tdepth = 0;
         while (la < tokens.size()) {
@@ -1121,11 +1172,23 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
           la++;
         }
       }
+      size_t qualStart = la;
       while (la < tokens.size() && (tokens[la].type == TokenType::BIT_AND ||
+                                    tokens[la].type == TokenType::AND_AND ||
                                     tokens[la].type == TokenType::STAR ||
+                                    tokens[la].type == TokenType::POWER ||
                                     tokens[la].type == TokenType::CONST))
         la++;
-      if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER) {
+      // An unnamed parameter (`const Result&`, `Node*`, `vector<int>`) ends
+      // right after its type; without a `&`/`*`/template the lone identifier
+      // stays a plain (untyped) parameter name, as in JS / Python.
+      bool unnamedTyped =
+          la < tokens.size() && (templated || la > qualStart) &&
+          (tokens[la].type == TokenType::COMMA ||
+           tokens[la].type == TokenType::RPAREN ||
+           tokens[la].type == TokenType::ASSIGN);
+      if (la < tokens.size() &&
+          (tokens[la].type == TokenType::IDENTIFIER || unnamedTyped)) {
         std::string tName =
             consume().value; // eat type name (e.g. "Entity", "Room", "Cell",
                              // "string", "unique_ptr")
@@ -1149,19 +1212,67 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
         // A `*` after the type name is a pointer qualifier (`TreeNode* node`),
         // not a Python `*args` marker; `&` is left for the ref check below.
         cppType = tName;
-        while (check(TokenType::STAR) || check(TokenType::CONST)) {
+        while (check(TokenType::STAR) || check(TokenType::POWER) || check(TokenType::CONST)) {
           if (check(TokenType::STAR))
             cppType += "*";
+          else if (check(TokenType::POWER))
+            cppType += "**";
           consume();
         }
       }
     }
 
+    // Function-pointer parameter: `void (*cb)(int)`, `Row (*fn)(const Row&)`,
+    // or unnamed `int (*)(int)`. A lone return-type keyword/identifier is
+    // still pending here; the pointee's parameter list is skipped.
+    std::string fnPtrName;
+    {
+      size_t la = pos;
+      if ((isCTypeKeyword(current().type) || check(TokenType::IDENTIFIER)) &&
+          la + 1 < tokens.size() && tokens[la + 1].type == TokenType::LPAREN)
+        ++la;
+      size_t q = la + 1;
+      while (q < tokens.size() && (tokens[q].type == TokenType::STAR ||
+                                   tokens[q].type == TokenType::BIT_AND))
+        ++q;
+      bool hasStar = q > la + 1;
+      // The name may lex as a keyword (`fn`, `input`): any word will do.
+      auto isWord = [&](size_t k) {
+        const std::string &v = tokens[k].value;
+        return !v.empty() && (std::isalpha((unsigned char)v[0]) || v[0] == '_');
+      };
+      if (q < tokens.size() && isWord(q))
+        ++q;
+      if (hasStar && la < tokens.size() && tokens[la].type == TokenType::LPAREN &&
+          q + 1 < tokens.size() && tokens[q].type == TokenType::RPAREN &&
+          tokens[q + 1].type == TokenType::LPAREN) {
+        while (pos < la)
+          consume(); // return type
+        consume();   // '('
+        while (check(TokenType::STAR) || check(TokenType::BIT_AND))
+          consume();
+        fnPtrName = isWord(pos) ? consume().value
+                                : "__unnamed_" + std::to_string(params.size());
+        consume(); // ')'
+        consume(); // '(' of the pointee's parameter list
+        int depth = 1;
+        while (!atEnd() && depth > 0) {
+          if (check(TokenType::LPAREN))
+            depth++;
+          else if (check(TokenType::RPAREN))
+            depth--;
+          consume();
+        }
+        cppType = "function";
+      }
+    }
+
     std::string prefix = "";
     bool isRef = false;
-    while (check(TokenType::BIT_AND) || check(TokenType::STAR) ||
-           check(TokenType::POWER)) {
-      if (check(TokenType::BIT_AND))
+    while (fnPtrName.empty() &&
+           (check(TokenType::BIT_AND) || check(TokenType::AND_AND) ||
+            check(TokenType::STAR) || check(TokenType::POWER))) {
+      if (check(TokenType::BIT_AND) || check(TokenType::AND_AND))
         isRef = true; // & = pass-by-reference
       else if (check(TokenType::STAR))
         prefix += "*";
@@ -1170,7 +1281,11 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       consume();
     }
 
-    if (check(TokenType::IDENTIFIER)) {
+    if (!fnPtrName.empty()) {
+      params.push_back(fnPtrName);
+      if (outIsRef)
+        outIsRef->push_back(false);
+    } else if (check(TokenType::IDENTIFIER)) {
       params.push_back(prefix + consume().value);
       if (outIsRef)
         outIsRef->push_back(isRef);
@@ -1286,8 +1401,8 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint) {
   // Consume any pointer stars and const qualifiers between type and name:
   // int* p  /  int *p  /  int* const p  /  const int* const p
   bool isPointer = false;
-  while (check(TokenType::STAR) || check(TokenType::CONST)) {
-    if (check(TokenType::STAR))
+  while (check(TokenType::STAR) || check(TokenType::POWER) || check(TokenType::CONST)) {
+    if (check(TokenType::STAR) || check(TokenType::POWER))
       isPointer = true;
     consume();
   }
@@ -1376,6 +1491,7 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint) {
     finalTypeHint += "[]";
   ASTNodePtr init;
   if (match(TokenType::ASSIGN)) {
+    skipNewlines(); // the value may start on the next line
     {
       BraceInitScope braceInit(braceInitDepth_);
       init = parseExpr();
