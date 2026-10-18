@@ -9,10 +9,12 @@
 // whatever the script names — same as npm, qpm doesn't include a JS engine.
 
 #include "QpmBuild.h"
+#include "QpmManifest.h"
 #include "QpmPublish.h"
 #include "QpmRegistry.h"
 #include "QpmResolver.h"
 #include "QpmScripts.h"
+#include "QpmSearch.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -55,6 +57,13 @@ namespace
             "  qpm build --clean           removes the build outputs\n"
             "  qpm build --cmake | --make | --direct   picks how a C/C++ project is built\n"
             "  qpm build -j <n> / -v       parallel compiles / print each command\n"
+            "  qpm search [<term>...]      searches the registry's names, descriptions and keywords\n"
+            "                              (no term lists every package; =<user> finds a user's)\n"
+            "  qpm search --npm <term>     searches npm instead (install falls back to it)\n"
+            "  qpm search --json | --parseable | --long | --limit <n> | --no-description\n"
+            "  qpm view [<pkg>[@<ver>]]    shows a package's details (aliases: info, show)\n"
+            "  qpm view <pkg> <field>...   prints fields only, e.g. `qpm view minidb version`\n"
+            "  qpm view <pkg> --json       the package document as JSON\n"
             "  qpm publish                 packs this package and uploads it to the registry\n"
             "  qpm publish --dry-run       shows what would be published, uploads nothing\n"
             "  qpm publish --token <t>     publish with this token instead of the saved login\n"
@@ -65,16 +74,22 @@ namespace
             "  qpm --help                  show this help\n"
             "  qpm --version               show version\n"
             "\n"
+            "Any command takes --registry <url> to use another registry API for that run.\n"
+            "\n"
             "Manifest (the first one found in the project folder is used):\n"
             "  package.qon       JSON like package.json, or requirements style\n"
             "  package.json      npm's manifest\n"
             "  requirements.txt  one `name==1.2.3` / `name ^1.2` per line\n"
             "\n"
+            "Registry: https://qpm.quantumlogicslimited.com (browse packages, sign up, publish)\n"
+            "\n"
             "Environment:\n"
-            "  QPM_REGISTRY   registry API base (default http://localhost:8000/api/registry/)\n"
+            "  QPM_REGISTRY   registry API base (default https://qpm.quantumlogicslimited.com/api/registry/;\n"
+            "                 a local backend is http://localhost:8000/api/registry/)\n"
             "  QPM_UPSTREAM   where install looks up packages the registry doesn't have\n"
             "                 (default https://registry.npmjs.org/, \"none\" to turn off)\n"
             "  QPM_TOKEN      auth token, overrides the one saved by `qpm login`\n"
+            "  NO_COLOR       turns off colored output\n"
             "\n"
             "qpm downloads packages straight from the registry — no npm or Node.js\n"
             "install required. Running a script (`qpm run`/`qpm start`) still shells\n"
@@ -96,14 +111,116 @@ namespace
             {
                 opts.token = args[++i];
             }
+            else if (args[i] == "--access" && i + 1 < args.size())
+            {
+                ++i; // npm habit; every package on the QPM registry is public
+            }
             else
             {
                 std::cerr << "[qpm] unknown publish option: " << args[i] << "\n"
-                          << "[qpm] usage: qpm publish [--dry-run] [--token <token>]\n";
+                          << "[qpm] usage: qpm publish [--dry-run] [--token <token>] [--registry <url>]\n";
                 return 1;
             }
         }
         return qpm::runPublish(opts);
+    }
+
+    // True for "--name=value", with "value" put in `value`.
+    bool optionValue(const std::string &a, const std::string &name, std::string &value)
+    {
+        if (a.compare(0, name.size() + 1, name + "=") != 0)
+            return false;
+        value = a.substr(name.size() + 1);
+        return true;
+    }
+
+    int runSearchCommand(const std::vector<std::string> &args)
+    {
+        qpm::SearchOptions opts;
+        const char *usage = "[qpm] usage: qpm search [<term>...] [--npm] [--json|--parseable] [--long]"
+                            " [--limit <n>] [--no-description] [--no-color]\n";
+        bool termsOnly = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            std::string value;
+            if (termsOnly || a.empty() || a[0] != '-' || a == "-")
+                opts.terms.push_back(a);
+            else if (a == "--")
+                termsOnly = true;
+            else if (a == "--json")
+                opts.json = true;
+            else if (a == "--parseable" || a == "-p")
+                opts.parseable = true;
+            else if (a == "--long" || a == "-l")
+                opts.longFormat = true;
+            else if (a == "--no-description")
+                opts.description = false;
+            else if (a == "--no-color")
+                opts.color = false;
+            else if (a == "--npm")
+                opts.npm = true;
+            else if ((a == "--limit" || a == "--searchlimit") && i + 1 < args.size())
+                opts.limit = std::atoi(args[++i].c_str());
+            else if (optionValue(a, "--limit", value) || optionValue(a, "--searchlimit", value))
+                opts.limit = std::atoi(value.c_str());
+            else
+            {
+                std::cerr << "[qpm] unknown search option: " << a << "\n" << usage;
+                return 1;
+            }
+        }
+        if (opts.limit <= 0)
+        {
+            std::cerr << "[qpm] --limit needs a number above 0\n" << usage;
+            return 1;
+        }
+        return qpm::runSearch(opts);
+    }
+
+    int runViewCommand(const std::vector<std::string> &args, const std::string &cwd)
+    {
+        qpm::ViewOptions opts;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            if (a == "--json")
+                opts.json = true;
+            else if (a == "--no-color")
+                opts.color = false;
+            else if (a.size() > 1 && a[0] == '-')
+            {
+                std::cerr << "[qpm] unknown view option: " << a << "\n"
+                          << "[qpm] usage: qpm view [<pkg>[@<version>]] [<field>...] [--json]\n";
+                return 1;
+            }
+            else if (opts.spec.empty())
+                opts.spec = a;
+            else
+                opts.fields.push_back(a);
+        }
+        // Like npm, no package (or ".") means the one this folder's manifest describes.
+        if (opts.spec.empty() || opts.spec == ".")
+        {
+            fs::path manifest = qpm::findManifest(cwd);
+            std::string name;
+            try
+            {
+                if (!manifest.empty())
+                    name = qpm::loadManifest(manifest).data.get("name").asString();
+            }
+            catch (const std::exception &)
+            {
+            }
+            if (name.empty())
+            {
+                std::cerr << "[qpm] usage: qpm view <pkg>[@<version>] [<field>...]\n"
+                          << "[qpm] (without <pkg> it shows this folder's package, but there's no named package here)\n";
+                return 1;
+            }
+            opts.spec = name;
+        }
+        return qpm::runView(opts);
     }
 
     int runBuildCommand(const std::vector<std::string> &args, const std::string &cwd)
@@ -162,6 +279,35 @@ int main(int argc, char *argv[])
 
     std::vector<std::string> args(argv + 1, argv + argc);
     std::string cwd = fs::current_path().string();
+
+    // --registry works with every command, so it's taken out before dispatch
+    // (but not from a program's arguments after `--`).
+    for (size_t i = 0; i < args.size() && args[i] != "--";)
+    {
+        std::string url;
+        if (args[i] == "--registry")
+        {
+            size_t count = i + 1 < args.size() ? 2 : 1;
+            if (count == 2)
+                url = args[i + 1];
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i), args.begin() + static_cast<std::ptrdiff_t>(i + count));
+        }
+        else if (optionValue(args[i], "--registry", url))
+        {
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        else
+        {
+            ++i;
+            continue;
+        }
+        if (url.empty())
+        {
+            std::cerr << "[qpm] --registry needs a URL, e.g. --registry http://localhost:8000/api/registry/\n";
+            return 1;
+        }
+        qpm::setRegistryOverride(url);
+    }
 
     if (args.empty() || args[0] == "--help" || args[0] == "-h")
     {
@@ -222,6 +368,10 @@ int main(int argc, char *argv[])
         }
         return qpm::runInit(cwd, yes);
     }
+    if (cmd == "search" || cmd == "s" || cmd == "se" || cmd == "find")
+        return runSearchCommand(args);
+    if (cmd == "view" || cmd == "info" || cmd == "show" || cmd == "v")
+        return runViewCommand(args, cwd);
     if (cmd == "publish")
         return runPublishCommand(args, cwd);
     if (cmd == "pack")

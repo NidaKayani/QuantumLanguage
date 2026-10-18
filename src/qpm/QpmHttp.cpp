@@ -81,7 +81,9 @@ namespace qpm
         uc.dwUrlPathLength = _countof(path);
         uc.dwExtraInfoLength = 0; // merge query string into UrlPath
 
-        if (!WinHttpCrackUrl(wurl.c_str(), 0, ICU_DECODE, &uc))
+        // No ICU_DECODE: the URL is already percent-encoded, and decoding it
+        // would send an encoded "+" or "&" in a search query as a different query.
+        if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc))
         {
             result.error = "invalid URL";
             return result;
