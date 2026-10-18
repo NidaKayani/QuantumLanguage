@@ -2056,8 +2056,36 @@ XV Lowerer::listInit(const TP &t, std::vector<ExprP> &kids, int line)
     case T::Array:
     {
         TP et = t->a.empty() ? tDyn() : t->a[0];
+        // Brace elision: `int m[2][3] = {1, 2, 3, 4}` fills the rows in order,
+        // as `{{1, 2, 3}, {4}}` would — a scalar where a row is expected starts
+        // an unbraced row that takes as many scalars as the row holds.
+        std::vector<ExprP> elided;
+        if (t->k == T::Array && et->k == T::Array)
+        {
+            long perRow = 1;
+            for (TP r = et; r->k == T::Array && !r->a.empty(); r = r->a[0])
+                perRow *= std::max(r->n, 1L);
+            std::vector<bool> scalar;
+            for (auto &k : kids)
+                scalar.push_back(k->k != EK::InitList && isArith(probeType(k)));
+            for (size_t i = 0; i < kids.size();)
+            {
+                if (!scalar[i])
+                {
+                    elided.push_back(kids[i++]);
+                    continue;
+                }
+                auto row = std::make_shared<Expr>();
+                row->k = EK::InitList;
+                row->line = kids[i]->line;
+                while (i < kids.size() && scalar[i] && (long)row->kids.size() < perRow)
+                    row->kids.push_back(kids[i++]);
+                elided.push_back(row);
+            }
+        }
+        std::vector<ExprP> &items = elided.empty() ? kids : elided;
         std::vector<ASTNodePtr> el;
-        for (auto &k : kids)
+        for (auto &k : items)
         {
             XV x = lowerExprTo(k, et);
             if (et->k == T::Dyn && x.t->k != T::Dyn && t->a.empty())
@@ -2065,7 +2093,7 @@ XV Lowerer::listInit(const TP &t, std::vector<ExprP> &kids, int line)
             x = convert(std::move(x), et, line);
             el.push_back(copyOf(std::move(x), line));
         }
-        if (t->k == T::Array && t->n > (long)kids.size())
+        if (t->k == T::Array && t->n > (long)items.size())
         {
             // remaining elements value-initialized
             std::vector<ASTNodePtr> a;
