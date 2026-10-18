@@ -9,10 +9,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -370,34 +373,155 @@ namespace qpm
             return ss.str();
         }
 
-        std::string base64Encode(const std::string &in)
+        std::string toLower(std::string s)
         {
-            static const char *table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for (char &c : s)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        }
+
+        std::string join(const std::vector<std::string> &parts, const std::string &sep)
+        {
             std::string out;
-            out.reserve((in.size() + 2) / 3 * 4);
-            size_t i = 0;
-            for (; i + 2 < in.size(); i += 3)
+            for (size_t i = 0; i < parts.size(); ++i)
+                out += (i ? sep : "") + parts[i];
+            return out;
+        }
+
+        // Keywords as typed at `qpm init`: separated by commas and/or spaces, like npm.
+        std::vector<std::string> splitKeywords(const std::string &text)
+        {
+            std::vector<std::string> out;
+            std::string word;
+            for (size_t i = 0; i <= text.size(); ++i)
             {
-                unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
-                             (static_cast<unsigned char>(in[i + 1]) << 8) |
-                             static_cast<unsigned char>(in[i + 2]);
-                out += table[(v >> 18) & 63];
-                out += table[(v >> 12) & 63];
-                out += table[(v >> 6) & 63];
-                out += table[v & 63];
-            }
-            size_t rem = in.size() - i;
-            if (rem)
-            {
-                unsigned v = static_cast<unsigned char>(in[i]) << 16;
-                if (rem == 2)
-                    v |= static_cast<unsigned char>(in[i + 1]) << 8;
-                out += table[(v >> 18) & 63];
-                out += table[(v >> 12) & 63];
-                out += rem == 2 ? table[(v >> 6) & 63] : '=';
-                out += '=';
+                char c = i < text.size() ? text[i] : ' ';
+                if (c == ',' || std::isspace(static_cast<unsigned char>(c)))
+                {
+                    if (!word.empty())
+                        out.push_back(word);
+                    word.clear();
+                }
+                else
+                {
+                    word += c;
+                }
             }
             return out;
+        }
+
+        // A manifest's "keywords": an array, or (hand-written) one comma-separated string.
+        std::vector<std::string> keywordList(const JsonValue &v)
+        {
+            std::vector<std::string> out;
+            if (v.isArray())
+            {
+                for (const auto &e : v.array())
+                    if (!trim(e.asString()).empty())
+                        out.push_back(trim(e.asString()));
+            }
+            else if (v.isString())
+            {
+                std::istringstream in(v.asString());
+                std::string part;
+                while (std::getline(in, part, ','))
+                    if (!trim(part).empty())
+                        out.push_back(trim(part));
+            }
+            return out;
+        }
+
+        // "author" as npm writes it: a string, or {name, email, url} -> "name <email> (url)".
+        std::string personString(const JsonValue &v)
+        {
+            if (!v.isObject())
+                return v.asString();
+            std::string out = v.get("name").asString();
+            if (!v.get("email").asString().empty())
+                out += " <" + v.get("email").asString() + ">";
+            if (!v.get("url").asString().empty())
+                out += " (" + v.get("url").asString() + ")";
+            return out;
+        }
+
+        // "repository" as a string or as {type, url}.
+        std::string repositoryUrl(const JsonValue &v)
+        {
+            return v.isObject() ? v.get("url").asString() : v.asString();
+        }
+
+        // The "origin" remote of the git repository in projectDir, or "".
+        std::string gitOriginUrl(const fs::path &projectDir)
+        {
+            std::ifstream f(projectDir / ".git" / "config");
+            std::string line;
+            bool inOrigin = false;
+            while (std::getline(f, line))
+            {
+                line = trim(line);
+                if (!line.empty() && line[0] == '[')
+                    inOrigin = line == "[remote \"origin\"]";
+                else if (inOrigin && line.compare(0, 3, "url") == 0 && line.find('=') != std::string::npos)
+                    return trim(line.substr(line.find('=') + 1));
+            }
+            return "";
+        }
+
+        // A repository URL as a browsable https:// page: "git+https://h/u/r.git",
+        // "git@h:u/r.git", "ssh://git@h/u/r" and "github:u/r" all become "https://h/u/r".
+        std::string repoWebUrl(std::string url)
+        {
+            url = trim(url);
+            if (url.compare(0, 4, "git+") == 0)
+                url.erase(0, 4);
+            if (url.compare(0, 7, "github:") == 0)
+                url = "https://github.com/" + url.substr(7);
+            else if (url.compare(0, 4, "git@") == 0 && url.find(':') != std::string::npos)
+                url = "https://" + url.substr(4, url.find(':') - 4) + "/" + url.substr(url.find(':') + 1);
+            else if (url.compare(0, 10, "ssh://git@") == 0)
+                url = "https://" + url.substr(10);
+            else if (url.compare(0, 6, "git://") == 0)
+                url = "https://" + url.substr(6);
+            if (url.size() > 4 && url.compare(url.size() - 4, 4, ".git") == 0)
+                url.resize(url.size() - 4);
+            while (!url.empty() && url.back() == '/')
+                url.pop_back();
+            return url;
+        }
+
+        // "https://github.com/u/r" for a GitHub repository URL, else "".
+        std::string githubWebUrl(const std::string &url)
+        {
+            std::string web = repoWebUrl(url);
+            return web.compare(0, 19, "https://github.com/") == 0 && web.size() > 19 ? web : "";
+        }
+
+        // multipart/form-data, the way the website uploads packages.
+        std::string makeBoundary()
+        {
+            std::random_device rd;
+            std::mt19937_64 gen((static_cast<std::uint64_t>(rd()) << 32) ^ rd() ^
+                                static_cast<std::uint64_t>(std::time(nullptr)));
+            std::string boundary = "----qpm-form-";
+            for (int i = 0; i < 32; ++i)
+                boundary += "0123456789abcdef"[gen() & 15];
+            return boundary;
+        }
+
+        void addFormField(std::string &body, const std::string &boundary, const std::string &name,
+                          const std::string &value)
+        {
+            body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" +
+                    value + "\r\n";
+        }
+
+        void addFormFile(std::string &body, const std::string &boundary, const std::string &name,
+                         const std::string &fileName, const std::string &data)
+        {
+            body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"; filename=\"" +
+                    fileName + "\"\r\nContent-Type: application/gzip\r\n\r\n";
+            body += data;
+            body += "\r\n";
         }
 
         struct Package
@@ -509,28 +633,127 @@ namespace qpm
                       << " unpacked, " << formatSize(pkg.tgz.size()) << " packed\n";
             return true;
         }
+
+        enum class Publishable
+        {
+            Yes,
+            No,         // `problem` says why
+            Unreachable // the registry couldn't be asked; `problem` says why
+        };
+
+        // Asks the registry whether it would take this version before anything
+        // is uploaded: the version has to be new, and a package with an owner
+        // only takes versions from that account. (The registry lets a guest
+        // publish over an owned name, so that check has to happen here.)
+        Publishable checkPublishable(const std::string &registry, const Package &pkg,
+                                     const std::string &publisher, std::string &problem)
+        {
+            HttpResponse resp = httpGet(registry + urlEncodeComponent(pkg.name), "application/json");
+            if (resp.error.empty() && resp.status == 404)
+                return Publishable::Yes; // the first version of a new package
+            if (!resp.ok())
+            {
+                problem = describeFailure(resp);
+                return Publishable::Unreachable;
+            }
+            JsonValue doc;
+            try
+            {
+                doc = JsonValue::parse(resp.body);
+            }
+            catch (const std::exception &e)
+            {
+                problem = std::string("unreadable answer from the registry: ") + e.what();
+                return Publishable::Unreachable;
+            }
+
+            if (doc.get("versions").has(pkg.version))
+            {
+                problem = pkg.name + "@" + pkg.version + " is already published; versions can't be replaced, so bump "
+                          "\"version\" in " + pkg.manifestFile + " and publish again";
+                return Publishable::No;
+            }
+            std::string owner = doc.get("owner").asString();
+            if (!owner.empty() && owner != "anonymous")
+            {
+                if (publisher.empty())
+                {
+                    problem = pkg.name + " belongs to " + owner + "; log in as " + owner +
+                              " with `qpm login` to publish a new version";
+                    return Publishable::No;
+                }
+                if (toLower(owner) != toLower(publisher))
+                {
+                    problem = pkg.name + " belongs to " + owner + ", but you're logged in as " + publisher;
+                    return Publishable::No;
+                }
+            }
+
+            std::string latest = doc.get("dist-tags").get("latest").asString();
+            SemVer mine, theirs;
+            if (SemVer::tryParse(pkg.version, mine) && SemVer::tryParse(latest, theirs) && compareSemVer(mine, theirs) < 0)
+                std::cerr << "[qpm] warning: " << pkg.version << " is lower than the latest version (" << latest
+                          << "), and the registry will make it the new latest\n";
+            return Publishable::Yes;
+        }
     } // namespace
 
     int runInit(const std::string &projectDirStr, bool acceptDefaults)
     {
         fs::path projectDir = fs::absolute(projectDirStr);
         fs::path pkgJsonPath = projectDir / "package.json";
-        if (fs::exists(pkgJsonPath))
+
+        // package.qon and requirements.txt are read before package.json, so a
+        // new package.json next to one of them would be ignored.
+        fs::path existing = findManifest(projectDir);
+        if (!existing.empty() && existing.filename() != "package.json")
         {
-            std::cerr << "[qpm] package.json already exists in " << projectDir.string() << "\n";
+            std::cerr << "[qpm] " << existing.filename().string() << " already describes this project (qpm reads it "
+                      << "before package.json), so edit that instead\n";
             return 1;
         }
 
-        std::string name = defaultPackageName(projectDir);
-        std::string version = "1.0.0";
-        std::string description, keywords, author;
-        std::string mainFile = defaultEntryPoint(projectDir);
-        std::string license = "MIT";
+        // Like npm, an existing package.json supplies the defaults, and every
+        // field init doesn't ask about stays as it is.
+        JsonValue pkg = JsonValue::makeObject();
+        if (!existing.empty())
+        {
+            try
+            {
+                pkg = loadManifest(pkgJsonPath).data;
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "[qpm] failed to parse " << e.what() << "\n";
+                return 1;
+            }
+            if (!pkg.isObject())
+                pkg = JsonValue::makeObject();
+        }
+        auto current = [&pkg](const char *key, const std::string &def)
+        {
+            std::string value = pkg.get(key).asString();
+            return value.empty() ? def : value;
+        };
+
+        std::string name = current("name", defaultPackageName(projectDir));
+        std::string version = current("version", "1.0.0");
+        std::string description = current("description", "");
+        std::string mainFile = current("main", defaultEntryPoint(projectDir));
+        std::string testCommand = pkg.get("scripts").get("test").asString();
+        std::string repository = repositoryUrl(pkg.get("repository"));
+        if (repository.empty())
+            repository = gitOriginUrl(projectDir);
+        std::string keywords = join(keywordList(pkg.get("keywords")), ", ");
+        const std::string originalAuthor = personString(pkg.get("author"));
+        std::string author = originalAuthor;
+        std::string license = current("license", "MIT");
 
         if (!acceptDefaults)
         {
-            std::cout << "This creates a package.json for a Quantum package.\n"
-                         "Press Enter to keep the value in ( ). `qpm init -y` skips these questions.\n\n";
+            std::cout << "This utility walks you through creating a package.json for a Quantum package.\n"
+                         "It only covers the most common fields. Press Enter to keep the value in ( ),\n"
+                         "^C to quit; `qpm init -y` skips the questions.\n\n";
             const std::string suggestedName = name;
             for (;;)
             {
@@ -540,42 +763,76 @@ namespace qpm
                     break;
                 std::cout << "  invalid name: " << problem << "\n";
             }
+            const std::string suggestedVersion = version;
             for (;;)
             {
-                version = ask("version", "1.0.0");
+                version = ask("version", suggestedVersion);
                 SemVer sv;
                 if (SemVer::tryParse(version, sv))
                     break;
                 std::cout << "  must be a semver version like 1.0.0\n";
             }
-            description = ask("description", "");
+            description = ask("description", description);
             mainFile = ask("entry point", mainFile);
-            keywords = ask("keywords (comma-separated)", "");
-            author = ask("author", "");
+            testCommand = ask("test command", testCommand);
+            repository = ask("git repository", repository);
+            keywords = ask("keywords", keywords);
+            author = ask("author", author);
             license = ask("license", license);
         }
 
-        JsonValue scripts = JsonValue::makeObject();
-        scripts.set("start", "qrun " + mainFile);
-
-        JsonValue keywordList = JsonValue::makeArray();
-        std::istringstream keywordStream(keywords);
-        std::string keyword;
-        while (std::getline(keywordStream, keyword, ','))
-            if (!trim(keyword).empty())
-                keywordList.push(trim(keyword));
-
-        JsonValue pkg = JsonValue::makeObject();
         pkg.set("name", name);
         pkg.set("version", version);
         pkg.set("description", description);
         pkg.set("main", mainFile);
+        JsonValue scripts = pkg.get("scripts");
+        if (!scripts.isObject())
+            scripts = JsonValue::makeObject();
+        if (!testCommand.empty())
+            scripts.set("test", testCommand);
+        if (!scripts.has("start"))
+            scripts.set("start", "qrun " + mainFile);
         pkg.set("scripts", scripts);
-        pkg.set("keywords", keywordList);
-        pkg.set("author", author);
+        std::string github = githubWebUrl(repository);
+        if (!repository.empty() && repository != repositoryUrl(pkg.get("repository")))
+        {
+            JsonValue repo = JsonValue::makeObject();
+            repo.set("type", "git");
+            repo.set("url", github.empty() ? repository : "git+" + github + ".git");
+            pkg.set("repository", repo);
+        }
+        JsonValue keywordArray = JsonValue::makeArray();
+        for (const auto &k : splitKeywords(keywords))
+            keywordArray.push(k);
+        pkg.set("keywords", keywordArray);
+        if (author != originalAuthor || !pkg.has("author")) // an untouched {name, email} object stays an object
+            pkg.set("author", author);
         pkg.set("license", license);
+        if (!github.empty() && !pkg.has("bugs"))
+        {
+            JsonValue bugs = JsonValue::makeObject();
+            bugs.set("url", github + "/issues");
+            pkg.set("bugs", bugs);
+        }
+        if (!github.empty() && !pkg.has("homepage"))
+            pkg.set("homepage", github + "#readme");
 
         std::string text = pkg.stringify(2) + "\n";
+        if (!acceptDefaults)
+        {
+            std::cout << "\nAbout to write to " << pkgJsonPath.string() << ":\n\n"
+                      << text << "\nIs this OK? (yes) " << std::flush;
+            std::string answer;
+            if (!std::getline(std::cin, answer))
+                std::cout << "\n";
+            answer = toLower(trim(answer));
+            if (!answer.empty() && answer != "y" && answer != "yes")
+            {
+                std::cout << "Aborted.\n";
+                return 0;
+            }
+        }
+
         std::ofstream out(pkgJsonPath, std::ios::binary | std::ios::trunc);
         out << text;
         if (!out)
@@ -583,8 +840,12 @@ namespace qpm
             std::cerr << "[qpm] failed to write " << pkgJsonPath.string() << "\n";
             return 1;
         }
-        std::cout << "\nWrote to " << pkgJsonPath.string() << ":\n\n" << text
-                  << "\n[qpm] next: `qpm i <pkg>` to add dependencies, `qpm publish --dry-run` to preview a publish\n";
+        if (acceptDefaults)
+            std::cout << "Wrote to " << pkgJsonPath.string() << ":\n\n" << text << "\n";
+
+        std::string page = packagePageUrl(registryBaseUrl(), name);
+        std::cout << "[qpm] next: `qpm i <pkg>` adds a dependency; `qpm publish` puts the package on the registry"
+                  << (page.empty() ? "" : " at " + page) << " (`qpm publish --dry-run` previews it)\n";
         return 0;
     }
 
@@ -617,66 +878,110 @@ namespace qpm
             std::cerr << "[qpm] " << pkg.name << " has \"private\": true in " << pkg.manifestFile << ", so it can't be published\n";
             return 1;
         }
+        std::string registry = registryBaseUrl();
+        if (!isQpmRegistry(registry))
+        {
+            std::cerr << "[qpm] qpm publishes through the QPM registry's upload API, and " << registry
+                      << " isn't a QPM registry (an .../api/registry/ URL)\n";
+            return 1;
+        }
+        if (pkg.name[0] == '@')
+        {
+            std::cerr << "[qpm] the QPM registry doesn't take scoped names like " << pkg.name
+                      << " yet; publish it under a plain name\n";
+            return 1;
+        }
         if (!buildTarball(projectDir, pkg))
             return 1;
 
-        std::string registry = registryBaseUrl();
-        std::string token = opts.token.empty() ? authToken() : opts.token;
-
-        if (opts.dryRun)
-        {
-            std::cout << "[qpm] dry run: would publish " << pkg.name << "@" << pkg.version << " to " << registry
-                      << (token.empty() ? " anonymously" : "") << "\n";
-            return 0;
-        }
-
         // The registry quietly treats a rejected token as anonymous, so check
         // it first rather than publishing an unowned package by accident.
-        std::string publisher = "anonymous (run `qpm login` to own the package name)";
+        std::string token = opts.token.empty() ? authToken() : opts.token;
+        std::string publisher;
         if (!token.empty())
         {
             std::string error;
             if (!lookupUser(token, publisher, error))
             {
                 std::cerr << "[qpm] your login for " << registry << " was rejected (" << error
-                          << ") — run `qpm login` again\n";
+                          << "); run `qpm login` again\n";
                 return 1;
             }
         }
+        std::string as = publisher.empty() ? "anonymously (`qpm login` first to own the name)" : "as " + publisher;
 
+        std::string problem;
+        switch (checkPublishable(registry, pkg, publisher, problem))
+        {
+        case Publishable::Yes:
+            break;
+        case Publishable::No:
+            std::cerr << "[qpm] can't publish: " << problem << "\n";
+            return 1;
+        case Publishable::Unreachable:
+            if (!opts.dryRun)
+            {
+                std::cerr << "[qpm] can't reach " << registry << " (" << problem << ")\n";
+                return 1;
+            }
+            std::cerr << "[qpm] warning: couldn't ask " << registry << " whether it would take this version ("
+                      << problem << ")\n";
+            break;
+        }
+
+        if (opts.dryRun)
+        {
+            std::cout << "[qpm] dry run: would publish " << pkg.name << "@" << pkg.version << " to " << registry
+                      << " " << as << "\n";
+            return 0;
+        }
+
+        // The same multipart form the website's publish page sends.
         const JsonValue &m = pkg.manifest;
-        JsonValue body = JsonValue::makeObject();
-        body.set("name", pkg.name);
-        body.set("version", pkg.version);
-        body.set("description", m.get("description").asString());
-        if (m.get("keywords").isArray() || m.get("keywords").isString())
-            body.set("keywords", m.get("keywords"));
-        if (m.get("license").isString())
-            body.set("license", m.get("license"));
-        JsonValue repo = m.get("repository");
-        std::string repoUrl = repo.isObject() ? repo.get("url").asString() : repo.asString();
+        std::string boundary = makeBoundary();
+        std::string body;
+        addFormField(body, boundary, "name", pkg.name);
+        addFormField(body, boundary, "version", pkg.version);
+        if (!m.get("description").asString().empty())
+            addFormField(body, boundary, "description", m.get("description").asString());
+        std::vector<std::string> keywords = keywordList(m.get("keywords"));
+        if (!keywords.empty())
+            addFormField(body, boundary, "keywords", join(keywords, ","));
+        if (!m.get("license").asString().empty())
+            addFormField(body, boundary, "license", m.get("license").asString());
+        std::string repoUrl = repoWebUrl(repositoryUrl(m.get("repository")));
         if (!repoUrl.empty())
-            body.set("repository", repoUrl);
-        if (m.get("homepage").isString())
-            body.set("homepage", m.get("homepage"));
+            addFormField(body, boundary, "repository", repoUrl);
+        if (!m.get("homepage").asString().empty())
+            addFormField(body, boundary, "homepage", m.get("homepage").asString());
         if (!pkg.readme.empty())
-            body.set("readme", pkg.readme);
-        if (m.get("dependencies").isObject())
-            body.set("dependencies", m.get("dependencies"));
-        body.set("fileBase64", base64Encode(pkg.tgz));
+            addFormField(body, boundary, "readme", pkg.readme);
+        if (m.get("dependencies").isObject() && !m.get("dependencies").object().empty())
+            addFormField(body, boundary, "dependencies", m.get("dependencies").stringify());
+        addFormFile(body, boundary, "file", pkg.tarballName, pkg.tgz);
+        body += "--" + boundary + "--\r\n";
 
-        std::vector<std::string> headers = {"Content-Type: application/json", "Accept: application/json"};
+        std::vector<std::string> headers = {"Content-Type: multipart/form-data; boundary=" + boundary,
+                                            "Accept: application/json"};
         if (!token.empty())
             headers.push_back("Authorization: Bearer " + token);
 
-        std::cout << "[qpm] publishing to " << registry << " as " << publisher << "\n";
-        HttpResponse resp = httpRequest("POST", registry + "publish", body.stringify(), headers);
+        std::cout << "[qpm] publishing to " << registry << " " << as << "\n";
+        HttpResponse resp = httpRequest("POST", registry + "publish", body, headers);
         if (!resp.ok())
         {
-            std::cerr << "[qpm] publish failed (" << describeFailure(resp) << ")\n";
+            if (resp.status == 413)
+                std::cerr << "[qpm] publish failed: the registry turned the upload down as too large ("
+                          << formatSize(body.size()) << ")\n"
+                          << "[qpm] leave build outputs, binaries and big assets out with a \"files\" list or a .qpmignore\n";
+            else
+                std::cerr << "[qpm] publish failed (" << describeFailure(resp) << ")\n";
             return 1;
         }
         std::cout << "+ " << pkg.name << "@" << pkg.version << "\n";
+        std::string page = packagePageUrl(registry, pkg.name);
+        if (!page.empty())
+            std::cout << "[qpm] " << page << "\n";
         return 0;
     }
 

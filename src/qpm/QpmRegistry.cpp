@@ -13,6 +13,7 @@
 #endif
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -22,8 +23,12 @@ namespace fs = std::filesystem;
 
 namespace qpm
 {
+    const char *const kDefaultRegistry = "https://qpm.quantumlogicslimited.com/api/registry/";
+
     namespace
     {
+        std::string g_registryOverride;
+
         std::string envOr(const char *name, const std::string &def)
         {
             const char *v = std::getenv(name);
@@ -121,14 +126,47 @@ namespace qpm
                 line.pop_back();
             return line;
         }
+
+        // The site that lists a registry's packages: the registry's own origin,
+        // except where the API is served from another host than the website.
+        std::string websiteBaseUrl(const std::string &registry)
+        {
+            if (!isQpmRegistry(registry))
+                return registry.find("//registry.npmjs.org/") != std::string::npos ? "https://www.npmjs.com/" : "";
+            std::string origin = registry.substr(0, registry.size() - std::strlen("api/registry/"));
+            if (origin == "https://qpm-website-backend.vercel.app/")
+                return "https://qpm.quantumlogicslimited.com/";
+            // The local backend's UI is the Vite dev server, which proxies /api to it.
+            if (origin == "http://localhost:8000/" || origin == "http://127.0.0.1:8000/")
+                return "http://localhost:3000/";
+            return origin;
+        }
     } // namespace
+
+    void setRegistryOverride(const std::string &url)
+    {
+        g_registryOverride = url;
+    }
 
     std::string registryBaseUrl()
     {
-        std::string base = envOr("QPM_REGISTRY", "http://localhost:8000/api/registry/");
+        std::string base = g_registryOverride.empty() ? envOr("QPM_REGISTRY", kDefaultRegistry) : g_registryOverride;
         if (base.back() != '/')
             base += '/';
         return base;
+    }
+
+    bool isQpmRegistry(const std::string &registry)
+    {
+        const std::string suffix = "/api/registry/";
+        return registry.size() > suffix.size() &&
+               registry.compare(registry.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    std::string packagePageUrl(const std::string &registry, const std::string &name)
+    {
+        std::string site = websiteBaseUrl(registry);
+        return site.empty() ? "" : site + "package/" + name;
     }
 
     std::string upstreamRegistryUrl()
@@ -169,6 +207,9 @@ namespace qpm
         if (!resp.ok())
         {
             std::cerr << "[qpm] login failed (" << describeFailure(resp) << ")\n";
+            std::string site = websiteBaseUrl(registry);
+            if (resp.status == 401 && !site.empty())
+                std::cerr << "[qpm] no account yet? sign up at " << site << "\n";
             return 1;
         }
 
