@@ -56,4 +56,9 @@ namespace qpm
     int runLogout();
     int runWhoami();
 
+    // `qpm auth`: which account (website profile) qpm is logged in as, whether
+    // its token still works, what kind it is and where it's stored. Exits 1
+    // when not logged in or the token doesn't work.
+    int runAuthStatus();
+
 } // namespace qpm

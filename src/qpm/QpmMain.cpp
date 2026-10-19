@@ -73,7 +73,10 @@ namespace
             "  qpm login <token>           the same without the question\n"
             "  qpm login --password        logs in with username and password instead\n"
             "  qpm logout                  forgets the saved token\n"
-            "  qpm whoami                  shows which account you're logged in as\n"
+            "  qpm whoami                  prints the username you're logged in as\n"
+            "  qpm auth                    shows which profile qpm is attached to: account, email,\n"
+            "                              packages, and whether the saved token works / expires\n"
+            "  qpm auth login | logout     same as qpm login / qpm logout\n"
             "  qpm --help                  show this help\n"
             "  qpm --version               show version\n"
             "\n"
@@ -126,6 +129,28 @@ namespace
             }
         }
         return qpm::runPublish(opts);
+    }
+
+    // `qpm login ...` (first = 1) or `qpm auth login ...` (first = 2).
+    int runLoginCommand(const std::vector<std::string> &args, size_t first)
+    {
+        qpm::LoginOptions opts;
+        for (size_t i = first; i < args.size(); ++i)
+        {
+            if (args[i] == "--password" || args[i] == "-p")
+                opts.password = true;
+            else if (args[i] == "--token" && i + 1 < args.size())
+                opts.token = args[++i];
+            else if (!args[i].empty() && args[i][0] != '-' && opts.token.empty())
+                opts.token = args[i];
+            else
+            {
+                std::cerr << "[qpm] unknown login option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm login [<token>] [--password]\n";
+                return 1;
+            }
+        }
+        return qpm::runLogin(opts);
     }
 
     // True for "--name=value", with "value" put in `value`.
@@ -380,29 +405,23 @@ int main(int argc, char *argv[])
     if (cmd == "pack")
         return qpm::runPack(cwd);
     if (cmd == "login")
-    {
-        qpm::LoginOptions opts;
-        for (size_t i = 1; i < args.size(); ++i)
-        {
-            if (args[i] == "--password" || args[i] == "-p")
-                opts.password = true;
-            else if (args[i] == "--token" && i + 1 < args.size())
-                opts.token = args[++i];
-            else if (!args[i].empty() && args[i][0] != '-' && opts.token.empty())
-                opts.token = args[i];
-            else
-            {
-                std::cerr << "[qpm] unknown login option: " << args[i] << "\n"
-                          << "[qpm] usage: qpm login [<token>] [--password]\n";
-                return 1;
-            }
-        }
-        return qpm::runLogin(opts);
-    }
+        return runLoginCommand(args, 1);
     if (cmd == "logout")
         return qpm::runLogout();
     if (cmd == "whoami")
         return qpm::runWhoami();
+    if (cmd == "auth")
+    {
+        std::string sub = args.size() > 1 ? args[1] : "status";
+        if (sub == "status" && args.size() <= 2)
+            return qpm::runAuthStatus();
+        if (sub == "login")
+            return runLoginCommand(args, 2);
+        if (sub == "logout" && args.size() == 2)
+            return qpm::runLogout();
+        std::cerr << "[qpm] usage: qpm auth [status | login [<token>] [--password] | logout]\n";
+        return 1;
+    }
 
     std::cerr << "[qpm] unknown command: " << cmd << "\n";
     printHelp();
