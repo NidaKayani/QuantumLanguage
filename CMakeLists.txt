@@ -54,9 +54,9 @@ add_executable(qpm ${QPM_SOURCES})
 if(WIN32)
     # z: zlib (statically linked via the -static link flag above, same as the
     #    other 3 targets already get a DLL-free libstdc++/libgcc).
-    # winhttp/crypt32/ws2_32: Windows system DLLs, present on every install —
-    #    linked the same way `advapi32` already is above.
-    target_link_libraries(qpm z winhttp crypt32 ws2_32)
+    # winhttp/crypt32/ws2_32/shell32: Windows system DLLs, present on every
+    #    install — linked the same way `advapi32` already is above.
+    target_link_libraries(qpm z winhttp crypt32 ws2_32 shell32)
 endif()
 
 message(STATUS "Quantum v2.0.0 — Bytecode VM  (static linking enabled)")

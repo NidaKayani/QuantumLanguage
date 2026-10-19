@@ -10,10 +10,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <conio.h>
+#include <shellapi.h>
 #endif
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -102,29 +106,146 @@ namespace qpm
             return base.substr(0, slash + 1) + "auth/";
         }
 
-        std::string prompt(const std::string &label, bool hideInput)
+        // One line from stdin without its line ending; false at the end of input.
+        bool readLine(std::string &line)
         {
-            std::cout << label << std::flush;
-#ifdef _WIN32
-            HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-            DWORD mode = 0;
-            bool restore = hideInput && GetConsoleMode(in, &mode) &&
-                           SetConsoleMode(in, mode & ~ENABLE_ECHO_INPUT);
-#else
-            bool restore = false;
-#endif
-            std::string line;
-            std::getline(std::cin, line);
-#ifdef _WIN32
-            if (restore)
-            {
-                SetConsoleMode(in, mode);
-                std::cout << "\n";
-            }
-#endif
+            if (!std::getline(std::cin, line))
+                return false;
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
-            return line;
+            return true;
+        }
+
+        bool stdinIsConsole()
+        {
+#ifdef _WIN32
+            DWORD mode = 0;
+            return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+#else
+            return false;
+#endif
+        }
+
+        // A password typed at the console, echoed as '*' so each keystroke shows
+        // (Backspace works). Piped input is read as a plain line.
+        bool readMasked(std::string &out)
+        {
+#ifdef _WIN32
+            if (stdinIsConsole())
+            {
+                std::wstring typed;
+                for (;;)
+                {
+                    wint_t c = _getwch();
+                    if (c == L'\r' || c == L'\n')
+                        break;
+                    if (c == 3) // Ctrl+C
+                    {
+                        std::cout << "\n";
+                        std::exit(130);
+                    }
+                    if (c == 0 || c == 0xE0) // arrow and function keys send a second code
+                    {
+                        _getwch();
+                        continue;
+                    }
+                    if (c == L'\b')
+                    {
+                        if (!typed.empty())
+                        {
+                            typed.pop_back();
+                            std::cout << "\b \b" << std::flush;
+                        }
+                        continue;
+                    }
+                    typed += static_cast<wchar_t>(c);
+                    std::cout << '*' << std::flush;
+                }
+                std::cout << "\n";
+                int len = WideCharToMultiByte(CP_UTF8, 0, typed.data(), static_cast<int>(typed.size()), nullptr, 0,
+                                              nullptr, nullptr);
+                out.assign(static_cast<size_t>(len), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, typed.data(), static_cast<int>(typed.size()), &out[0], len, nullptr,
+                                    nullptr);
+                return true;
+            }
+#endif
+            return readLine(out);
+        }
+
+        // A pasted token without the spaces, quotes or "Bearer " that came along with it.
+        std::string cleanToken(const std::string &raw)
+        {
+            std::string token;
+            for (char c : raw)
+                if (!std::isspace(static_cast<unsigned char>(c)) && c != '"' && c != '\'')
+                    token += c;
+            if (token.size() > 6 && (token.compare(0, 6, "Bearer") == 0 || token.compare(0, 6, "bearer") == 0))
+                token.erase(0, 6);
+            return token;
+        }
+
+        // The claims inside a JWT ("header.claims.signature"), or Null if `token` isn't one.
+        JsonValue jwtClaims(const std::string &token)
+        {
+            size_t first = token.find('.');
+            size_t second = first == std::string::npos ? std::string::npos : token.find('.', first + 1);
+            if (second == std::string::npos)
+                return JsonValue();
+            std::string json; // base64url-decoded
+            unsigned buffer = 0;
+            int bits = 0;
+            for (size_t i = first + 1; i < second; ++i)
+            {
+                char c = token[i];
+                int v = c >= 'A' && c <= 'Z'   ? c - 'A'
+                        : c >= 'a' && c <= 'z' ? c - 'a' + 26
+                        : c >= '0' && c <= '9' ? c - '0' + 52
+                        : c == '-' || c == '+' ? 62
+                        : c == '_' || c == '/' ? 63
+                                               : -1;
+                if (v < 0)
+                    break; // '=' padding
+                buffer = (buffer << 6) | static_cast<unsigned>(v);
+                bits += 6;
+                if (bits >= 8)
+                {
+                    bits -= 8;
+                    json += static_cast<char>((buffer >> bits) & 0xFF);
+                }
+            }
+            try
+            {
+                JsonValue claims = JsonValue::parse(json);
+                return claims.isObject() ? claims : JsonValue();
+            }
+            catch (...)
+            {
+                return JsonValue();
+            }
+        }
+
+        // "expires in 6 days (2026-10-25)", or "expired on 2026-10-11".
+        std::string expiryText(double exp)
+        {
+            std::time_t when = static_cast<std::time_t>(exp);
+            char date[32] = "";
+            if (std::tm *local = std::localtime(&when))
+                std::strftime(date, sizeof date, "%Y-%m-%d", local);
+            double left = exp - static_cast<double>(std::time(nullptr));
+            if (left <= 0)
+                return std::string("expired on ") + date;
+            long long days = static_cast<long long>(left / 86400);
+            if (days < 1)
+                return std::string("expires within a day (") + date + ")";
+            return "expires in " + std::to_string(days) + (days == 1 ? " day (" : " days (") + date + ")";
+        }
+
+        void openInBrowser(const std::string &url)
+        {
+#ifdef _WIN32
+            ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
         }
 
         // The site that lists a registry's packages: the registry's own origin,
@@ -187,49 +308,127 @@ namespace qpm
         return loadRc().get("tokens").get(registryBaseUrl()).asString();
     }
 
-    int runLogin()
+    double tokenExpiry(const std::string &token)
+    {
+        return jwtClaims(token).get("exp").asNumber(0);
+    }
+
+    int runLogin(const LoginOptions &opts)
     {
         std::string registry = registryBaseUrl();
-        std::cout << "[qpm] log in to " << registry << "\n";
-        std::string user = prompt("Username or email: ", false);
-        std::string password = prompt("Password: ", true);
-        if (user.empty() || password.empty())
+        std::string site = websiteBaseUrl(registry);
+        std::string token = cleanToken(opts.token);
+
+        if (opts.password)
         {
-            std::cerr << "[qpm] username and password are required\n";
+            std::cout << "[qpm] log in to " << (site.empty() ? registry : site) << "\n";
+            std::string user, password;
+            std::cout << "Username or email: " << std::flush;
+            readLine(user);
+            std::cout << "Password: " << std::flush;
+            readMasked(password);
+            if (user.empty() || password.empty())
+            {
+                std::cerr << "[qpm] username and password are required\n";
+                return 1;
+            }
+
+            JsonValue body = JsonValue::makeObject();
+            body.set("emailOrUsername", user);
+            body.set("password", password);
+            HttpResponse resp = httpRequest("POST", authBaseUrl() + "login", body.stringify(),
+                                            {"Content-Type: application/json", "Accept: application/json"});
+            if (!resp.ok())
+            {
+                std::cerr << "[qpm] login failed (" << describeFailure(resp) << ")\n";
+                if (resp.status == 401 && !site.empty())
+                    std::cerr << "[qpm] no account yet? sign up at " << site
+                              << " (or run `qpm login` and paste the API token from your profile)\n";
+                return 1;
+            }
+            try
+            {
+                token = JsonValue::parse(resp.body).get("token").asString();
+            }
+            catch (...)
+            {
+            }
+            if (token.empty())
+            {
+                std::cerr << "[qpm] login failed (registry returned no token)\n";
+                return 1;
+            }
+        }
+        else if (token.empty())
+        {
+            std::cout << "[qpm] log in to " << (site.empty() ? registry : site) << "\n";
+            if (!site.empty())
+                std::cout << "[qpm] copy your API token from " << site << "profile (Copy token)"
+                          << (stdinIsConsole() ? ", or press Enter to open that page" : "") << "\n";
+            for (bool opened = false;;)
+            {
+                std::cout << "Enter your API token: " << std::flush;
+                std::string line;
+                if (!readLine(line))
+                {
+                    std::cout << "\n";
+                    std::cerr << "[qpm] no token entered\n";
+                    return 1;
+                }
+                token = cleanToken(line);
+                if (!token.empty())
+                    break;
+                if (site.empty() || opened || !stdinIsConsole())
+                {
+                    std::cerr << "[qpm] no token entered\n";
+                    return 1;
+                }
+                openInBrowser(site + "profile");
+                opened = true;
+                std::cout << "[qpm] opened " << site << "profile in your browser: sign in, click Copy token, "
+                          << "and paste it here\n";
+            }
+        }
+
+        std::string username, error;
+        if (!lookupUser(token, username, error))
+        {
+            std::cerr << "[qpm] the registry didn't accept that token (" << error << ")\n";
+            if (!site.empty())
+                std::cerr << "[qpm] copy it again from " << site << "profile; Copy token copies all of it\n";
             return 1;
         }
 
-        JsonValue body = JsonValue::makeObject();
-        body.set("emailOrUsername", user);
-        body.set("password", password);
-        HttpResponse resp = httpRequest("POST", authBaseUrl() + "login", body.stringify(),
-                                        {"Content-Type: application/json", "Accept: application/json"});
-        if (!resp.ok())
+        // A website session token expires a week after signing in. Trade it for the
+        // account's API token, which doesn't, on registries that hand those out.
+        if (jwtClaims(token).get("kind").asString() != "api")
         {
-            std::cerr << "[qpm] login failed (" << describeFailure(resp) << ")\n";
-            std::string site = websiteBaseUrl(registry);
-            if (resp.status == 401 && !site.empty())
-                std::cerr << "[qpm] no account yet? sign up at " << site << "\n";
-            return 1;
-        }
-
-        JsonValue doc;
-        try
-        {
-            doc = JsonValue::parse(resp.body);
-        }
-        catch (...)
-        {
-        }
-        std::string token = doc.get("token").asString();
-        if (token.empty())
-        {
-            std::cerr << "[qpm] login failed (registry returned no token)\n";
-            return 1;
+            HttpResponse resp = httpRequest("GET", authBaseUrl() + "api-token", "",
+                                            {"Accept: application/json", "Authorization: Bearer " + token});
+            if (resp.ok())
+            {
+                try
+                {
+                    std::string apiToken = JsonValue::parse(resp.body).get("token").asString();
+                    if (!apiToken.empty())
+                        token = apiToken;
+                }
+                catch (...)
+                {
+                }
+            }
         }
 
         setSavedToken(registry, token);
-        std::cout << "[qpm] logged in as " << doc.get("user").get("username").asString(user) << "\n";
+        std::cout << "[qpm] logged in as " << username << "\n";
+        double exp = tokenExpiry(token);
+        if (exp > 0)
+            std::cout << "[qpm] this token " << expiryText(exp) << "; run `qpm login` again after that\n";
+        else
+            std::cout << "[qpm] saved in " << rcPath().string()
+                      << ", so `qpm init` and `qpm publish` work from now on without logging in again\n";
+        if (!envOr("QPM_TOKEN", "").empty())
+            std::cerr << "[qpm] note: QPM_TOKEN is set and is used instead of this login until you clear it\n";
         return 0;
     }
 
@@ -283,6 +482,9 @@ namespace qpm
             return 1;
         }
         std::cout << username << "\n";
+        double exp = tokenExpiry(token);
+        if (exp > 0)
+            std::cerr << "[qpm] this login " << expiryText(exp) << "\n";
         return 0;
     }
 

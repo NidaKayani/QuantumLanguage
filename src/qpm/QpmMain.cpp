@@ -68,7 +68,10 @@ namespace
             "  qpm publish --dry-run       shows what would be published, uploads nothing\n"
             "  qpm publish --token <t>     publish with this token instead of the saved login\n"
             "  qpm pack                    writes <name>-<version>.tgz without publishing\n"
-            "  qpm login                   logs in to the registry and saves the token\n"
+            "  qpm login                   asks for your API token (Profile on the website, Copy\n"
+            "                              token) and saves it, so you only log in once\n"
+            "  qpm login <token>           the same without the question\n"
+            "  qpm login --password        logs in with username and password instead\n"
             "  qpm logout                  forgets the saved token\n"
             "  qpm whoami                  shows which account you're logged in as\n"
             "  qpm --help                  show this help\n"
@@ -377,7 +380,25 @@ int main(int argc, char *argv[])
     if (cmd == "pack")
         return qpm::runPack(cwd);
     if (cmd == "login")
-        return qpm::runLogin();
+    {
+        qpm::LoginOptions opts;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--password" || args[i] == "-p")
+                opts.password = true;
+            else if (args[i] == "--token" && i + 1 < args.size())
+                opts.token = args[++i];
+            else if (!args[i].empty() && args[i][0] != '-' && opts.token.empty())
+                opts.token = args[i];
+            else
+            {
+                std::cerr << "[qpm] unknown login option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm login [<token>] [--password]\n";
+                return 1;
+            }
+        }
+        return qpm::runLogin(opts);
+    }
     if (cmd == "logout")
         return qpm::runLogout();
     if (cmd == "whoami")
