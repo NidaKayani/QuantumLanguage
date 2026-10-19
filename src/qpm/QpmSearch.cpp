@@ -1,4 +1,5 @@
 #include "QpmSearch.h"
+#include "QpmColor.h"
 #include "QpmHttp.h"
 #include "QpmJson.h"
 #include "QpmRegistry.h"
@@ -12,11 +13,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
-#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
-#endif
-#else
-#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -94,28 +90,6 @@ namespace qpm
                         out.push_back(oneLine(part));
             }
             return out;
-        }
-
-        // True when stdout is a console that understands ANSI colors (turning
-        // them on if needed) and the user hasn't opted out with NO_COLOR, or
-        // when FORCE_COLOR asks for colors anyway (e.g. through a pipe).
-        bool enableColor(bool wanted)
-        {
-            if (!wanted || std::getenv("NO_COLOR"))
-                return false;
-            const char *force = std::getenv("FORCE_COLOR");
-            if (force && *force && std::string(force) != "0")
-                return true;
-#ifdef _WIN32
-            HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-            DWORD mode = 0;
-            if (!GetConsoleMode(out, &mode))
-                return false;
-            return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) ||
-                   SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-#else
-            return isatty(1);
-#endif
         }
 
         // Columns of the console stdout writes to; through a pipe or into a file,
@@ -695,7 +669,7 @@ namespace qpm
         if (anyKeywords)
             cols.push_back(keywords);
 
-        printTable(cols, opts.longFormat ? 0 : consoleWidth(), termsLower, enableColor(opts.color));
+        printTable(cols, opts.longFormat ? 0 : consoleWidth(), termsLower, opts.color && colorEnabled());
         if (total > static_cast<double>(hits.size()))
             std::cout << "[qpm] showing " << hits.size() << " of " << formatCount(total)
                       << " matches (--limit <n> shows more)\n";
@@ -835,7 +809,7 @@ namespace qpm
             return 0;
         }
 
-        bool color = enableColor(opts.color);
+        bool color = opts.color && colorEnabled();
         auto paint = [color](const std::string &text, const char *code)
         { return color ? std::string("\x1b[") + code + "m" + text + "\x1b[0m" : text; };
 

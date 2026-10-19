@@ -1,4 +1,5 @@
 #include "QpmRegistry.h"
+#include "QpmColor.h"
 #include "QpmHttp.h"
 #include "QpmJson.h"
 
@@ -249,14 +250,18 @@ namespace qpm
 #endif
         }
 
-        // "API token, never expires" / "sign-in token, expires in 6 days (2026-10-25)".
+        // "API token, never expires" / "sign-in token, expires in 6 days (2026-10-25)",
+        // the expiry green, yellow or red by how much time is left.
         std::string tokenKindText(const std::string &token)
         {
             JsonValue claims = jwtClaims(token);
             if (claims.get("kind").asString() == "api")
-                return "API token, never expires";
+                return "API token, " + paint("never expires", "32");
             double exp = claims.get("exp").asNumber(0);
-            return exp > 0 ? "sign-in token, " + expiryText(exp) : "token";
+            if (exp <= 0)
+                return "token";
+            bool expired = exp <= static_cast<double>(std::time(nullptr));
+            return "sign-in token, " + paint(expiryText(exp), expired ? "1;31" : "33");
         }
 
         // The account `token` belongs to, from GET <auth>/me. On failure fills
@@ -497,11 +502,18 @@ namespace qpm
         std::string token = authToken();
         int status = 0;
 
-        std::cout << (site.empty() ? registry : site) << "\n";
+        // Colors follow the website: orange brand and token, cyan links, gray labels.
+        const char *orange = "38;5;208", *gray = "90", *link = "4;36";
+        const std::string tick = paint("\xE2\x9C\x93", "1;32"), cross = paint("\xE2\x9C\x97", "1;31");
+        const std::string loginCommand = paint("qpm login", "1;36");
+        auto label = [&](const char *name)
+        { return "    " + paint(std::string(name) + std::string(11 - std::strlen(name), ' '), gray); };
+
+        std::cout << paint(site.empty() ? registry : site, ("1;" + std::string(orange)).c_str()) << "\n";
         if (token.empty())
         {
-            std::cout << "  \xE2\x9C\x97 Not logged in. Run `qpm login` and paste the API token from "
-                      << (site.empty() ? "your account" : site + "profile") << "\n";
+            std::cout << "  " << cross << " Not logged in. Run " << loginCommand << " and paste the API token from "
+                      << (site.empty() ? std::string("your account") : paint(site + "profile", link)) << "\n";
             status = 1;
         }
         else
@@ -512,10 +524,11 @@ namespace qpm
             if (fetchAccount(token, user, error, rejected))
             {
                 std::string email = user.get("email").asString();
-                std::cout << "  \xE2\x9C\x93 Logged in as " << user.get("username").asString("(unknown user)")
-                          << (email.empty() ? "" : " (" + email + ")") << "\n";
+                std::cout << "  " << tick << " Logged in as "
+                          << paint(user.get("username").asString("(unknown user)"), "1;32")
+                          << (email.empty() ? "" : " " + paint("(" + email + ")", gray)) << "\n";
                 if (!site.empty())
-                    std::cout << "  - Profile: " << site << "profile\n";
+                    std::cout << label("Profile") << paint(site + "profile", link) << "\n";
 
                 // The packages this account owns, as the profile page lists them.
                 HttpResponse resp = isQpmRegistry(registry)
@@ -534,37 +547,38 @@ namespace qpm
                 if (packages.isArray())
                 {
                     const auto &list = packages.array();
-                    std::cout << "  - Packages: ";
+                    std::cout << label("Packages");
                     if (list.empty())
-                        std::cout << "none yet (`qpm publish` adds one)";
+                        std::cout << "none yet " << paint("(qpm publish adds one)", gray);
                     else
-                        std::cout << list.size() << " (";
+                        std::cout << paint(std::to_string(list.size()), "1") << paint(":", gray) << " ";
                     for (size_t i = 0; i < list.size() && i < 8; ++i)
-                        std::cout << (i ? ", " : "") << list[i].get("name").asString() << " "
-                                  << list[i].get("latestVersion").asString();
+                        std::cout << (i ? paint(", ", gray) : "") << paint(list[i].get("name").asString(), "36") << " "
+                                  << paint(list[i].get("latestVersion").asString(), gray);
                     if (list.size() > 8)
-                        std::cout << " and " << list.size() - 8 << " more";
-                    std::cout << (list.empty() ? "" : ")") << "\n";
+                        std::cout << paint(" and " + std::to_string(list.size() - 8) + " more", gray);
+                    std::cout << "\n";
                 }
             }
             else if (rejected)
             {
-                std::cout << "  \xE2\x9C\x97 The saved token doesn't work anymore (" << error << ")\n"
-                          << "    Run `qpm login` to attach your profile again\n";
+                std::cout << "  " << cross << " The saved token doesn't work anymore " << paint("(" + error + ")", gray)
+                          << "\n    Run " << loginCommand << " to attach your profile again\n";
                 status = 1;
             }
             else
             {
-                std::cout << "  \xE2\x9C\x97 Couldn't reach the registry to check the token (" << error << ")\n";
+                std::cout << "  " << cross << " Couldn't reach the registry to check the token "
+                          << paint("(" + error + ")", gray) << "\n";
                 status = 1;
             }
-            std::cout << "  - Token: "
-                      << (token.size() > 12 ? "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" +
-                                                  token.substr(token.size() - 6)
-                                            : std::string("(short)"))
-                      << ", " << tokenKindText(token) << "\n"
-                      << "  - Stored in: " << (fromEnv ? "the QPM_TOKEN environment variable" : rcPath().string())
-                      << "\n";
+            std::string masked = token.size() > 12
+                                     ? "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" +
+                                           token.substr(token.size() - 6)
+                                     : "(short)";
+            std::cout << label("Token") << paint(masked, orange) << paint(", ", gray) << tokenKindText(token) << "\n"
+                      << label("Stored in")
+                      << paint(fromEnv ? "the QPM_TOKEN environment variable" : rcPath().string(), gray) << "\n";
         }
 
         // Logins saved for other registries (a local backend, say).
@@ -575,9 +589,10 @@ namespace qpm
                 others.push_back(m.first);
         if (!others.empty())
         {
-            std::cout << "\nAlso logged in to:\n";
+            std::cout << "\n" << paint("Also logged in to:", "1") << "\n";
             for (const auto &other : others)
-                std::cout << "  " << other << "  (`qpm auth --registry " << other << "` checks it)\n";
+                std::cout << "  " << paint(other, "36") << "  "
+                          << paint("(qpm auth --registry " + other + " checks it)", gray) << "\n";
         }
         return status;
     }
