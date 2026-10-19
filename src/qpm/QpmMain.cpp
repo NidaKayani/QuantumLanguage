@@ -9,6 +9,7 @@
 // whatever the script names — same as npm, qpm doesn't include a JS engine.
 
 #include "QpmBuild.h"
+#include "QpmColor.h"
 #include "QpmManifest.h"
 #include "QpmPublish.h"
 #include "QpmRegistry.h"
@@ -80,7 +81,8 @@ namespace
             "  qpm --help                  show this help\n"
             "  qpm --version               show version\n"
             "\n"
-            "Any command takes --registry <url> to use another registry API for that run.\n"
+            "Any command takes --registry <url> to use another registry API for that run,\n"
+            "and --no-color for plain output.\n"
             "\n"
             "Manifest (the first one found in the project folder is used):\n"
             "  package.qon       JSON like package.json, or requirements style\n"
@@ -308,11 +310,17 @@ int main(int argc, char *argv[])
     std::vector<std::string> args(argv + 1, argv + argc);
     std::string cwd = fs::current_path().string();
 
-    // --registry works with every command, so it's taken out before dispatch
-    // (but not from a program's arguments after `--`).
+    // --registry and --no-color work with every command, so they're taken out
+    // before dispatch (but not from a program's arguments after `--`).
     for (size_t i = 0; i < args.size() && args[i] != "--";)
     {
         std::string url;
+        if (args[i] == "--no-color")
+        {
+            qpm::disableColor();
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
         if (args[i] == "--registry")
         {
             size_t count = i + 1 < args.size() ? 2 : 1;
