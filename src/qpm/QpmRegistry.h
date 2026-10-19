@@ -41,8 +41,18 @@ namespace qpm
     // `error` if the token is rejected or the registry can't be reached.
     bool lookupUser(const std::string &token, std::string &username, std::string &error);
 
+    // When `token` (a JWT) expires, in seconds since 1970; 0 if it never does
+    // (the website's API tokens) or isn't a JWT.
+    double tokenExpiry(const std::string &token);
+
+    struct LoginOptions
+    {
+        std::string token;     // `qpm login <token>` skips the question
+        bool password = false; // `qpm login --password`: username and password instead of a token
+    };
+
     // `qpm login` / `qpm logout` / `qpm whoami`. Return a process exit code.
-    int runLogin();
+    int runLogin(const LoginOptions &opts);
     int runLogout();
     int runWhoami();
 
