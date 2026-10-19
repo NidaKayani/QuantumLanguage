@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -248,6 +249,39 @@ namespace qpm
 #endif
         }
 
+        // "API token, never expires" / "sign-in token, expires in 6 days (2026-10-25)".
+        std::string tokenKindText(const std::string &token)
+        {
+            JsonValue claims = jwtClaims(token);
+            if (claims.get("kind").asString() == "api")
+                return "API token, never expires";
+            double exp = claims.get("exp").asNumber(0);
+            return exp > 0 ? "sign-in token, " + expiryText(exp) : "token";
+        }
+
+        // The account `token` belongs to, from GET <auth>/me. On failure fills
+        // `error`, and `rejected` says the registry turned the token down (as
+        // opposed to not answering).
+        bool fetchAccount(const std::string &token, JsonValue &user, std::string &error, bool &rejected)
+        {
+            HttpResponse resp = httpRequest("GET", authBaseUrl() + "me", "",
+                                            {"Accept: application/json", "Authorization: Bearer " + token});
+            if (!resp.ok())
+            {
+                error = describeFailure(resp);
+                rejected = resp.error.empty() && (resp.status == 401 || resp.status == 403);
+                return false;
+            }
+            try
+            {
+                user = JsonValue::parse(resp.body).get("user");
+            }
+            catch (...)
+            {
+            }
+            return true;
+        }
+
         // The site that lists a registry's packages: the registry's own origin,
         // except where the API is served from another host than the website.
         std::string websiteBaseUrl(const std::string &registry)
@@ -447,23 +481,105 @@ namespace qpm
 
     bool lookupUser(const std::string &token, std::string &username, std::string &error)
     {
-        HttpResponse resp = httpRequest("GET", authBaseUrl() + "me", "",
-                                        {"Accept: application/json", "Authorization: Bearer " + token});
-        if (!resp.ok())
-        {
-            error = describeFailure(resp);
+        JsonValue user;
+        bool rejected = false;
+        if (!fetchAccount(token, user, error, rejected))
             return false;
-        }
-        try
-        {
-            username = JsonValue::parse(resp.body).get("user").get("username").asString();
-        }
-        catch (...)
-        {
-        }
-        if (username.empty())
-            username = "(unknown user)";
+        username = user.get("username").asString("(unknown user)");
         return true;
+    }
+
+    int runAuthStatus()
+    {
+        std::string registry = registryBaseUrl();
+        std::string site = websiteBaseUrl(registry);
+        bool fromEnv = !envOr("QPM_TOKEN", "").empty();
+        std::string token = authToken();
+        int status = 0;
+
+        std::cout << (site.empty() ? registry : site) << "\n";
+        if (token.empty())
+        {
+            std::cout << "  \xE2\x9C\x97 Not logged in. Run `qpm login` and paste the API token from "
+                      << (site.empty() ? "your account" : site + "profile") << "\n";
+            status = 1;
+        }
+        else
+        {
+            JsonValue user;
+            std::string error;
+            bool rejected = false;
+            if (fetchAccount(token, user, error, rejected))
+            {
+                std::string email = user.get("email").asString();
+                std::cout << "  \xE2\x9C\x93 Logged in as " << user.get("username").asString("(unknown user)")
+                          << (email.empty() ? "" : " (" + email + ")") << "\n";
+                if (!site.empty())
+                    std::cout << "  - Profile: " << site << "profile\n";
+
+                // The packages this account owns, as the profile page lists them.
+                HttpResponse resp = isQpmRegistry(registry)
+                                        ? httpRequest("GET", registry + "user/my-packages", "",
+                                                      {"Accept: application/json", "Authorization: Bearer " + token})
+                                        : HttpResponse{};
+                JsonValue packages;
+                try
+                {
+                    if (resp.ok())
+                        packages = JsonValue::parse(resp.body).get("packages");
+                }
+                catch (...)
+                {
+                }
+                if (packages.isArray())
+                {
+                    const auto &list = packages.array();
+                    std::cout << "  - Packages: ";
+                    if (list.empty())
+                        std::cout << "none yet (`qpm publish` adds one)";
+                    else
+                        std::cout << list.size() << " (";
+                    for (size_t i = 0; i < list.size() && i < 8; ++i)
+                        std::cout << (i ? ", " : "") << list[i].get("name").asString() << " "
+                                  << list[i].get("latestVersion").asString();
+                    if (list.size() > 8)
+                        std::cout << " and " << list.size() - 8 << " more";
+                    std::cout << (list.empty() ? "" : ")") << "\n";
+                }
+            }
+            else if (rejected)
+            {
+                std::cout << "  \xE2\x9C\x97 The saved token doesn't work anymore (" << error << ")\n"
+                          << "    Run `qpm login` to attach your profile again\n";
+                status = 1;
+            }
+            else
+            {
+                std::cout << "  \xE2\x9C\x97 Couldn't reach the registry to check the token (" << error << ")\n";
+                status = 1;
+            }
+            std::cout << "  - Token: "
+                      << (token.size() > 12 ? "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2" +
+                                                  token.substr(token.size() - 6)
+                                            : std::string("(short)"))
+                      << ", " << tokenKindText(token) << "\n"
+                      << "  - Stored in: " << (fromEnv ? "the QPM_TOKEN environment variable" : rcPath().string())
+                      << "\n";
+        }
+
+        // Logins saved for other registries (a local backend, say).
+        std::vector<std::string> others;
+        JsonValue saved = loadRc().get("tokens");
+        for (const auto &m : saved.object())
+            if (m.first != registry && !m.second.asString().empty())
+                others.push_back(m.first);
+        if (!others.empty())
+        {
+            std::cout << "\nAlso logged in to:\n";
+            for (const auto &other : others)
+                std::cout << "  " << other << "  (`qpm auth --registry " << other << "` checks it)\n";
+        }
+        return status;
     }
 
     int runWhoami()

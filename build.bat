@@ -209,6 +209,7 @@ echo     qpm start                 ^<-- shorthand for `qpm run start`
 echo     qpm search calculator     ^<-- searches qpm.quantumlogicslimited.com
 echo     qpm view minidb           ^<-- shows a package's versions, deps and links
 echo     qpm login                 ^<-- saves your API token, once per computer
+echo     qpm auth                  ^<-- shows which profile qpm is logged in as
 echo     qpm publish               ^<-- packs the current package and publishes it
 echo.
 endlocal
