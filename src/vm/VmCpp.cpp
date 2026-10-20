@@ -42,6 +42,8 @@ double num(const QV &v)
 {
     if (v.isNumber())
         return v.asNumber();
+    if (v.isLong())
+        return (double)v.asLong();
     if (v.isBool())
         return v.asBool() ? 1 : 0;
     if (v.isNil())
@@ -54,17 +56,155 @@ double num(const QV &v)
     return 0;
 }
 QV N(double d) { return QV(d); }
+QV L64(int64_t x) { return QV::ofLong(x); }
+// An integer argument, exact for 64-bit values
+int64_t ival(const QV &v)
+{
+    if (v.isLong())
+        return v.asLong();
+    double d = num(v);
+    if (std::isnan(d))
+        return 0;
+    if (d >= 9223372036854775807.0)
+        return d >= 18446744073709551615.0 ? -1 : (int64_t)(uint64_t)d; // an unsigned 64-bit value
+    if (d <= -9223372036854775808.0)
+        return INT64_MIN;
+    return (int64_t)d;
+}
 QV S(const std::string &s) { return QV(s); }
 QV B(bool b) { return QV(b); }
 ArrP newArr(size_t n = 0) { return std::make_shared<Array>(n); }
 QV A(ArrP a) { return QV(std::move(a)); }
 QV A(std::initializer_list<QV> l) { return QV(std::make_shared<Array>(l)); }
+// ─── C strings ─────────────────────────────────────────────────────────────
+// A char buffer (char buf[N], a malloc'd block) is a string held in a slot of
+// a container, and a char* into it is the reference [container, key, offset];
+// a string literal's char* is the plain string. Bytes past a buffer's end read
+// as NUL, and a C string ends at its first NUL.
+
+bool isCRef(const QV &v)
+{
+    if (!v.isArray())
+        return false;
+    const Array &r = *v.asArray();
+    return r.size() == 3 && r[0].isArray() && r[1].isNumber() && r[2].isNumber();
+}
+
+// The buffer a char* reference points into (an empty slot becomes ""), and the offset.
+std::string *cbuf(const QV &p, long &off)
+{
+    const Array &r = *p.asArray();
+    Array &c = *r[0].asArray();
+    size_t k = (size_t)r[1].asNumber();
+    off = (long)r[2].asNumber();
+    if (k >= c.size())
+        return nullptr;
+    if (!c[k].isString())
+    {
+        if (!c[k].isNil())
+            return nullptr;
+        c[k] = QV(std::string());
+    }
+    return &std::get<std::string>(c[k].data);
+}
+
+long coff(const QV &p) { return isCRef(p) ? (long)p.asArray()->at(2).asNumber() : 0; }
+
+// The C string a char* or char buffer designates: up to its first NUL.
+std::string cstr(const QV &v)
+{
+    if (v.isString())
+    {
+        const std::string &s = std::get<std::string>(v.data);
+        size_t z = s.find('\0');
+        return z == std::string::npos ? s : s.substr(0, z);
+    }
+    if (isCRef(v))
+    {
+        long off = 0;
+        const std::string *b = cbuf(v, off);
+        if (!b || off < 0 || off >= (long)b->size())
+            return "";
+        size_t z = b->find('\0', (size_t)off);
+        return b->substr((size_t)off, z == std::string::npos ? std::string::npos : z - (size_t)off);
+    }
+    if (v.isNil())
+        return "";
+    return v.toString();
+}
+
+// The raw bytes at a char* / buffer: n of them, NUL past the end.
+std::string cbytes(const QV &v, long n)
+{
+    std::string out;
+    if (n <= 0)
+        return out;
+    const std::string *b = nullptr;
+    long off = 0;
+    if (v.isString())
+        b = &std::get<std::string>(v.data);
+    else if (isCRef(v))
+        b = cbuf(v, off);
+    out.assign((size_t)n, '\0');
+    if (b)
+        for (long i = 0; i < n; ++i)
+            if (off + i >= 0 && off + i < (long)b->size())
+                out[(size_t)i] = (*b)[(size_t)(off + i)];
+    return out;
+}
+
+// Write one byte; a NUL past the end is already there.
+void putChar(std::string &b, long i, char c)
+{
+    if (i < 0)
+        return;
+    if ((size_t)i >= b.size())
+    {
+        if (c == 0)
+            return;
+        b.resize((size_t)i + 1, '\0');
+    }
+    b[(size_t)i] = c;
+}
+
+// Write bytes at pos (trailing NULs are implicit, so they are dropped).
+void putBytes(std::string &b, long pos, const std::string &bytes)
+{
+    if (pos < 0)
+        return;
+    size_t end = (size_t)pos + bytes.size();
+    if (end > b.size())
+        b.resize(end, '\0');
+    for (size_t i = 0; i < bytes.size(); ++i)
+        b[(size_t)pos + i] = bytes[i];
+    while (!b.empty() && b.back() == '\0')
+        b.pop_back();
+}
+
+// A char* moved by n: references keep their buffer; a literal gets a buffer of its own.
+QV cadd(const QV &p, long n)
+{
+    if (isCRef(p))
+    {
+        const Array &r = *p.asArray();
+        return QV(std::make_shared<Array>(Array{r[0], r[1], QV((double)((long)r[2].asNumber() + n))}));
+    }
+    if (p.isString())
+    {
+        auto cell = std::make_shared<Array>(Array{p});
+        return QV(std::make_shared<Array>(Array{QV(cell), QV(0.0), QV((double)n)}));
+    }
+    return p;
+}
+
 std::string str(const QV &v)
 {
     if (v.isString())
         return v.asString();
     if (v.isNil())
         return "";
+    if (isCRef(v))
+        return cstr(v);
     return v.toString();
 }
 
@@ -86,6 +226,14 @@ QV makeExc(const std::string &cls, const std::string &msg)
 
 int cmpValues(const QV &a, const QV &b)
 {
+    if ((a.isLong() && (b.isLong() || b.isNumber())) || (b.isLong() && a.isNumber()))
+    {
+        if (a.isLong() && b.isLong())
+            return a.asLong() < b.asLong() ? -1 : a.asLong() > b.asLong() ? 1 : 0;
+        long double x = a.isLong() ? (long double)a.asLong() : (long double)a.asNumber();
+        long double y = b.isLong() ? (long double)b.asLong() : (long double)b.asNumber();
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
     if (a.isNumber() && b.isNumber())
     {
         double x = a.asNumber(), y = b.asNumber();
@@ -129,6 +277,8 @@ int cmpValues(const QV &a, const QV &b)
 
 bool eqValues(const QV &a, const QV &b)
 {
+    if ((a.isLong() && (b.isLong() || b.isNumber())) || (b.isLong() && a.isNumber()))
+        return cmpValues(a, b) == 0;
     if (a.isArray() && b.isArray())
     {
         const Array &x = *a.asArray(), &y = *b.asArray();
@@ -173,6 +323,16 @@ bool eqValues(const QV &a, const QV &b)
 
 void encodeKey(const QV &v, std::string &out)
 {
+    if (v.isLong() && (v.asLong() > (1LL << 53) || v.asLong() < -(1LL << 53)))
+    {
+        out += "n" + std::to_string(v.asLong()) + ";"; // beyond doubles: its own key
+        return;
+    }
+    if (v.isLong())
+    {
+        encodeKey(QV((double)v.asLong()), out); // one key with the same number as a double
+        return;
+    }
     if (v.isNumber())
     {
         char buf[40];
@@ -257,6 +417,16 @@ ArrP snapshot(const DictP &d, bool sorted, bool isMap)
 }
 
 QV entryKey(const QV &e, bool isMap) { return isMap ? e.asArray()->at(0) : e; }
+
+// multiset / multimap: a repeated key's later entries are stored under
+// key + kDupSep + a sequence number (a sorted snapshot keeps them in order)
+uint64_t g_multiSeq = 0;
+const char kDupSep = 30; // ASCII record separator: never in a key
+std::string dupKey(const std::string &key) { return key + kDupSep + std::to_string(++g_multiSeq); }
+bool isKeyOf(const std::string &k, const std::string &key)
+{
+    return k == key || (k.size() > key.size() && k.compare(0, key.size(), key) == 0 && k[key.size()] == kDupSep);
+}
 
 // ─── Copies ────────────────────────────────────────────────────────────────
 
@@ -366,6 +536,29 @@ std::string fmtDouble(double d, int prec, bool fixed, bool sci, bool showpoint, 
         std::snprintf(buf, sizeof buf, showpoint ? (upper ? "%#.*G" : "%#.*g") : (upper ? "%.*G" : "%.*g"),
                       prec == 0 ? 1 : prec, d);
     return buf;
+}
+
+// An exact 64-bit integer (an unsigned type shows its value modulo 2^64)
+std::string fmtI64(int64_t x, bool uns, int base, bool upper, bool showbase, bool showpos)
+{
+    char buf[80];
+    if (base == 16)
+    {
+        std::snprintf(buf, sizeof buf, upper ? "%llX" : "%llx", (unsigned long long)x);
+        return (showbase ? (upper ? "0X" : "0x") : "") + std::string(buf);
+    }
+    if (base == 8)
+    {
+        std::snprintf(buf, sizeof buf, "%llo", (unsigned long long)x);
+        return (showbase && x ? "0" : "") + std::string(buf);
+    }
+    if (uns)
+    {
+        std::snprintf(buf, sizeof buf, "%llu", (unsigned long long)x);
+        return buf;
+    }
+    std::snprintf(buf, sizeof buf, "%lld", (long long)x);
+    return (showpos && x >= 0 ? "+" : "") + std::string(buf);
 }
 
 std::string fmtInt(double v, int base, bool upper, bool showbase, bool showpos)
@@ -515,7 +708,10 @@ std::string formatFor(const DictP &d, const QV &v, const std::string &kind)
 {
     int prec = (int)nget(d, "precision", 6);
     std::string fl = sget(d, "float");
-    if (kind == "i" || kind == "u")
+    if (v.isLong() && (kind == "i" || kind == "u" || kind == "l" || kind == "L"))
+        return fmtI64(v.asLong(), kind == "u" || kind == "L", (int)nget(d, "base", 10), bget(d, "uppercase"),
+                      bget(d, "showbase"), bget(d, "showpos"));
+    if (kind == "i" || kind == "u" || kind == "l" || kind == "L")
         return fmtInt(num(v), (int)nget(d, "base", 10), bget(d, "uppercase"), bget(d, "showbase"), bget(d, "showpos"));
     if (kind == "d" || kind == "f")
     {
@@ -530,6 +726,8 @@ std::string formatFor(const DictP &d, const QV &v, const std::string &kind)
         return bget(d, "boolalpha") ? (v.isTruthy() ? "true" : "false") : (v.isTruthy() ? "1" : "0");
     if (kind == "s")
         return str(v);
+    if (kind == "z")
+        return cstr(v);
     if (kind == "p")
     {
         if (v.isNil())
@@ -687,10 +885,10 @@ std::string cppPrintf(const std::string &fmt, const Array &kinds, const Array &v
         switch (conv)
         {
         case 'd': case 'i':
-            std::snprintf(buf, sizeof buf, (spec + "lld").c_str(), (long long)num(v));
+            std::snprintf(buf, sizeof buf, (spec + "lld").c_str(), (long long)ival(v));
             break;
         case 'u': case 'x': case 'X': case 'o':
-            std::snprintf(buf, sizeof buf, (spec + "ll" + conv).c_str(), (unsigned long long)(long long)num(v));
+            std::snprintf(buf, sizeof buf, (spec + "ll" + conv).c_str(), (unsigned long long)ival(v));
             break;
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
             std::snprintf(buf, sizeof buf, (spec + conv).c_str(), num(v));
@@ -700,7 +898,7 @@ std::string cppPrintf(const std::string &fmt, const Array &kinds, const Array &v
             break;
         case 's':
         {
-            std::string s = str(v);
+            std::string s = cstr(v);
             std::snprintf(buf, sizeof buf, (spec + "s").c_str(), s.c_str());
             if (s.size() > 900)
             {
@@ -908,6 +1106,12 @@ void VM::registerCppNatives()
     // ── numbers ──
     reg("__cpp_idiv__", [](std::vector<QV> a) -> QV
         {
+        if (arg(a, 0).isLong() || arg(a, 1).isLong())
+        {
+            int64_t p = ival(arg(a, 0)), q = ival(arg(a, 1));
+            if (q == 0) throw RuntimeError("integer division by zero");
+            return L64(q == -1 ? (int64_t)(0 - (uint64_t)p) : p / q);
+        }
         double x = num(arg(a, 0)), y = num(arg(a, 1));
         if (y == 0) throw RuntimeError("integer division by zero");
         if (std::fabs(x) < 9.2e18 && std::fabs(y) < 9.2e18)
@@ -915,6 +1119,12 @@ void VM::registerCppNatives()
         return N(std::trunc(x / y)); });
     reg("__cpp_imod__", [](std::vector<QV> a) -> QV
         {
+        if (arg(a, 0).isLong() || arg(a, 1).isLong())
+        {
+            int64_t p = ival(arg(a, 0)), q = ival(arg(a, 1));
+            if (q == 0) throw RuntimeError("integer division by zero");
+            return L64(q == -1 ? 0 : p % q);
+        }
         double x = num(arg(a, 0)), y = num(arg(a, 1));
         if (y == 0) throw RuntimeError("integer division by zero");
         if (std::fabs(x) < 9.2e18 && std::fabs(y) < 9.2e18)
@@ -929,20 +1139,36 @@ void VM::registerCppNatives()
     reg("__cpp_b2i__", [](std::vector<QV> a) -> QV { return N(num(arg(a, 0))); });
     reg("__cpp_wrap__", [](std::vector<QV> a) -> QV
         {
+        if (arg(a, 0).isLong())
+        {
+            int64_t m = ival(arg(a, 1)), x = arg(a, 0).asLong() % m;
+            return N((double)(x < 0 ? x + m : x));
+        }
         double m = num(arg(a, 1));
         double x = std::fmod(std::trunc(num(arg(a, 0))), m);
         if (x < 0) x += m;
         return N(x); });
     reg("__cpp_uwrap__", [](std::vector<QV> a) -> QV
         {
-        double x = num(arg(a, 0));
         std::string t = str(arg(a, 1));
+        bool wide = !(t == "unsigned int" || t == "unsigned long" || t == "unsigned short");
+        if (arg(a, 0).isLong())
+        {
+            if (wide) return arg(a, 0); // 64-bit: already wrapped
+            int64_t m = t == "unsigned short" ? 65536 : 4294967296LL, x = arg(a, 0).asLong() % m;
+            return N((double)(x < 0 ? x + m : x));
+        }
+        double x = num(arg(a, 0));
+        if (wide && x < 0 && x == std::floor(x) && x > -9.2e18)
+            return L64((int64_t)x); // the two's-complement value, shown unsigned
         if (x >= 0) return N(x);
         double m = (t == "unsigned int" || t == "unsigned long") ? 4294967296.0 : t == "unsigned short" ? 65536.0 : 18446744073709551616.0;
         return N(x + m); });
     reg("__cpp_math__", [](std::vector<QV> a) -> QV
         {
         std::string f = str(arg(a, 0));
+        if (f == "fabs" && arg(a, 1).isLong())
+            return L64(arg(a, 1).asLong() < 0 ? (int64_t)(0 - (uint64_t)arg(a, 1).asLong()) : arg(a, 1).asLong());
         double x = num(arg(a, 1)), y = num(arg(a, 2));
         if (!f.empty() && f.back() == 'f' && f != "erf" && f != "erfc") f.pop_back();
         if (f == "sqrt") return N(std::sqrt(x));
@@ -1022,6 +1248,23 @@ void VM::registerCppNatives()
         {
         QV x = arg(a, 0), y = arg(a, 1);
         if (x.isNil() || y.isNil()) return B(x.isNil() && y.isNil());
+        if ((isCRef(x) || x.isString()) && (isCRef(y) || y.isString()) && (isCRef(x) || isCRef(y)))
+        {
+            if (coff(x) != coff(y)) return B(false);
+            if (isCRef(x) && isCRef(y))
+            {
+                const Array &p = *x.asArray(), &q = *y.asArray();
+                if (p[0].asArray() == q[0].asArray() && p[1].asNumber() == q[1].asNumber()) return B(true);
+            }
+            auto whole = [](const QV &v) -> std::string
+            {
+                if (v.isString()) return v.asString();
+                long off = 0;
+                const std::string *b = cbuf(v, off);
+                return b ? *b : std::string();
+            };
+            return B(whole(x) == whole(y));
+        }
         if (x.isArray() && y.isArray())
         {
             if (x.asArray() == y.asArray()) return B(true);
@@ -1158,17 +1401,230 @@ void VM::registerCppNatives()
         return S(chr(num(c))); });
     reg("__cpp_str_at__", [](std::vector<QV> a) -> QV
         {
-        QV s = arg(a, 0);
+        if (a.empty()) return N(0);
+        const QV &s = a[0];
         long i = (long)num(arg(a, 1));
-        if (!s.isString()) return N(0);
-        const std::string &x = s.asString();
-        return N(i >= 0 && i < (long)x.size() ? (unsigned char)x[i] : 0); });
+        const std::string *x = nullptr;
+        long off = 0;
+        if (s.isString()) x = &std::get<std::string>(s.data);
+        else if (isCRef(s)) x = cbuf(s, off);
+        i += off;
+        return N(x && i >= 0 && i < (long)x->size() ? (unsigned char)(*x)[(size_t)i] : 0); });
     reg("__cpp_str_set__", [](std::vector<QV> a) -> QV
         {
-        std::string s = str(arg(a, 0));
+        QV s = arg(a, 0);
         long i = (long)num(arg(a, 1));
-        if (i >= 0 && i < (long)s.size()) s[i] = (char)(long long)num(arg(a, 2));
-        return S(s); });
+        char c = (char)(long long)num(arg(a, 2));
+        if (isCRef(s))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(s, off)) putChar(*b, off + i, c);
+            return s;
+        }
+        std::string x = str(s);
+        putChar(x, i, c);
+        return S(x); });
+    // (container, key, i): a char of the string held in container[key], read / written in place
+    reg("__cpp_str_get__", [](std::vector<QV> a) -> QV
+        {
+        if (a.size() < 3 || !a[0].isArray()) return N(0);
+        const Array &c = *a[0].asArray();
+        size_t k = (size_t)num(a[1]);
+        long i = (long)num(a[2]);
+        if (k >= c.size() || !c[k].isString()) return N(0);
+        const std::string &x = std::get<std::string>(c[k].data);
+        return N(i >= 0 && i < (long)x.size() ? (unsigned char)x[(size_t)i] : 0); });
+    reg("__cpp_str_put__", [](std::vector<QV> a) -> QV
+        {
+        if (a.size() < 4 || !a[0].isArray()) return arg(a, 3);
+        Array &c = *a[0].asArray();
+        size_t k = (size_t)num(a[1]);
+        if (k >= c.size()) return a[3];
+        if (c[k].isNil()) c[k] = S("");
+        if (c[k].isString()) putChar(std::get<std::string>(c[k].data), (long)num(a[2]), (char)(long long)num(a[3]));
+        return a[3]; });
+    // char* (a reference into a buffer, or a literal)
+    reg("__cpp_cs_put__", [](std::vector<QV> a) -> QV
+        {
+        QV p = arg(a, 0);
+        if (isCRef(p))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(p, off)) putChar(*b, off + (long)num(arg(a, 1)), (char)(long long)num(arg(a, 2)));
+        }
+        return arg(a, 2); });
+    reg("__cpp_cs_add__", [](std::vector<QV> a) -> QV { return cadd(arg(a, 0), (long)num(arg(a, 1))); });
+    reg("__cpp_cs_diff__", [](std::vector<QV> a) -> QV { return N((double)(coff(arg(a, 0)) - coff(arg(a, 1)))); });
+    reg("__cpp_cs_str__", [](std::vector<QV> a) -> QV { return S(cstr(arg(a, 0))); });
+    reg("__cpp_first__", [](std::vector<QV> a) -> QV { return arg(a, 0); });
+    reg("__cpp_strlen__", [](std::vector<QV> a) -> QV
+        {
+        QV p = arg(a, 0);
+        const std::string *b = nullptr;
+        long off = 0;
+        if (p.isString()) b = &std::get<std::string>(p.data);
+        else if (isCRef(p)) b = cbuf(p, off);
+        if (!b || off >= (long)b->size() || off < 0) return N(0);
+        size_t z = b->find('\0', (size_t)off);
+        return N((double)((z == std::string::npos ? b->size() : z) - (size_t)off)); });
+    // a fresh buffer holding s (malloc / strdup)
+    reg("__cpp_cs_new__", [](std::vector<QV> a) -> QV
+        {
+        auto cell = std::make_shared<Array>(Array{S(str(arg(a, 0)))});
+        return A({QV(cell), N(0), N(0)}); });
+    reg("__cpp_cs_realloc__", [](std::vector<QV> a) -> QV
+        {
+        QV p = arg(a, 0);
+        if (isCRef(p)) return p;
+        auto cell = std::make_shared<Array>(Array{S(p.isString() ? p.asString() : std::string())});
+        return A({QV(cell), N(0), N(0)}); });
+    reg("__cpp_cs_dup__", [](std::vector<QV> a) -> QV
+        {
+        std::string s = cstr(arg(a, 0));
+        double n = num(arg(a, 1));
+        if (n >= 0 && (double)s.size() > n) s = s.substr(0, (size_t)n);
+        auto cell = std::make_shared<Array>(Array{S(s)});
+        return A({QV(cell), N(0), N(0)}); });
+    // strcpy / strncpy / strcat / strncat (dst, src, n | -1, append) → dst
+    reg("__cpp_cs_strcpy__", [](std::vector<QV> a) -> QV
+        {
+        QV dst = arg(a, 0);
+        std::string s = cstr(arg(a, 1));
+        long n = (long)num(arg(a, 2));
+        bool app = arg(a, 3).isTruthy();
+        std::string bytes;
+        if (!app)
+        {
+            if (n < 0) bytes = s + std::string(1, '\0');
+            else
+            {
+                bytes = s.substr(0, std::min((size_t)n, s.size()));
+                if ((long)bytes.size() < n) bytes.append((size_t)n - bytes.size(), '\0');
+            }
+        }
+        else
+        {
+            if (n >= 0 && (long)s.size() > n) s = s.substr(0, (size_t)n);
+            bytes = s + std::string(1, '\0');
+        }
+        auto at = [&](std::string &b, long off)
+        {
+            long pos = off;
+            if (app)
+            {
+                size_t z = off < (long)b.size() ? b.find('\0', (size_t)off) : std::string::npos;
+                pos = z == std::string::npos ? std::max<long>((long)b.size(), off) : (long)z;
+            }
+            putBytes(b, pos, bytes);
+        };
+        if (isCRef(dst))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(dst, off)) at(*b, off);
+            return dst;
+        }
+        std::string b = dst.isString() ? dst.asString() : std::string();
+        at(b, 0);
+        return S(b); });
+    // sprintf / snprintf into dst: (dst, text, size | -1) → the text's length
+    reg("__cpp_cs_sprintf__", [](std::vector<QV> a) -> QV
+        {
+        QV dst = arg(a, 0);
+        std::string t = str(arg(a, 1));
+        double lim = num(arg(a, 2));
+        double len = (double)t.size();
+        if (lim >= 0)
+        {
+            if (lim == 0) return N(len);
+            if ((double)t.size() > lim - 1) t = t.substr(0, (size_t)(lim - 1));
+        }
+        if (isCRef(dst))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(dst, off)) putBytes(*b, off, t + std::string(1, '\0'));
+        }
+        return N(len); });
+    reg("__cpp_cs_chr__", [](std::vector<QV> a) -> QV
+        {
+        QV s = arg(a, 0);
+        std::string v = cstr(s);
+        char ch = (char)(long long)num(arg(a, 1));
+        size_t pos = ch == 0 ? v.size() : (arg(a, 2).isTruthy() ? v.rfind(ch) : v.find(ch));
+        if (pos == std::string::npos) return QV();
+        return cadd(s, (long)pos); });
+    reg("__cpp_cs_strstr__", [](std::vector<QV> a) -> QV
+        {
+        QV s = arg(a, 0);
+        size_t pos = cstr(s).find(cstr(arg(a, 1)));
+        if (pos == std::string::npos) return QV();
+        return cadd(s, (long)pos); });
+    // strspn (0) / strcspn (1) / strpbrk (2)
+    reg("__cpp_cs_span__", [](std::vector<QV> a) -> QV
+        {
+        QV s = arg(a, 0);
+        std::string v = cstr(s), set = cstr(arg(a, 1));
+        int mode = (int)num(arg(a, 2));
+        size_t p = mode == 0 ? v.find_first_not_of(set) : v.find_first_of(set);
+        if (mode == 2) return p == std::string::npos ? QV() : cadd(s, (long)p);
+        return N((double)(p == std::string::npos ? v.size() : p)); });
+    reg("__cpp_cs_memset__", [](std::vector<QV> a) -> QV
+        {
+        QV dst = arg(a, 0);
+        long n = (long)num(arg(a, 2));
+        std::string bytes(n > 0 ? (size_t)n : 0, (char)((long long)num(arg(a, 1)) & 0xFF));
+        if (isCRef(dst))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(dst, off)) putBytes(*b, off, bytes);
+            return dst;
+        }
+        std::string b = dst.isString() ? dst.asString() : std::string();
+        putBytes(b, 0, bytes);
+        return S(b); });
+    reg("__cpp_cs_memcpy__", [](std::vector<QV> a) -> QV
+        {
+        QV dst = arg(a, 0);
+        std::string bytes = cbytes(arg(a, 1), (long)num(arg(a, 2)));
+        if (isCRef(dst))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(dst, off)) putBytes(*b, off, bytes);
+            return dst;
+        }
+        std::string b = dst.isString() ? dst.asString() : std::string();
+        putBytes(b, 0, bytes);
+        return S(b); });
+    reg("__cpp_cs_memcmp__", [](std::vector<QV> a) -> QV
+        {
+        long n = (long)num(arg(a, 2));
+        std::string x = cbytes(arg(a, 0), n), y = cbytes(arg(a, 1), n);
+        int r = std::memcmp(x.data(), y.data(), x.size());
+        return N(r < 0 ? -1 : r > 0 ? 1 : 0); });
+    // fgets(dst, n, stream) / gets(dst) (n < 0): a line from stdin into the buffer, NULL at EOF
+    reg("__cpp_fgets__", [this](std::vector<QV> a) -> QV
+        {
+        QV dst = arg(a, 0);
+        long n = (long)num(arg(a, 1));
+        DictP in = globals->get("__cpp_cin").asDict();
+        if (n == 0 || n == 1) return n == 1 ? dst : QV();
+        std::string line;
+        bool any = false;
+        while (n < 0 || (long)line.size() < n - 1)
+        {
+            int c = getChar(in);
+            if (c < 0) break;
+            any = true;
+            if (c == '\n' && n < 0) break;
+            line += (char)c;
+            if (c == '\n') break;
+        }
+        if (!any) return QV();
+        if (isCRef(dst))
+        {
+            long off = 0;
+            if (std::string *b = cbuf(dst, off)) putBytes(*b, off, line + std::string(1, '\0'));
+        }
+        return dst; });
     reg("__cpp_str_check__", [](std::vector<QV> a) -> QV
         {
         std::string s = str(arg(a, 0));
@@ -1384,7 +1840,7 @@ void VM::registerCppNatives()
         return B(ok); });
     reg("__cpp_strcmp__", [](std::vector<QV> a) -> QV
         {
-        std::string x = str(arg(a, 0)), y = str(arg(a, 1));
+        std::string x = cstr(arg(a, 0)), y = cstr(arg(a, 1));
         double n = num(arg(a, 2));
         if (n >= 0) { x = x.substr(0, (size_t)n); y = y.substr(0, (size_t)n); }
         if (arg(a, 3).isTruthy())
@@ -1431,6 +1887,8 @@ void VM::registerCppNatives()
         }
         if (k == "b") return S(v.isTruthy() ? "1" : "0");
         if (k == "s") return S(str(v));
+        if (k == "z") return S(cstr(v));
+        if (v.isLong()) return S(fmtI64(v.asLong(), k == "u" || k == "L", 10, false, false, false));
         return S(fmtInt(num(v), 10, false, false, false)); });
     reg("__cpp_sto__", [](std::vector<QV> a) -> QV
         {
@@ -1444,13 +1902,19 @@ void VM::registerCppNatives()
         char *end = nullptr;
         errno = 0;
         double r = 0;
+        bool wide = fn.find("ll") != std::string::npos; // 64-bit results are exact
+        int64_t exact = 0;
         if (fl)
             r = std::strtod(b, &end);
-        else if (fn == "stoul" || fn == "stoull" || fn == "strtoul")
-            r = (double)std::strtoull(b, &end, base);
+        else if (fn == "stoul" || fn == "stoull" || fn == "strtoul" || fn == "strtoull")
+        {
+            exact = (int64_t)std::strtoull(b, &end, base);
+            r = (double)(uint64_t)exact;
+        }
         else
         {
             long long v = std::strtoll(b, &end, base);
+            exact = v;
             r = (double)v;
             if (errno != ERANGE && (fn == "stoi" || fn == "stol" || fn == "atoi" || fn == "atol") &&
                 (v > 2147483647LL || v < -2147483648LL))
@@ -1472,6 +1936,7 @@ void VM::registerCppNatives()
             if (ref->size() >= 2 && (*ref)[0].isArray())
                 (*(*ref)[0].asArray())[(size_t)num((*ref)[1])] = N((double)(end - b));
         }
+        if (wide && !fl) return L64(exact);
         return N(r); });
 
     // ── printf family ──
@@ -1483,8 +1948,459 @@ void VM::registerCppNatives()
         if (target == "stderr") { std::cout.flush(); std::cerr << out; }
         else std::cout << out;
         return N((double)out.size()); });
-    reg("__cpp_puts__", [](std::vector<QV> a) -> QV { std::cout << str(arg(a, 0)) << "\n"; return N(1); });
+    reg("__cpp_puts__", [](std::vector<QV> a) -> QV { std::cout << cstr(arg(a, 0)) << "\n"; return N(1); });
+    reg("__cpp_fputs__", [](std::vector<QV> a) -> QV
+        {
+        std::string s = cstr(arg(a, 0));
+        if (str(arg(a, 1)) == "stderr") { std::cout.flush(); std::cerr << s; }
+        else std::cout << s;
+        return N(1); });
+    reg("__cpp_fputc__", [](std::vector<QV> a) -> QV
+        {
+        char c = (char)(long long)num(arg(a, 0));
+        if (str(arg(a, 1)) == "stderr") { std::cout.flush(); std::cerr << c; }
+        else std::cout << c;
+        return N((double)(unsigned char)c); });
     reg("__cpp_putchar__", [](std::vector<QV> a) -> QV { std::cout << (char)(long long)num(arg(a, 0)); return arg(a, 0); });
+    // <stdarg.h>: a va_list is [rest arguments, next index]
+    reg("__cpp_va_arg__", [](std::vector<QV> a) -> QV
+        {
+        QV ap = arg(a, 0);
+        if (!ap.isArray() || ap.asArray()->size() < 2) return QV();
+        Array &st = *ap.asArray();
+        if (!st[0].isArray()) return QV();
+        Array &rest = *st[0].asArray();
+        size_t i = (size_t)num(st[1]);
+        st[1] = N((double)(i + 1));
+        return i < rest.size() ? rest[i] : QV(); });
+    reg("__cpp_va_rest__", [](std::vector<QV> a) -> QV
+        {
+        auto out = newArr();
+        QV ap = arg(a, 0);
+        if (ap.isArray() && ap.asArray()->size() >= 2 && ap.asArray()->at(0).isArray())
+        {
+            const Array &rest = *ap.asArray()->at(0).asArray();
+            for (size_t i = (size_t)num(ap.asArray()->at(1)); i < rest.size(); ++i) out->push_back(rest[i]);
+        }
+        return A(out); });
+    reg("__cpp_va_copy__", [](std::vector<QV> a) -> QV
+        {
+        QV ap = arg(a, 0);
+        if (!ap.isArray()) return ap;
+        return A(std::make_shared<Array>(*ap.asArray())); });
+    // scanf(fmt, refs): (source string | nil for stdin, format, [where each value goes])
+    reg("__cpp_scanf__", [this](std::vector<QV> a) -> QV
+        {
+        DictP in;
+        if (arg(a, 0).isNil())
+            in = globals->get("__cpp_cin").asDict();
+        else
+        {
+            in = std::make_shared<Dict>();
+            (*in)["__stream"] = S("istringstream");
+            (*in)["buf"] = S(cstr(arg(a, 0)));
+            (*in)["pos"] = N(0);
+        }
+        std::string fmt = str(arg(a, 1));
+        ArrP refs = arg(a, 2).isArray() ? arg(a, 2).asArray() : newArr();
+        size_t next = 0;
+        int assigned = 0;
+        bool anyInput = false;
+        auto put = [&](const QV &v)
+        {
+            if (next >= refs->size()) return;
+            QV r = (*refs)[next++];
+            if (isCRef(r))
+            {
+                long off = 0;
+                if (std::string *b = cbuf(r, off))
+                {
+                    if (v.isString()) putBytes(*b, off, v.asString() + std::string(1, '\0'));
+                    else putChar(*b, off, (char)(long long)num(v));
+                }
+                ++assigned;
+                return;
+            }
+            if (r.isArray() && r.asArray()->size() == 2 && r.asArray()->at(0).isArray())
+            {
+                ArrP c = r.asArray()->at(0).asArray();
+                size_t k = (size_t)num(r.asArray()->at(1));
+                if (k < c->size()) (*c)[k] = v;
+            }
+            ++assigned;
+        };
+        for (size_t i = 0; i < fmt.size(); ++i)
+        {
+            char f = fmt[i];
+            if (std::isspace((unsigned char)f))
+            {
+                skipWs(in);
+                continue;
+            }
+            if (f != '%')
+            {
+                if (peekChar(in) != (unsigned char)f) break;
+                getChar(in);
+                continue;
+            }
+            ++i;
+            if (i < fmt.size() && fmt[i] == '%')
+            {
+                skipWs(in);
+                if (peekChar(in) != '%') break;
+                getChar(in);
+                continue;
+            }
+            bool suppress = false;
+            if (i < fmt.size() && fmt[i] == '*') { suppress = true; ++i; }
+            long width = 0;
+            while (i < fmt.size() && std::isdigit((unsigned char)fmt[i])) width = width * 10 + (fmt[i++] - '0');
+            bool ll = false;
+            while (i < fmt.size() && std::strchr("hlLqjzt", fmt[i]))
+            {
+                if (fmt[i] == 'l' && i + 1 < fmt.size() && fmt[i + 1] == 'l') ll = true;
+                if (fmt[i] == 'j' || fmt[i] == 'q') ll = true;
+                ++i;
+            }
+            if (i >= fmt.size()) break;
+            char conv = fmt[i];
+            if (conv == 'c')
+            {
+                long n = width > 0 ? width : 1;
+                std::string got;
+                for (long k = 0; k < n; ++k)
+                {
+                    int c = getChar(in);
+                    if (c < 0) break;
+                    got += (char)c;
+                }
+                if (got.empty()) break;
+                anyInput = true;
+                if (!suppress) put(n == 1 ? N((double)(unsigned char)got[0]) : S(got));
+                continue;
+            }
+            if (conv == '[')
+            {
+                // scanset %[...] / %[^...]
+                size_t j = i + 1;
+                bool neg = j < fmt.size() && fmt[j] == '^';
+                if (neg) ++j;
+                std::string set;
+                if (j < fmt.size() && fmt[j] == ']') set += fmt[j++];
+                while (j < fmt.size() && fmt[j] != ']') set += fmt[j++];
+                i = j;
+                std::string got;
+                while (true)
+                {
+                    int c = peekChar(in);
+                    if (c < 0) break;
+                    bool inSet = set.find((char)c) != std::string::npos;
+                    if (inSet == neg) break;
+                    if (width > 0 && (long)got.size() >= width) break;
+                    got += (char)getChar(in);
+                }
+                if (got.empty()) break;
+                anyInput = true;
+                if (!suppress) put(S(got));
+                continue;
+            }
+            skipWs(in);
+            if (peekChar(in) < 0) break;
+            anyInput = true;
+            std::string tok;
+            auto take = [&](auto ok)
+            {
+                while (true)
+                {
+                    int c = peekChar(in);
+                    if (c < 0 || !ok(c, tok)) break;
+                    if (width > 0 && (long)tok.size() >= width) break;
+                    tok += (char)getChar(in);
+                }
+            };
+            if (conv == 's')
+            {
+                take([](int c, const std::string &) { return !std::isspace(c); });
+                if (!suppress) put(S(tok));
+                continue;
+            }
+            if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o')
+            {
+                int base = conv == 'x' || conv == 'X' ? 16 : conv == 'o' ? 8 : 10;
+                take([base](int c, const std::string &t) {
+                    if ((c == '-' || c == '+') && t.empty()) return true;
+                    if (base == 16) return std::isxdigit(c) != 0 || ((c == 'x' || c == 'X') && (t == "0" || t == "-0" || t == "+0"));
+                    return c >= '0' && c < '0' + std::min(base, 10);
+                });
+                if (tok.empty() || tok == "-" || tok == "+") break;
+                long long v = conv == 'u' || base != 10 ? (long long)std::strtoull(tok.c_str(), nullptr, base)
+                                                        : std::strtoll(tok.c_str(), nullptr, base);
+                if (!suppress) put(ll ? L64(v) : N((double)v));
+                continue;
+            }
+            if (std::strchr("fFeEgGaA", conv))
+            {
+                take([](int c, const std::string &t) {
+                    if (std::isdigit(c) || c == '.') return true;
+                    if ((c == '-' || c == '+') && (t.empty() || t.back() == 'e' || t.back() == 'E')) return true;
+                    if ((c == 'e' || c == 'E') && !t.empty() && t.find_first_of("eE") == std::string::npos) return true;
+                    return false;
+                });
+                if (tok.empty()) break;
+                if (!suppress) put(N(std::strtod(tok.c_str(), nullptr)));
+                continue;
+            }
+            break;
+        }
+        if (assigned == 0 && !anyInput && peekChar(in) < 0) return N(-1);
+        return N((double)assigned); });
+    // strtok(s | NULL, delims): the next token of the string being split, or NULL
+    reg("__cpp_strtok__", [](std::vector<QV> a) -> QV
+        {
+        static std::string text;
+        static size_t pos = 0;
+        static QV buf; // the buffer being split, when it is one
+        if (!arg(a, 0).isNil())
+        {
+            buf = isCRef(arg(a, 0)) ? arg(a, 0) : QV();
+            text = buf.isNil() ? cstr(arg(a, 0)) : std::string();
+            pos = buf.isNil() ? 0 : (size_t)coff(buf);
+        }
+        std::string delims = cstr(arg(a, 1));
+        if (!buf.isNil())
+        {
+            long off = 0;
+            std::string *b = cbuf(buf, off);
+            if (!b) return QV();
+            size_t i = pos, n = b->size();
+            while (i < n && (*b)[i] != 0 && delims.find((*b)[i]) != std::string::npos) ++i;
+            if (i >= n || (*b)[i] == 0) { pos = i; return QV(); }
+            size_t st = i;
+            while (i < n && (*b)[i] != 0 && delims.find((*b)[i]) == std::string::npos) ++i;
+            if (i < n && (*b)[i] != 0) { (*b)[i] = 0; pos = i + 1; }
+            else pos = i;
+            return cadd(buf, (long)st - off);
+        }
+        while (pos < text.size() && delims.find(text[pos]) != std::string::npos) ++pos;
+        if (pos >= text.size()) return QV();
+        size_t end = pos;
+        while (end < text.size() && delims.find(text[end]) == std::string::npos) ++end;
+        std::string tok = text.substr(pos, end - pos);
+        pos = end < text.size() ? end + 1 : end;
+        return S(tok); });
+    // memcpy / memmove (dst, src, element size, bytes, copy plan) on [block, offset] references
+    reg("__cpp_memcpy__", [](std::vector<QV> a) -> QV
+        {
+        QV d = arg(a, 0), s = arg(a, 1), plan = arg(a, 4);
+        long es = std::max(1L, (long)num(arg(a, 2)));
+        long n = (long)num(arg(a, 3)) / es;
+        auto ref = [](const QV &p, ArrP &blk, long &off)
+        {
+            if (p.isArray() && p.asArray()->size() == 2 && p.asArray()->at(0).isArray())
+            {
+                blk = p.asArray()->at(0).asArray();
+                off = (long)num(p.asArray()->at(1));
+                return true;
+            }
+            return false;
+        };
+        ArrP db, sb;
+        long doff = 0, soff = 0;
+        if (!ref(d, db, doff) || !ref(s, sb, soff)) return d;
+        std::vector<QV> tmp;
+        for (long k = 0; k < n && soff + k < (long)sb->size(); ++k)
+            tmp.push_back(plan.isArray() ? copyValue((*sb)[soff + k], plan) : (*sb)[soff + k]);
+        for (long k = 0; k < (long)tmp.size() && doff + k < (long)db->size(); ++k) (*db)[doff + k] = tmp[k];
+        return d; });
+    // memset(dst, byte, element size, bytes, float elements)
+    reg("__cpp_memset__", [](std::vector<QV> a) -> QV
+        {
+        QV d = arg(a, 0);
+        long b = (long)num(arg(a, 1)) & 0xFF;
+        long es = std::max(1L, (long)num(arg(a, 2)));
+        long n = (long)num(arg(a, 3)) / es;
+        double v;
+        if (arg(a, 4).isTruthy())
+            v = 0; // floating elements: only zeroing is meaningful
+        else
+        {
+            uint64_t u = 0;
+            for (long k = 0; k < es && k < 8; ++k) u = (u << 8) | (uint64_t)b;
+            if (es >= 8) v = (double)(int64_t)u;
+            else
+            {
+                int64_t sv = (int64_t)u;
+                int64_t sign = (int64_t)1 << (8 * es - 1);
+                if (sv & sign) sv -= sign << 1;
+                v = (double)sv;
+            }
+        }
+        if (d.isArray() && d.asArray()->size() == 2 && d.asArray()->at(0).isArray())
+        {
+            ArrP blk = d.asArray()->at(0).asArray();
+            long off = (long)num(d.asArray()->at(1));
+            for (long k = 0; k < n && off + k < (long)blk->size(); ++k) (*blk)[off + k] = N(v);
+        }
+        return d; });
+    reg("__cpp_memset_str__", [](std::vector<QV> a) -> QV
+        {
+        long c = (long)num(arg(a, 0)) & 0xFF;
+        long n = (long)num(arg(a, 1));
+        if (c == 0 || n <= 0) return S("");
+        return S(std::string((size_t)n, (char)c)); });
+    reg("__cpp_memcmp__", [](std::vector<QV> a) -> QV
+        {
+        QV x = arg(a, 0), y = arg(a, 1);
+        long es = std::max(1L, (long)num(arg(a, 2)));
+        long n = (long)num(arg(a, 3)) / es;
+        if (!x.isArray() || !y.isArray() || x.asArray()->size() != 2 || y.asArray()->size() != 2) return N(0);
+        ArrP xb = x.asArray()->at(0).asArray(), yb = y.asArray()->at(0).asArray();
+        long xo = (long)num(x.asArray()->at(1)), yo = (long)num(y.asArray()->at(1));
+        for (long k = 0; k < n; ++k)
+        {
+            double p = xo + k < (long)xb->size() ? num((*xb)[xo + k]) : 0, q2 = yo + k < (long)yb->size() ? num((*yb)[yo + k]) : 0;
+            if (p != q2) return N(p < q2 ? -1 : 1);
+        }
+        return N(0); });
+    // destructors: an object's dynamic class's "#dtor" (from its descriptor's vtable)
+    auto destroy = [this](const QV &p)
+    {
+        if (!p.isArray())
+            return;
+        const Array &o = *p.asArray();
+        if (o.empty() || !o[0].isDict())
+            return;
+        DictP desc = o[0].asDict();
+        auto vt = desc->find("vt");
+        if (vt == desc->end() || !vt->second.isDict())
+            return;
+        auto f = vt->second.asDict()->find("#dtor");
+        if (f != vt->second.asDict()->end())
+            invokeCallable(f->second, {p});
+    };
+    reg("__cpp_delete__", [destroy](std::vector<QV> a) -> QV
+        {
+        destroy(arg(a, 0));
+        return QV(); });
+    // temporaries pending destruction at the end of their full expression
+    static std::vector<QV> pendingTemps;
+    reg("__cpp_temp__", [](std::vector<QV> a) -> QV
+        {
+        pendingTemps.push_back(arg(a, 0));
+        return arg(a, 0); });
+    reg("__cpp_temps_mark__", [](std::vector<QV>) -> QV { return N((double)pendingTemps.size()); });
+    reg("__cpp_temps_end__", [destroy](std::vector<QV> a) -> QV
+        {
+        size_t mark = (size_t)num(arg(a, 0));
+        while (pendingTemps.size() > mark)
+        {
+            QV t = pendingTemps.back();
+            pendingTemps.pop_back();
+            destroy(t);
+        }
+        return QV(); });
+    // shared_ptr owners, counted per object
+    static std::unordered_map<const void *, int64_t> spCount;
+    auto spKey = [](const QV &p) -> const void * { return p.isArray() ? (const void *)p.asArray().get() : nullptr; };
+    reg("__cpp_sp_new__", [spKey](std::vector<QV> a) -> QV
+        {
+        if (const void *k = spKey(arg(a, 0))) spCount[k] = 1;
+        return arg(a, 0); });
+    reg("__cpp_sp_copy__", [spKey](std::vector<QV> a) -> QV
+        {
+        if (const void *k = spKey(arg(a, 0)))
+        {
+            auto it = spCount.find(k);
+            if (it != spCount.end()) ++it->second;
+            else spCount[k] = 2;
+        }
+        return arg(a, 0); });
+    reg("__cpp_sp_release__", [spKey, destroy](std::vector<QV> a) -> QV
+        {
+        const void *k = spKey(arg(a, 0));
+        if (!k) return QV();
+        auto it = spCount.find(k);
+        if (it != spCount.end() && --it->second > 0) return QV();
+        if (it != spCount.end()) spCount.erase(it);
+        destroy(arg(a, 0)); // the last owner
+        return QV(); });
+    reg("__cpp_sp_count__", [spKey](std::vector<QV> a) -> QV
+        {
+        const void *k = spKey(arg(a, 0));
+        if (!k) return N(0);
+        auto it = spCount.find(k);
+        return N(it == spCount.end() ? 1 : (double)it->second); });
+    // a container's elements (an object array: its elements, last first when `reverse`)
+    static std::function<void(const QV &, bool)> destroyEach;
+    destroyEach = [destroy, spKey](const QV &v, bool reverse)
+    {
+        QV c = v;
+        if (c.isArray() && c.asArray()->size() == 2 && c.asArray()->at(0).isArray() && c.asArray()->at(1).isNumber())
+            c = c.asArray()->at(0); // a pointer [block, offset] from new T[n]
+        if (!c.isArray()) return;
+        ArrP arr = c.asArray();
+        if (!arr->empty() && arr->at(0).isDict()) { destroy(c); return; } // an object
+        std::vector<QV> items(arr->begin(), arr->end());
+        if (reverse) std::reverse(items.begin(), items.end());
+        for (const QV &x : items)
+        {
+            if (const void *k = spKey(x))
+            {
+                auto it = spCount.find(k);
+                if (it != spCount.end())
+                {
+                    if (--it->second > 0) continue;
+                    spCount.erase(it);
+                }
+            }
+            if (x.isArray() && !x.asArray()->empty() && x.asArray()->at(0).isDict()) destroy(x);
+            else if (x.isArray()) destroyEach(x, reverse);
+        }
+    };
+    reg("__cpp_destroy_each__", [](std::vector<QV> a) -> QV
+        {
+        destroyEach(arg(a, 0), arg(a, 1).isTruthy());
+        return QV(); });
+    reg("__cpp_qsort__", [this](std::vector<QV> a) -> QV
+        {
+        QV base = arg(a, 0);
+        long n = (long)num(arg(a, 1));
+        QV cmp = arg(a, 2);
+        int mode = (int)num(arg(a, 3));
+        if (!base.isArray() || base.asArray()->size() != 2 || !base.asArray()->at(0).isArray()) return QV();
+        ArrP blk = base.asArray()->at(0).asArray();
+        long off = (long)num(base.asArray()->at(1));
+        if (off < 0 || off + n > (long)blk->size()) n = std::max(0L, (long)blk->size() - off);
+        std::vector<QV> items(blk->begin() + off, blk->begin() + off + n);
+        auto refTo = [&](const QV &v) -> QV
+        {
+            if (mode == 1) return v;
+            auto cell = std::make_shared<Array>(Array{v});
+            return mode == 2 ? A({QV(cell), N(0), N(0)}) : A({QV(cell), N(0)});
+        };
+        std::stable_sort(items.begin(), items.end(), [&](const QV &x, const QV &y)
+                         { return num(invokeCallable(cmp, {refTo(x), refTo(y)})) < 0; });
+        for (long i = 0; i < n; ++i) (*blk)[(size_t)(off + i)] = items[(size_t)i];
+        return QV(); });
+    reg("__cpp_bsearch__", [this](std::vector<QV> a) -> QV
+        {
+        QV key = arg(a, 0), base = arg(a, 1), cmp = arg(a, 3);
+        long n = (long)num(arg(a, 2));
+        int mode = (int)num(arg(a, 4));
+        if (!base.isArray() || base.asArray()->size() != 2 || !base.asArray()->at(0).isArray()) return QV();
+        ArrP blk = base.asArray()->at(0).asArray();
+        long off = (long)num(base.asArray()->at(1));
+        long lo = 0, hi = std::min(n, (long)blk->size() - off) - 1;
+        while (lo <= hi)
+        {
+            long mid = lo + (hi - lo) / 2;
+            QV el = mode == 1 ? (*blk)[(size_t)(off + mid)] : (mode == 2 ? A({QV(blk), N((double)(off + mid)), N(0)}) : A({QV(blk), N((double)(off + mid))}));
+            double c = num(invokeCallable(cmp, {key, el}));
+            if (c == 0) return el;
+            if (c < 0) hi = mid - 1;
+            else lo = mid + 1;
+        }
+        return QV(); });
     reg("__cpp_getchar__", [this](std::vector<QV>) -> QV
         {
         DictP in = globals->get("__cpp_cin").asDict();
@@ -1561,6 +2477,7 @@ void VM::registerCppNatives()
         // arithmetic on the value doesn't divide by zero; the stream still
         // fails, so `while (cin >> x)` loops end.
         QV failedNum = N(g_testMode && sget(d, "__stream") == "cin" ? 1 : 0);
+        if (k == "z") k = "s";
         if (bget(d, "fail")) return k == "s" ? S("") : failedNum;
         if (k == "c")
         {
@@ -1573,6 +2490,14 @@ void VM::registerCppNatives()
         if (w.empty()) { setFail(d, true); return k == "s" ? S("") : failedNum; }
         if (k == "s" || k == "?") return S(w);
         char *end = nullptr;
+        if (k == "l" || k == "L")
+        {
+            long long v = k == "L" ? (long long)std::strtoull(w.c_str(), &end, 10) : std::strtoll(w.c_str(), &end, 10);
+            if (end == w.c_str()) { setFail(d, false); return L64(0); }
+            size_t used = (size_t)(end - w.c_str());
+            if (used < w.size()) (*d)["pos"] = N(nget(d, "pos") - (double)(w.size() - used));
+            return L64(v);
+        }
         double r = (k == "d" || k == "f") ? std::strtod(w.c_str(), &end) : (double)std::strtoll(w.c_str(), &end, 10);
         if (end == w.c_str()) { setFail(d, false); return N(0); }
         // unread the rest of the token (e.g. "12abc")
@@ -1637,6 +2562,24 @@ void VM::registerCppNatives()
         if (m == "precision") { double old = nget(d, "precision", 6); if (!args.empty()) (*d)["precision"] = N(num(args[0])); return N(old); }
         if (m == "width") { double old = nget(d, "width"); if (!args.empty()) (*d)["width"] = N(num(args[0])); return N(old); }
         if (m == "fill") { if (!args.empty()) (*d)["fill"] = S(chr(num(args[0]))); return QV(); }
+        if ((m == "setf" || m == "unsetf") && !args.empty() && args[0].isDict() && args[0].asDict()->count("__manip"))
+        {
+            // ios flags are manipulators: setf applies one, unsetf its opposite
+            std::string n = str(args[0].asDict()->at("__manip"));
+            auto md = std::make_shared<Dict>();
+            if (m == "setf")
+                (*md)["__manip"] = S(n);
+            else if (n == "floatfield" || n == "fixed" || n == "scientific")
+                (*md)["__manip"] = S("defaultfloat");
+            else if (n == "basefield" || n == "hex" || n == "oct")
+                (*md)["__manip"] = S("dec");
+            else if (n == "adjustfield" || n == "left" || n == "internal")
+                (*md)["__manip"] = S("right");
+            else
+                (*md)["__manip"] = S("no" + n);
+            applyManip(d, md);
+            return QV();
+        }
         if (m == "tellg") return N(nget(d, "pos"));
         if (m == "seekg") { if (!args.empty()) (*d)["pos"] = N(num(args[0])); (*d)["eof"] = B(false); (*d)["fail"] = B(false); return sv; }
         if (m == "rdbuf") { auto r = std::make_shared<Dict>(); (*r)["__rdbuf"] = sv; return QV(r); }
@@ -1652,6 +2595,46 @@ void VM::registerCppNatives()
         out->reserve(std::max(0L, n));
         for (long i = 0; i < n; ++i) out->push_back(plan.isArray() ? copyValue(v, plan) : v);
         return A(out); });
+    // malloc / calloc: (bytes, element size, element value, copy plan, element is a struct)
+    // -> one struct object, or a pointer [block, 0] to `bytes / size` elements
+    reg("__cpp_malloc__", [](std::vector<QV> a) -> QV
+        {
+        long size = std::max(1L, (long)num(arg(a, 1)));
+        long n = std::max(0L, (long)num(arg(a, 0)) / size);
+        QV v = arg(a, 2), plan = arg(a, 3);
+        if (arg(a, 4).isTruthy() && n == 1)
+            return plan.isArray() ? copyValue(v, plan) : v;
+        auto out = newArr();
+        out->reserve(n);
+        for (long i = 0; i < n; ++i) out->push_back(plan.isArray() ? copyValue(v, plan) : v);
+        auto p = newArr();
+        p->push_back(A(out));
+        p->push_back(N(0));
+        return A(p); });
+    // realloc: (block, bytes, element size, element value, plan, struct) -> the block, resized
+    reg("__cpp_realloc__", [](std::vector<QV> a) -> QV
+        {
+        QV old = arg(a, 0);
+        long size = std::max(1L, (long)num(arg(a, 2)));
+        long n = std::max(0L, (long)num(arg(a, 1)) / size);
+        QV v = arg(a, 3), plan = arg(a, 4);
+        auto fresh = [&]() { return plan.isArray() ? copyValue(v, plan) : v; };
+        if (old.isArray() && old.asArray()->size() == 2 && old.asArray()->at(0).isArray() && !old.asArray()->at(0).isDict())
+        {
+            ArrP block = old.asArray()->at(0).asArray();
+            long base = (long)num(old.asArray()->at(1));
+            long want = base + n;
+            if ((long)block->size() > want) block->resize((size_t)want);
+            while ((long)block->size() < want) block->push_back(fresh());
+            return old;
+        }
+        auto out = newArr();
+        if (!old.isNil()) out->push_back(old); // a single struct object grows into a block
+        while ((long)out->size() < n) out->push_back(fresh());
+        auto p = newArr();
+        p->push_back(A(out));
+        p->push_back(N(0));
+        return A(p); });
     reg("__cpp_fill_to__", [](std::vector<QV> a) -> QV
         {
         ArrP arr = arg(a, 0).asArray();
@@ -1910,7 +2893,15 @@ void VM::registerCppNatives()
         QV e = mapGet(arg(a, 0).asDict(), arg(a, 1));
         if (e.isNil()) throwExc("out_of_range", "map::at");
         return e; });
-    reg("__cpp_dict_count__", [mapGet](std::vector<QV> a) -> QV { return N(mapGet(arg(a, 0).asDict(), arg(a, 1)).isNil() ? 0 : 1); });
+    reg("__cpp_dict_count__", [mapGet](std::vector<QV> a) -> QV
+        {
+        DictP d = arg(a, 0).asDict();
+        if (mapGet(d, arg(a, 1)).isNil()) return N(0);
+        if (!arg(a, 2).isTruthy()) return N(1);
+        std::string key = keyOf(arg(a, 1));
+        double n = 0;
+        for (auto &kv : *d) if (isKeyOf(kv.first, key)) ++n;
+        return N(n); });
     auto isMapDict = [](const DictP &d) -> bool
     {
         // map entries are [key, value] arrays; set entries are the keys
@@ -1981,9 +2972,14 @@ void VM::registerCppNatives()
         if (it == d->end()) return N(0);
         invalidate(d);
         Dict fresh;
-        for (auto &kv : *d) if (kv.first != key) fresh[kv.first] = kv.second;
+        double n = 0;
+        for (auto &kv : *d)
+        {
+            if (isKeyOf(kv.first, key)) ++n;
+            else fresh[kv.first] = kv.second;
+        }
         *d = std::move(fresh);
-        return N(1); });
+        return N(n); });
     reg("__cpp_dict_erase_it__", [isMapDict](std::vector<QV> a) -> QV
         {
         DictP d = arg(a, 0).asDict();
@@ -1994,7 +2990,17 @@ void VM::registerCppNatives()
         QV entry = it.cont.asArray()->at(it.pos);
         std::string key = keyOf(entryKey(entry, isMap));
         Dict fresh;
-        for (auto &kv : *d) if (kv.first != key) fresh[kv.first] = kv.second;
+        bool gone = false; // just this entry (a multiset may hold equal ones)
+        for (auto &kv : *d)
+        {
+            if (!gone && isKeyOf(kv.first, key) &&
+                (isMap ? kv.second.isArray() && entry.isArray() && kv.second.asArray() == entry.asArray() : eqValues(kv.second, entry)))
+            {
+                gone = true;
+                continue;
+            }
+            fresh[kv.first] = kv.second;
+        }
         invalidate(d);
         *d = std::move(fresh);
         ArrP snap = snapshot(d, sorted, isMap);
@@ -2008,9 +3014,11 @@ void VM::registerCppNatives()
         std::string key = keyOf(k);
         auto it = d->find(key);
         bool inserted = false;
-        if (it == d->end())
+        if (it == d->end() || (arg(a, 3).isTruthy() && !assignIfExists))
         {
             invalidate(d);
+            if (it != d->end())
+                key = dupKey(key); // multiset / multimap: another equal entry
             (*d)[key] = isMap ? A({k, v}) : k;
             inserted = true;
         }
@@ -2034,6 +3042,7 @@ void VM::registerCppNatives()
             const Array &pr = *p.asArray();
             std::string key = keyOf(pr[0]);
             if (!d->count(key)) (*d)[key] = A({pr[0], pr[1]});
+            else if (arg(a, 1).isTruthy()) (*d)[dupKey(key)] = A({pr[0], pr[1]});
         }
         return QV(d); });
     reg("__cpp_set_from__", [](std::vector<QV> a) -> QV
@@ -2043,6 +3052,7 @@ void VM::registerCppNatives()
         {
             std::string key = keyOf(k);
             if (!d->count(key)) (*d)[key] = k;
+            else if (arg(a, 1).isTruthy()) (*d)[dupKey(key)] = k;
         }
         return QV(d); });
 
@@ -2084,7 +3094,10 @@ void VM::registerCppNatives()
         Array &v = *f.cont.asArray();
         long b = std::clamp<long>(f.pos, 0, (long)v.size()), e = std::clamp<long>(l.pos, b, (long)v.size());
         QV cmp = arg(a, 2);
+        bool rev = arg(a, 3).isTruthy(); // sorted through reverse iterators
+        if (rev) std::reverse(v.begin() + b, v.begin() + e);
         std::stable_sort(v.begin() + b, v.begin() + e, [&](const QV &x, const QV &y) { return less(cmp, x, y); });
+        if (rev) std::reverse(v.begin() + b, v.begin() + e);
         return QV(); });
     reg("__cpp_reverse__", [](std::vector<QV> a) -> QV
         {
@@ -2141,6 +3154,7 @@ void VM::registerCppNatives()
             {
                 if (!y.isNil()) acc = call(y, {acc, at(i)});
                 else if (acc.isString() || at(i).isString()) acc = S(str(acc) + str(at(i)));
+                else if (acc.isLong() || at(i).isLong()) acc = L64((int64_t)((uint64_t)ival(acc) + (uint64_t)ival(at(i))));
                 else acc = N(num(acc) + num(at(i)));
             }
             return acc;

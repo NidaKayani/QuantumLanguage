@@ -1,0 +1,1145 @@
+# Quantum lexer, written in Quantum: a port of src/lexer/*.cpp.
+#
+# A token is the array [type, value, line, col]; the type numbers follow
+# TokenType in include/Token.h, in the same order. lexTokenize(src) returns
+# the token list with the Python-style INDENT / DEDENT tokens already
+# inserted, exactly as Lexer::tokenize does.
+
+let T_NUMBER = 0
+let T_STRING = 1
+let T_TEMPLATE_STRING = 2
+let T_BOOL_TRUE = 3
+let T_BOOL_FALSE = 4
+let T_NIL = 5
+let T_IDENTIFIER = 6
+let T_LET = 7
+let T_CONST = 8
+let T_FN = 9
+let T_DEF = 10
+let T_FUNCTION = 11
+let T_CLASS = 12
+let T_EXTENDS = 13
+let T_NEW = 14
+let T_THIS = 15
+let T_SUPER = 16
+let T_RETURN = 17
+let T_IF = 18
+let T_ELSE = 19
+let T_ELIF = 20
+let T_WHILE = 21
+let T_FOR = 22
+let T_IN = 23
+let T_OF = 24
+let T_BREAK = 25
+let T_CONTINUE = 26
+let T_RAISE = 27
+let T_TRY = 28
+let T_EXCEPT = 29
+let T_FINALLY = 30
+let T_AS = 31
+let T_WITH = 32
+let T_PRINT = 33
+let T_INPUT = 34
+let T_COUT = 35
+let T_CIN = 36
+let T_FROM = 37
+let T_IMPORT = 38
+let T_EXPORT = 39
+let T_TYPE_INT = 40
+let T_TYPE_FLOAT = 41
+let T_TYPE_DOUBLE = 42
+let T_TYPE_CHAR = 43
+let T_TYPE_STRING = 44
+let T_TYPE_BOOL = 45
+let T_TYPE_VOID = 46
+let T_TYPE_LONG = 47
+let T_TYPE_SHORT = 48
+let T_TYPE_UNSIGNED = 49
+let T_PLUS = 50
+let T_MINUS = 51
+let T_STAR = 52
+let T_SLASH = 53
+let T_FLOOR_DIV = 54
+let T_PERCENT = 55
+let T_POWER = 56
+let T_EQ = 57
+let T_NEQ = 58
+let T_STRICT_EQ = 59
+let T_STRICT_NEQ = 60
+let T_NULL_COALESCE = 61
+let T_LT = 62
+let T_GT = 63
+let T_LTE = 64
+let T_GTE = 65
+let T_AND = 66
+let T_OR = 67
+let T_NOT = 68
+let T_IS = 69
+let T_ASSIGN = 70
+let T_PLUS_ASSIGN = 71
+let T_MINUS_ASSIGN = 72
+let T_STAR_ASSIGN = 73
+let T_SLASH_ASSIGN = 74
+let T_AND_ASSIGN = 75
+let T_OR_ASSIGN = 76
+let T_XOR_ASSIGN = 77
+let T_MOD_ASSIGN = 78
+let T_FAT_ARROW = 79
+let T_PLUS_PLUS = 80
+let T_MINUS_MINUS = 81
+let T_BIT_AND = 82
+let T_BIT_OR = 83
+let T_BIT_XOR = 84
+let T_BIT_NOT = 85
+let T_LSHIFT = 86
+let T_RSHIFT = 87
+let T_AND_AND = 88
+let T_OR_OR = 89
+let T_LPAREN = 90
+let T_RPAREN = 91
+let T_LBRACE = 92
+let T_RBRACE = 93
+let T_LBRACKET = 94
+let T_RBRACKET = 95
+let T_COMMA = 96
+let T_SEMICOLON = 97
+let T_COLON = 98
+let T_DOT = 99
+let T_ARROW = 100
+let T_QUESTION = 101
+let T_DECORATOR = 102
+let T_NEWLINE = 103
+let T_EOF = 104
+let T_UNKNOWN = 105
+let T_INDENT = 106
+let T_DEDENT = 107
+
+let LEX_KEYWORDS = {
+    "let": T_LET, "const": T_CONST, "fn": T_FN, "def": T_DEF, "function": T_FUNCTION,
+    "class": T_CLASS, "extends": T_EXTENDS, "new": T_NEW, "this": T_THIS, "self": T_THIS,
+    "super": T_SUPER, "return": T_RETURN, "if": T_IF, "else": T_ELSE, "elif": T_ELIF,
+    "while": T_WHILE, "for": T_FOR, "in": T_IN, "of": T_OF, "break": T_BREAK,
+    "continue": T_CONTINUE, "raise": T_RAISE, "throw": T_RAISE, "try": T_TRY,
+    "except": T_EXCEPT, "catch": T_EXCEPT, "finally": T_FINALLY, "as": T_AS, "with": T_WITH,
+    "print": T_PRINT, "printf": T_PRINT, "input": T_INPUT, "scanf": T_INPUT, "cout": T_COUT,
+    "cin": T_CIN, "import": T_IMPORT, "from": T_FROM, "export": T_EXPORT,
+    "true": T_BOOL_TRUE, "True": T_BOOL_TRUE, "false": T_BOOL_FALSE, "False": T_BOOL_FALSE,
+    "nil": T_NIL, "null": T_NIL, "undefined": T_NIL, "None": T_NIL, "nullptr": T_NIL,
+    "NULL": T_NIL, "and": T_AND, "or": T_OR, "not": T_NOT, "is": T_IS,
+    "int": T_TYPE_INT, "float": T_TYPE_FLOAT, "double": T_TYPE_DOUBLE, "char": T_TYPE_CHAR,
+    "string": T_TYPE_STRING, "bool": T_TYPE_BOOL, "void": T_TYPE_VOID, "long": T_TYPE_LONG,
+    "short": T_TYPE_SHORT, "unsigned": T_TYPE_UNSIGNED
+}
+
+# ── characters (ASCII, as <cctype> classifies them) ──────────────────────────
+
+fn lexIsDigit(c) {
+    return c != "" and c >= "0" and c <= "9"
+}
+
+fn lexIsAlpha(c) {
+    return c != "" and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z"))
+}
+
+fn lexIsAlnum(c) {
+    return lexIsDigit(c) or lexIsAlpha(c)
+}
+
+fn lexIsXDigit(c) {
+    return lexIsDigit(c) or (c >= "a" and c <= "f") or (c >= "A" and c <= "F")
+}
+
+# ── the lexer's state: one per source (template literals lex sub-sources) ───
+
+fn lexNew(src) {
+    let lx = {"src": src, "n": len(src), "pos": 0, "line": 1, "col": 1, "pending": [], "defines": {}}
+    # Skip a UTF-8 byte-order mark (common from Windows editors).
+    if lx["n"] >= 3 and ord(src[0]) == 239 and ord(src[1]) == 187 and ord(src[2]) == 191 {
+        lx["pos"] = 3
+    }
+    return lx
+}
+
+fn lexCur(lx) {
+    let p = lx["pos"]
+    if p < lx["n"] {
+        return lx["src"][p]
+    }
+    return ""
+}
+
+fn lexPeek(lx, off) {
+    let p = lx["pos"] + off
+    if p < lx["n"] {
+        return lx["src"][p]
+    }
+    return ""
+}
+
+fn lexAdvance(lx) {
+    let c = lx["src"][lx["pos"]]
+    lx["pos"] = lx["pos"] + 1
+    if c == "\n" {
+        lx["line"] = lx["line"] + 1
+        lx["col"] = 1
+    } else {
+        lx["col"] = lx["col"] + 1
+    }
+    return c
+}
+
+fn lexMore(lx) {
+    return lx["pos"] < lx["n"]
+}
+
+fn lexTok(type, value, line, col) {
+    return [type, value, line, col]
+}
+
+fn lexError(msg, line) {
+    raise "LexError: " + msg + " (line " + str(line) + ")"
+}
+
+fn lexSkipWhitespace(lx) {
+    while lexMore(lx) {
+        let c = lexCur(lx)
+        if c != " " and c != "\t" and c != "\r" {
+            break
+        }
+        lexAdvance(lx)
+    }
+}
+
+fn lexSkipComment(lx) {
+    while lexMore(lx) and lexCur(lx) != "\n" {
+        lexAdvance(lx)
+    }
+}
+
+fn lexSkipBlockComment(lx) {
+    # '/*' is already consumed: skip until '*/' (unterminated: to the end)
+    while lexMore(lx) {
+        if lexCur(lx) == "*" and lexPeek(lx, 1) == "/" {
+            lexAdvance(lx)
+            lexAdvance(lx)
+            return nil
+        }
+        lexAdvance(lx)
+    }
+}
+
+fn lexReadNumber(lx) {
+    let startLine = lx["line"]
+    let startCol = lx["col"]
+    let num = ""
+    let hasDot = false
+    if lexCur(lx) == "0" and (lexPeek(lx, 1) == "x" or lexPeek(lx, 1) == "X") {
+        num = num + lexAdvance(lx)
+        num = num + lexAdvance(lx)
+        while lexMore(lx) and lexIsXDigit(lexCur(lx)) {
+            num = num + lexAdvance(lx)
+        }
+    } else {
+        while lexMore(lx) and (lexIsDigit(lexCur(lx)) or lexCur(lx) == ".") {
+            if lexCur(lx) == "." {
+                if hasDot {
+                    break
+                }
+                hasDot = true
+            }
+            num = num + lexAdvance(lx)
+        }
+        # Exponent: 1e20, 2.5E-3, 6e+10
+        let e = lexCur(lx)
+        if (e == "e" or e == "E") and (lexIsDigit(lexPeek(lx, 1)) or ((lexPeek(lx, 1) == "+" or lexPeek(lx, 1) == "-") and lexIsDigit(lexPeek(lx, 2)))) {
+            num = num + lexAdvance(lx)
+            if lexCur(lx) == "+" or lexCur(lx) == "-" {
+                num = num + lexAdvance(lx)
+            }
+            while lexMore(lx) and lexIsDigit(lexCur(lx)) {
+                num = num + lexAdvance(lx)
+            }
+        }
+        # C integer / float suffixes: LL, ULL, LU, L, U, F, f
+        while lexMore(lx) {
+            let s = lexCur(lx)
+            if s != "L" and s != "l" and s != "U" and s != "u" and s != "F" and s != "f" {
+                break
+            }
+            lexAdvance(lx)
+        }
+    }
+    return lexTok(T_NUMBER, num, startLine, startCol)
+}
+
+# Template literal: `Hello ${name}!` becomes  "Hello " + (name) + "!"
+fn lexReadTemplateLiteral(lx, out, startLine, startCol) {
+    lexAdvance(lx)
+    let parts = []
+    let seg = ""
+    while lexMore(lx) and lexCur(lx) != "`" {
+        let c = lexCur(lx)
+        if c == "\\" {
+            lexAdvance(lx)
+            let d = lexCur(lx)
+            if d == "n" {
+                seg = seg + "\n"
+            } else if d == "t" {
+                seg = seg + "\t"
+            } else if d == "`" {
+                seg = seg + "`"
+            } else if d == "\\" {
+                seg = seg + "\\"
+            } else if d == "$" {
+                seg = seg + "$"
+            } else {
+                seg = seg + "\\" + d
+            }
+            lexAdvance(lx)
+        } else if c == "$" and lx["pos"] + 1 < lx["n"] and lx["src"][lx["pos"] + 1] == "{" {
+            parts.push([false, seg])
+            seg = ""
+            lexAdvance(lx)
+            lexAdvance(lx)
+            let expr = ""
+            let depth = 1
+            while lexMore(lx) and depth > 0 {
+                let ch = lexCur(lx)
+                if ch == "{" {
+                    depth = depth + 1
+                } else if ch == "}" {
+                    depth = depth - 1
+                    if depth == 0 {
+                        lexAdvance(lx)
+                        break
+                    }
+                }
+                expr = expr + ch
+                lexAdvance(lx)
+            }
+            parts.push([true, expr])
+        } else {
+            seg = seg + c
+            lexAdvance(lx)
+        }
+    }
+    if lexMore(lx) {
+        lexAdvance(lx)
+    }
+    parts.push([false, seg])
+
+    let first = true
+    let i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if !p[0] {
+            if p[1] != "" or len(parts) == 1 {
+                if !first {
+                    out.push(lexTok(T_PLUS, "+", startLine, startCol))
+                }
+                first = false
+                out.push(lexTok(T_STRING, p[1], startLine, startCol))
+            }
+        } else {
+            if !first {
+                out.push(lexTok(T_PLUS, "+", startLine, startCol))
+            }
+            first = false
+            out.push(lexTok(T_LPAREN, "(", startLine, startCol))
+            let sub = lexTokenize(p[1])
+            let j = 0
+            while j < len(sub) {
+                let t = sub[j]
+                if t[0] != T_EOF and t[0] != T_NEWLINE {
+                    out.push(t)
+                }
+                j = j + 1
+            }
+            out.push(lexTok(T_RPAREN, ")", startLine, startCol))
+        }
+        i = i + 1
+    }
+    if first {
+        out.push(lexTok(T_STRING, "", startLine, startCol))
+    }
+}
+
+fn lexReadString(lx, quote) {
+    let startLine = lx["line"]
+    let startCol = lx["col"]
+    lexAdvance(lx)
+    let s = ""
+    while lexMore(lx) and lexCur(lx) != quote {
+        if lexCur(lx) == "\\" {
+            lexAdvance(lx)
+            let d = lexCur(lx)
+            if d == "n" {
+                s = s + "\n"
+            } else if d == "t" {
+                s = s + "\t"
+            } else if d == "r" {
+                s = s + "\r"
+            } else if d == "\\" {
+                s = s + "\\"
+            } else if d == "'" {
+                s = s + "'"
+            } else if d == "\"" {
+                s = s + "\""
+            } else if d == "0" {
+                s = s + chr(0)
+            } else {
+                s = s + d
+            }
+            lexAdvance(lx)
+        } else {
+            s = s + lexAdvance(lx)
+        }
+    }
+    if !lexMore(lx) {
+        lexError("Unterminated string literal", startLine)
+    }
+    lexAdvance(lx)
+    return lexTok(T_STRING, s, startLine, startCol)
+}
+
+fn lexAtTripleQuote(lx, quote) {
+    return lexCur(lx) == quote and lexPeek(lx, 1) == quote and lexPeek(lx, 2) == quote
+}
+
+# Python """...""" / '''...''' (escapes processed unless raw)
+fn lexReadTripleString(lx, quote, raw) {
+    let startLine = lx["line"]
+    let startCol = lx["col"]
+    lexAdvance(lx)
+    lexAdvance(lx)
+    lexAdvance(lx)
+    let s = ""
+    while lexMore(lx) and !lexAtTripleQuote(lx, quote) {
+        if lexCur(lx) == "\\" and !raw and lx["pos"] + 1 < lx["n"] {
+            lexAdvance(lx)
+            let d = lexCur(lx)
+            if d == "n" {
+                s = s + "\n"
+            } else if d == "t" {
+                s = s + "\t"
+            } else if d == "r" {
+                s = s + "\r"
+            } else if d == "0" {
+                s = s + chr(0)
+            } else if d == "\n" {
+                s = s
+            } else {
+                s = s + d
+            }
+            lexAdvance(lx)
+        } else {
+            s = s + lexAdvance(lx)
+        }
+    }
+    if !lexMore(lx) {
+        lexError("Unterminated triple-quoted string literal", startLine)
+    }
+    lexAdvance(lx)
+    lexAdvance(lx)
+    lexAdvance(lx)
+    return lexTok(T_STRING, s, startLine, startCol)
+}
+
+fn lexIsOperatorWord(w) {
+    return w == "and" or w == "or" or w == "not" or w == "if" or w == "else" or w == "in" or w == "is" or w == "for" or w == "lambda"
+}
+
+# After a value token, whether the '//' at pos is a C/JS line comment rather
+# than Python floor division: nothing operand-like follows, or two bare
+# words sit side by side ("// Remove HTML tags"), which no expression has.
+fn lexSlashSlashIsComment(lx) {
+    let src = lx["src"]
+    let n = lx["n"]
+    let p = lx["pos"] + 1
+    while p < n and (src[p] == " " or src[p] == "\t") {
+        p = p + 1
+    }
+    if p >= n or src[p] == "\n" or src[p] == "\r" {
+        return true
+    }
+    let c = src[p]
+    if !(lexIsAlnum(c) or c == "_" or c == "(" or c == "[" or c == "-" or c == "+" or c == "\"" or c == "'" or c == ".") {
+        return true
+    }
+    let prevWasWord = false
+    let prevWord = ""
+    while p < n and src[p] != "\n" {
+        let ch = src[p]
+        if ch == "#" or ch == ";" {
+            break
+        }
+        if ch == "\"" or ch == "'" {
+            p = p + 1
+            while p < n and src[p] != ch and src[p] != "\n" {
+                if src[p] == "\\" {
+                    p = p + 2
+                } else {
+                    p = p + 1
+                }
+            }
+            p = p + 1
+            prevWasWord = false
+            continue
+        }
+        if lexIsAlnum(ch) or ch == "_" {
+            let w = ""
+            while p < n and (lexIsAlnum(src[p]) or src[p] == "_" or src[p] == ".") {
+                w = w + src[p]
+                p = p + 1
+            }
+            if prevWasWord and !lexIsOperatorWord(prevWord) and !lexIsOperatorWord(w) {
+                return true
+            }
+            prevWord = w
+            prevWasWord = true
+            continue
+        }
+        if ch != " " and ch != "\t" and ch != "\r" {
+            prevWasWord = false
+        }
+        p = p + 1
+    }
+    return false
+}
+
+# f"..." → a template literal, lexed in place (tokens go to lx["pending"])
+fn lexReadFString(lx, startLine, startCol) {
+    let quote = lexCur(lx)
+    let triple = lexAtTripleQuote(lx, quote)
+    lexAdvance(lx)
+    if triple {
+        lexAdvance(lx)
+        lexAdvance(lx)
+    }
+    let raw = ""
+    while lexMore(lx) {
+        if triple {
+            if lexAtTripleQuote(lx, quote) {
+                break
+            }
+        } else if lexCur(lx) == quote {
+            break
+        }
+        if lexCur(lx) == "{" {
+            lexAdvance(lx)
+            let exprPart = ""
+            let fmtPart = ""
+            let depth = 1
+            let inFormat = false
+            let parenDepth = 0
+            let inSingleQ = false
+            let inDoubleQ = false
+            while lexMore(lx) and depth > 0 {
+                let ch = lexCur(lx)
+                # string literals inside the expression: no false colon matches
+                if !inDoubleQ and ch == "'" and !inFormat {
+                    inSingleQ = !inSingleQ
+                } else if !inSingleQ and ch == "\"" and !inFormat {
+                    inDoubleQ = !inDoubleQ
+                }
+                let insideStr = inSingleQ or inDoubleQ
+                if !insideStr {
+                    if ch == "(" {
+                        parenDepth = parenDepth + 1
+                    } else if ch == ")" {
+                        if parenDepth > 0 {
+                            parenDepth = parenDepth - 1
+                        }
+                    } else if ch == "{" {
+                        depth = depth + 1
+                    } else if ch == "}" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            lexAdvance(lx)
+                            break
+                        }
+                    }
+                    if depth == 1 and parenDepth == 0 and ch == ":" and !inFormat {
+                        inFormat = true
+                        lexAdvance(lx)
+                        continue
+                    }
+                }
+                if inFormat {
+                    fmtPart = fmtPart + ch
+                } else {
+                    exprPart = exprPart + ch
+                }
+                lexAdvance(lx)
+            }
+            if inFormat {
+                raw = raw + "${__format__(" + exprPart + ", \"" + fmtPart + "\")}"
+            } else {
+                raw = raw + "${" + exprPart + "}"
+            }
+        } else if lexCur(lx) == "\\" {
+            raw = raw + lexCur(lx)
+            lexAdvance(lx)
+            if lexMore(lx) {
+                raw = raw + lexCur(lx)
+                lexAdvance(lx)
+            }
+        } else {
+            raw = raw + lexCur(lx)
+            lexAdvance(lx)
+        }
+    }
+    let q = 1
+    if triple {
+        q = 3
+    }
+    while q > 0 and lexMore(lx) {
+        lexAdvance(lx)
+        q = q - 1
+    }
+    let sub = lexTokenize("`" + raw + "`")
+    if len(sub) > 0 and sub[len(sub) - 1][0] == T_EOF {
+        sub.pop()
+    }
+    lx["pending"] = sub
+    return lexTok(T_UNKNOWN, "__fstring__", startLine, startCol)
+}
+
+fn lexReadIdentifierOrKeyword(lx) {
+    let startLine = lx["line"]
+    let startCol = lx["col"]
+    let id = ""
+    while lexMore(lx) and (lexIsAlnum(lexCur(lx)) or lexCur(lx) == "_") {
+        id = id + lexAdvance(lx)
+    }
+    # Raw string: r"..." / r'...'
+    if (id == "r" or id == "R") and lexMore(lx) and (lexCur(lx) == "\"" or lexCur(lx) == "'") {
+        let quote = lexCur(lx)
+        if lexAtTripleQuote(lx, quote) {
+            return lexReadTripleString(lx, quote, true)
+        }
+        let strLine = lx["line"]
+        let strCol = lx["col"]
+        lexAdvance(lx)
+        let raw = ""
+        while lexMore(lx) and lexCur(lx) != quote {
+            raw = raw + lexAdvance(lx)
+        }
+        if lexMore(lx) {
+            lexAdvance(lx)
+        }
+        return lexTok(T_STRING, raw, strLine, strCol)
+    }
+    # f-string: f"..." / f'...'
+    if (id == "f" or id == "F") and lexMore(lx) and (lexCur(lx) == "\"" or lexCur(lx) == "'") {
+        return lexReadFString(lx, startLine, startCol)
+    }
+    let type = T_IDENTIFIER
+    if LEX_KEYWORDS.has(id) {
+        type = LEX_KEYWORDS[id]
+    }
+    # #define macros: substitute the replacement tokens
+    let defs = lx["defines"]
+    if defs.has(id) {
+        let rep = defs[id]
+        if len(rep) > 0 {
+            if len(rep) == 1 {
+                return rep[0]
+            }
+            let rest = []
+            let k = 1
+            while k < len(rep) {
+                rest.push(rep[k])
+                k = k + 1
+            }
+            let old = lx["pending"]
+            k = 0
+            while k < len(old) {
+                rest.push(old[k])
+                k = k + 1
+            }
+            lx["pending"] = rest
+            return rep[0]
+        }
+    }
+    return lexTok(type, id, startLine, startCol)
+}
+
+# `#define NAME tokens...` (other directives are skipped with the line)
+fn lexReadDirective(lx) {
+    lexAdvance(lx)
+    while lexMore(lx) and (lexCur(lx) == " " or lexCur(lx) == "\t") {
+        lexAdvance(lx)
+    }
+    let directive = ""
+    while lexMore(lx) and lexIsAlpha(lexCur(lx)) {
+        directive = directive + lexAdvance(lx)
+    }
+    if directive == "define" {
+        while lexMore(lx) and (lexCur(lx) == " " or lexCur(lx) == "\t") {
+            lexAdvance(lx)
+        }
+        let macroName = ""
+        while lexMore(lx) and (lexIsAlnum(lexCur(lx)) or lexCur(lx) == "_") {
+            macroName = macroName + lexAdvance(lx)
+        }
+        while lexMore(lx) and (lexCur(lx) == " " or lexCur(lx) == "\t") {
+            lexAdvance(lx)
+        }
+        let replacement = []
+        while lexMore(lx) and lexCur(lx) != "\n" and lexCur(lx) != "\r" {
+            while lexMore(lx) and (lexCur(lx) == " " or lexCur(lx) == "\t") {
+                lexAdvance(lx)
+            }
+            if !lexMore(lx) or lexCur(lx) == "\n" or lexCur(lx) == "\r" {
+                break
+            }
+            let tl = lx["line"]
+            let tc = lx["col"]
+            let rc = lexCur(lx)
+            if lexIsDigit(rc) or (rc == "-" and lx["pos"] + 1 < lx["n"] and lexIsDigit(lx["src"][lx["pos"] + 1])) {
+                replacement.push(lexReadNumber(lx))
+            } else if rc == "'" or rc == "\"" {
+                replacement.push(lexReadString(lx, rc))
+            } else if lexIsAlpha(rc) or rc == "_" {
+                let id = ""
+                while lexMore(lx) and (lexIsAlnum(lexCur(lx)) or lexCur(lx) == "_") {
+                    id = id + lexAdvance(lx)
+                }
+                let defs = lx["defines"]
+                if defs.has(id) {
+                    let rep = defs[id]
+                    let k = 0
+                    while k < len(rep) {
+                        replacement.push(rep[k])
+                        k = k + 1
+                    }
+                } else {
+                    replacement.push(lexTok(T_IDENTIFIER, id, tl, tc))
+                }
+            } else {
+                # operator / punctuation: the rest of the line is skipped
+                while lexMore(lx) and lexCur(lx) != "\n" and lexCur(lx) != "\r" {
+                    lexAdvance(lx)
+                }
+                break
+            }
+        }
+        if macroName != "" {
+            lx["defines"][macroName] = replacement
+        }
+    }
+    while lexMore(lx) and lexCur(lx) != "\n" and lexCur(lx) != "\r" {
+        lexAdvance(lx)
+    }
+}
+
+fn lexPrevIsValue(raw, withNil) {
+    if len(raw) == 0 {
+        return false
+    }
+    let t = raw[len(raw) - 1][0]
+    if t == T_NIL {
+        return withNil
+    }
+    return t == T_NUMBER or t == T_STRING or t == T_IDENTIFIER or t == T_RPAREN or t == T_RBRACKET or t == T_BOOL_TRUE or t == T_BOOL_FALSE
+}
+
+fn lexOperator(lx, raw, c, startLine, startCol, afterStd) {
+    if c == "+" {
+        if lexCur(lx) == "+" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_PLUS_PLUS, "++", startLine, startCol))
+        } else if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_PLUS_ASSIGN, "+=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_PLUS, "+", startLine, startCol))
+        }
+    } else if c == "-" {
+        if lexCur(lx) == "-" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_MINUS_MINUS, "--", startLine, startCol))
+        } else if lexCur(lx) == ">" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_ARROW, "->", startLine, startCol))
+        } else if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_MINUS_ASSIGN, "-=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_MINUS, "-", startLine, startCol))
+        }
+    } else if c == "*" {
+        if lexCur(lx) == "*" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_POWER, "**", startLine, startCol))
+        } else if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_STAR_ASSIGN, "*=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_STAR, "*", startLine, startCol))
+        }
+    } else if c == "/" {
+        let d = lexCur(lx)
+        if d != "/" and d != "*" and d != "=" and !lexPrevIsValue(raw, false) {
+            # a regex literal: /pattern/flags, kept as a string token
+            let regStr = "/"
+            let inCls = false
+            while lexMore(lx) and lexCur(lx) != "\n" {
+                let rc = lx["src"][lx["pos"]]
+                if rc == "\\" and lx["pos"] + 1 < lx["n"] {
+                    regStr = regStr + rc + lx["src"][lx["pos"] + 1]
+                    lx["pos"] = lx["pos"] + 2
+                    lx["col"] = lx["col"] + 2
+                    continue
+                }
+                if rc == "[" {
+                    inCls = true
+                }
+                if rc == "]" {
+                    inCls = false
+                }
+                if rc == "/" and !inCls {
+                    lexAdvance(lx)
+                    regStr = regStr + "/"
+                    break
+                }
+                regStr = regStr + rc
+                lexAdvance(lx)
+            }
+            while lexMore(lx) and lexIsAlpha(lexCur(lx)) {
+                regStr = regStr + lexAdvance(lx)
+            }
+            raw.push(lexTok(T_STRING, regStr, startLine, startCol))
+            return nil
+        }
+        if d == "/" {
+            # Python floor division only right after a value; otherwise a comment
+            if lexPrevIsValue(raw, true) and !lexSlashSlashIsComment(lx) {
+                lexAdvance(lx)
+                raw.push(lexTok(T_FLOOR_DIV, "//", startLine, startCol))
+            } else {
+                lexSkipComment(lx)
+            }
+        } else if d == "*" {
+            lexAdvance(lx)
+            lexSkipBlockComment(lx)
+        } else if d == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_SLASH_ASSIGN, "/=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_SLASH, "/", startLine, startCol))
+        }
+    } else if c == "=" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            if lexCur(lx) == "=" {
+                lexAdvance(lx)
+                raw.push(lexTok(T_STRICT_EQ, "===", startLine, startCol))
+            } else {
+                raw.push(lexTok(T_EQ, "==", startLine, startCol))
+            }
+        } else if lexCur(lx) == ">" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_FAT_ARROW, "=>", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_ASSIGN, "=", startLine, startCol))
+        }
+    } else if c == "!" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            if lexCur(lx) == "=" {
+                lexAdvance(lx)
+                raw.push(lexTok(T_STRICT_NEQ, "!==", startLine, startCol))
+            } else {
+                raw.push(lexTok(T_NEQ, "!=", startLine, startCol))
+            }
+        } else {
+            raw.push(lexTok(T_NOT, "!", startLine, startCol))
+        }
+    } else if c == "<" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_LTE, "<=", startLine, startCol))
+        } else if lexCur(lx) == "<" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_LSHIFT, "<<", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_LT, "<", startLine, startCol))
+        }
+    } else if c == ">" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_GTE, ">=", startLine, startCol))
+        } else if lexCur(lx) == ">" {
+            lexAdvance(lx)
+            if lexCur(lx) == "=" {
+                # >>= : a shift, then an assignment
+                lexAdvance(lx)
+                raw.push(lexTok(T_RSHIFT, ">>", startLine, startCol))
+                raw.push(lexTok(T_ASSIGN, "=", startLine, startCol))
+            } else {
+                raw.push(lexTok(T_RSHIFT, ">>", startLine, startCol))
+            }
+        } else {
+            raw.push(lexTok(T_GT, ">", startLine, startCol))
+        }
+    } else if c == "&" {
+        if lexCur(lx) == "&" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_AND_AND, "&&", startLine, startCol))
+        } else if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_AND_ASSIGN, "&=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_BIT_AND, "&", startLine, startCol))
+        }
+    } else if c == "|" {
+        if lexCur(lx) == "|" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_OR_OR, "||", startLine, startCol))
+        } else if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_OR_ASSIGN, "|=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_BIT_OR, "|", startLine, startCol))
+        }
+    } else if c == "^" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_XOR_ASSIGN, "^=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_BIT_XOR, "^", startLine, startCol))
+        }
+    } else if c == "~" {
+        raw.push(lexTok(T_BIT_NOT, "~", startLine, startCol))
+    } else if c == "%" {
+        if lexCur(lx) == "=" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_MOD_ASSIGN, "%=", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_PERCENT, "%", startLine, startCol))
+        }
+    } else if c == "(" {
+        raw.push(lexTok(T_LPAREN, "(", startLine, startCol))
+    } else if c == ")" {
+        raw.push(lexTok(T_RPAREN, ")", startLine, startCol))
+    } else if c == "{" {
+        raw.push(lexTok(T_LBRACE, "{", startLine, startCol))
+    } else if c == "}" {
+        raw.push(lexTok(T_RBRACE, "}", startLine, startCol))
+    } else if c == "[" {
+        raw.push(lexTok(T_LBRACKET, "[", startLine, startCol))
+    } else if c == "]" {
+        raw.push(lexTok(T_RBRACKET, "]", startLine, startCol))
+    } else if c == "," {
+        raw.push(lexTok(T_COMMA, ",", startLine, startCol))
+    } else if c == ";" {
+        raw.push(lexTok(T_SEMICOLON, ";", startLine, startCol))
+    } else if c == ":" {
+        let n = len(raw)
+        if lexCur(lx) == ":" and n > 0 and raw[n - 1][0] == T_IDENTIFIER and (raw[n - 1][1] == "std" or n - 1 == afterStd[0]) {
+            # C++ "std::" — the qualifier is dropped (std::cout lexes as cout)
+            lexAdvance(lx)
+            raw.pop()
+            afterStd[0] = len(raw)
+        } else {
+            raw.push(lexTok(T_COLON, ":", startLine, startCol))
+        }
+    } else if c == "." {
+        if lexCur(lx) == "." and lx["pos"] + 1 < lx["n"] and lx["src"][lx["pos"] + 1] == "." {
+            lexAdvance(lx)
+            lexAdvance(lx)
+            raw.push(lexTok(T_IDENTIFIER, "...", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_DOT, ".", startLine, startCol))
+        }
+    } else if c == "?" {
+        # ?. (optional chaining) reads as '.', ?? as null-coalescing
+        if lexCur(lx) == "." {
+            lexAdvance(lx)
+            raw.push(lexTok(T_DOT, ".", startLine, startCol))
+        } else if lexCur(lx) == "?" {
+            lexAdvance(lx)
+            raw.push(lexTok(T_NULL_COALESCE, "??", startLine, startCol))
+        } else {
+            raw.push(lexTok(T_QUESTION, "?", startLine, startCol))
+        }
+    } else if c == "@" {
+        raw.push(lexTok(T_DECORATOR, "@", startLine, startCol))
+    } else {
+        lexError("Unexpected character: " + c, startLine)
+    }
+}
+
+fn lexTokenize(src) {
+    let lx = lexNew(src)
+    let raw = []
+    # index of the token right after a dropped "std::" qualifier
+    let afterStd = [-1]
+    while lexMore(lx) {
+        lexSkipWhitespace(lx)
+        if !lexMore(lx) {
+            break
+        }
+        let c = lexCur(lx)
+        let startLine = lx["line"]
+        let startCol = lx["col"]
+        if c == "\n" {
+            raw.push(lexTok(T_NEWLINE, "\\n", startLine, startCol))
+            lexAdvance(lx)
+        } else if c == "#" {
+            lexReadDirective(lx)
+        } else if lexIsDigit(c) {
+            raw.push(lexReadNumber(lx))
+        } else if c == "\"" or c == "'" {
+            if lexAtTripleQuote(lx, c) {
+                raw.push(lexReadTripleString(lx, c, false))
+            } else {
+                raw.push(lexReadString(lx, c))
+            }
+        } else if c == "`" {
+            lexReadTemplateLiteral(lx, raw, startLine, startCol)
+        } else if lexIsAlpha(c) or c == "_" {
+            let tok = lexReadIdentifierOrKeyword(lx)
+            if tok[0] == T_UNKNOWN and tok[1] == "__fstring__" {
+                let pend = lx["pending"]
+                let k = 0
+                while k < len(pend) {
+                    raw.push(pend[k])
+                    k = k + 1
+                }
+                lx["pending"] = []
+            } else {
+                raw.push(tok)
+                let pend = lx["pending"]
+                if len(pend) > 0 {
+                    let k = 0
+                    while k < len(pend) {
+                        raw.push(pend[k])
+                        k = k + 1
+                    }
+                    lx["pending"] = []
+                }
+            }
+        } else {
+            lexAdvance(lx)
+            lexOperator(lx, raw, c, startLine, startCol, afterStd)
+        }
+    }
+    raw.push(lexTok(T_EOF, "", lx["line"], lx["col"]))
+    return lexIndentPass(src, raw, lx["line"])
+}
+
+# ── Python-style INDENT / DEDENT ─────────────────────────────────────────────
+# A COLON followed by a NEWLINE and a more-indented line opens a block; a
+# less-indented line closes blocks. Never inside ( [ {; NEWLINEs inside ( [
+# are dropped entirely.
+fn lexIndentPass(src, raw, lastLine) {
+    let indentOf = []
+    let k = 0
+    while k <= lastLine + 1 {
+        indentOf.push(0)
+        k = k + 1
+    }
+    let curLine = 1
+    let curIndent = 0
+    let lineStart = true
+    let i = 0
+    let n = len(src)
+    while i < n {
+        let ch = src[i]
+        if ch == "\n" {
+            indentOf[curLine] = curIndent
+            curLine = curLine + 1
+            curIndent = 0
+            lineStart = true
+        } else if lineStart {
+            if ch == " " {
+                curIndent = curIndent + 1
+            } else if ch == "\t" {
+                curIndent = curIndent + 4
+            } else {
+                lineStart = false
+            }
+        }
+        i = i + 1
+    }
+    indentOf[curLine] = curIndent
+
+    let tokens = []
+    let stack = [0]
+    let bracketDepth = 0
+    let parenBracketDepth = 0
+    let count = len(raw)
+    i = 0
+    while i < count {
+        let tok = raw[i]
+        let t = tok[0]
+        if t == T_LBRACE or t == T_LBRACKET or t == T_LPAREN {
+            bracketDepth = bracketDepth + 1
+            if t != T_LBRACE {
+                parenBracketDepth = parenBracketDepth + 1
+            }
+        } else if t == T_RBRACE or t == T_RBRACKET or t == T_RPAREN {
+            if bracketDepth > 0 {
+                bracketDepth = bracketDepth - 1
+            }
+            if t != T_RBRACE and parenBracketDepth > 0 {
+                parenBracketDepth = parenBracketDepth - 1
+            }
+        }
+        if t == T_NEWLINE and parenBracketDepth > 0 {
+            i = i + 1
+            continue
+        }
+        if t == T_COLON and bracketDepth == 0 {
+            let j = i + 1
+            while j < count and raw[j][0] == T_NEWLINE {
+                j = j + 1
+            }
+            if j < count and raw[j][0] != T_EOF {
+                let nextIndent = indentOf[raw[j][2]]
+                if nextIndent > stack[len(stack) - 1] {
+                    tokens.push(tok)
+                    let m = i + 1
+                    while m < j {
+                        tokens.push(raw[m])
+                        m = m + 1
+                    }
+                    i = j
+                    stack.push(nextIndent)
+                    tokens.push(lexTok(T_INDENT, "INDENT", tok[2], tok[3]))
+                    continue
+                }
+            }
+            tokens.push(tok)
+            i = i + 1
+            continue
+        }
+        if t == T_NEWLINE and bracketDepth == 0 {
+            tokens.push(tok)
+            let j = i + 1
+            while j < count and raw[j][0] == T_NEWLINE {
+                j = j + 1
+            }
+            if j < count and raw[j][0] != T_EOF {
+                let nextIndent = indentOf[raw[j][2]]
+                while len(stack) > 1 and nextIndent < stack[len(stack) - 1] {
+                    stack.pop()
+                    tokens.push(lexTok(T_DEDENT, "DEDENT", tok[2], tok[3]))
+                }
+            } else {
+                while len(stack) > 1 {
+                    stack.pop()
+                    tokens.push(lexTok(T_DEDENT, "DEDENT", tok[2], tok[3]))
+                }
+            }
+            i = i + 1
+            continue
+        }
+        tokens.push(tok)
+        i = i + 1
+    }
+    return tokens
+}

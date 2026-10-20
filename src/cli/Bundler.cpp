@@ -208,6 +208,12 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
         std::cout.flush();
         return 1;
     }
+    catch (const CompileError &e)
+    {
+        std::cerr << e.what();
+        std::cerr.flush();
+        return 1;
+    }
     catch (const std::exception &e)
     {
         std::cout << Colors::RED << "[Compile Error] " << Colors::RESET << e.what() << "\n";

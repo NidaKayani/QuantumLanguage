@@ -41,6 +41,7 @@ bool QuantumValue::isTruthy() const
         if constexpr (std::is_same_v<T, QuantumNil>)    return false;
         if constexpr (std::is_same_v<T, bool>)          return v;
         if constexpr (std::is_same_v<T, double>)        return v != 0.0;
+        if constexpr (std::is_same_v<T, int64_t>)       return v != 0;
         if constexpr (std::is_same_v<T, std::string>)   return !v.empty() && !(v.size() == 1 && v[0] == '\0');
         if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) return !v->empty();
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>) return v && !v->isNull();
@@ -103,6 +104,7 @@ std::string QuantumValue::toString() const
         }
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumClass>>)    return "<class:" + v->name + ">";
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumBoundMethod>>) return "<bound method>";
+        if constexpr (std::is_same_v<T, int64_t>) return std::to_string(v);
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>) {
             if (!v || v->isNull()) return "0x0";
             // Show a deterministic fake address based on cell pointer value
@@ -132,6 +134,7 @@ std::string QuantumValue::typeName() const
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumClass>>)    return "class";
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumBoundMethod>>) return "method";
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>)  return "pointer";
+        if constexpr (std::is_same_v<T, int64_t>)      return "long";
         return "unknown"; }, data);
 }
 

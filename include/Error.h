@@ -40,6 +40,17 @@ public:
         : QuantumError("IndexError", msg, line) {}
 };
 
+// A program rejected at compile time by a strict front-end (Java, or C/C++
+// under --strict). `what()` is the complete diagnostic, already in the real
+// compiler's format (gcc's `file:line:col: error: ...`, javac's
+// `File.java:line: error: ...`), so the CLI prints it verbatim.
+class CompileError : public QuantumError
+{
+public:
+    explicit CompileError(const std::string &report)
+        : QuantumError("CompileError", report) {}
+};
+
 namespace Colors
 {
     inline const char *RED = "\033[31m";

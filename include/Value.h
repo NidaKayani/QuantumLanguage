@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <deque>
@@ -69,7 +70,10 @@ struct QuantumValue
         std::shared_ptr<QuantumInstance>,
         std::shared_ptr<QuantumClass>,
         std::shared_ptr<QuantumBoundMethod>,
-        std::shared_ptr<QuantumPointer>>;
+        std::shared_ptr<QuantumPointer>,
+        // An exact 64-bit integer: a Java `long` (src/java/). Ordinary numbers
+        // are doubles, exact only up to 2^53, which `long` math goes past.
+        int64_t>;
 
     Data data;
 
@@ -87,6 +91,14 @@ struct QuantumValue
     explicit QuantumValue(std::shared_ptr<QuantumClass> c) : data(std::move(c)) {}
     explicit QuantumValue(std::shared_ptr<QuantumBoundMethod> bm) : data(std::move(bm)) {}
     explicit QuantumValue(std::shared_ptr<QuantumPointer> p) : data(std::move(p)) {}
+    // No constructor from integers (an int would be ambiguous with bool and
+    // double): 64-bit integers are made explicitly.
+    static QuantumValue ofLong(int64_t v)
+    {
+        QuantumValue q;
+        q.data = v;
+        return q;
+    }
 
     // Type checks
     bool isNil() const { return std::holds_alternative<QuantumNil>(data); }
@@ -101,6 +113,7 @@ struct QuantumValue
     bool isClass() const { return std::holds_alternative<std::shared_ptr<QuantumClass>>(data); }
     bool isBoundMethod() const { return std::holds_alternative<std::shared_ptr<QuantumBoundMethod>>(data); }
     bool isPointer() const { return std::holds_alternative<std::shared_ptr<QuantumPointer>>(data); }
+    bool isLong() const { return std::holds_alternative<int64_t>(data); }
 
     // Accessors
     bool asBool() const { return std::get<bool>(data); }
@@ -113,6 +126,7 @@ struct QuantumValue
     std::shared_ptr<QuantumClass> asClass() const { return std::get<std::shared_ptr<QuantumClass>>(data); }
     std::shared_ptr<QuantumBoundMethod> asBoundMethod() const { return std::get<std::shared_ptr<QuantumBoundMethod>>(data); }
     std::shared_ptr<QuantumPointer> asPointer() const { return std::get<std::shared_ptr<QuantumPointer>>(data); }
+    int64_t asLong() const { return std::get<int64_t>(data); }
 
     bool isNative() const;
     std::shared_ptr<QuantumNative> asNative() const;
@@ -256,6 +270,17 @@ public:
 
     // Pointer support: get a shared cell for a variable so &var returns a live reference
     std::shared_ptr<QuantumValue> getCell(const std::string &name);
+
+    // The storage of `name` in this environment (not its parents), or null.
+    // Bindings are never removed, so the pointer stays valid; null too when a
+    // pointer cell (getCell / defineRef) holds the live value instead.
+    QuantumValue *slot(const std::string &name)
+    {
+        if (!cells.empty() && cells.count(name))
+            return nullptr;
+        auto it = vars.find(name);
+        return it == vars.end() ? nullptr : &it->second;
+    }
 
     std::shared_ptr<Environment> parent;
 

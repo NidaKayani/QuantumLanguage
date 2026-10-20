@@ -1,0 +1,169 @@
+# AST nodes for the self-hosted compiler: dicts mirroring the structs in
+# include/AST.h. Every node has "k" (its kind) and "line"; the other fields
+# carry the struct's member names and defaults.
+
+fn nNumber(v, ln) {
+    return {"k": "Number", "value": v, "line": ln}
+}
+
+fn nString(s, ln) {
+    return {"k": "String", "value": s, "line": ln}
+}
+
+fn nBool(b, ln) {
+    return {"k": "Bool", "value": b, "line": ln}
+}
+
+fn nNil(ln) {
+    return {"k": "Nil", "line": ln}
+}
+
+fn nIdent(name, ln) {
+    return {"k": "Ident", "name": name, "line": ln}
+}
+
+fn nBinary(op, l, r, ln) {
+    return {"k": "Binary", "op": op, "left": l, "right": r, "line": ln}
+}
+
+fn nUnary(op, x, ln) {
+    return {"k": "Unary", "op": op, "operand": x, "line": ln}
+}
+
+fn nAssign(op, target, value, ln) {
+    return {"k": "Assign", "op": op, "target": target, "value": value, "line": ln}
+}
+
+fn nCall(callee, args, ln) {
+    return {"k": "Call", "callee": callee, "args": args, "line": ln}
+}
+
+fn nIndex(obj, idx, ln) {
+    return {"k": "Index", "object": obj, "index": idx, "line": ln}
+}
+
+fn nSlice(obj, start, stop, step, ln) {
+    return {"k": "Slice", "object": obj, "start": start, "stop": stop, "step": step, "line": ln}
+}
+
+fn nMember(obj, member, ln) {
+    return {"k": "Member", "object": obj, "member": member, "line": ln}
+}
+
+fn nArray(elements, ln) {
+    return {"k": "Array", "elements": elements, "line": ln}
+}
+
+# pairs: [[key, value], ...]; a nil key is a spread (...obj)
+fn nDict(pairs, ln) {
+    return {"k": "Dict", "pairs": pairs, "line": ln}
+}
+
+fn nLambda(params, body, ln) {
+    return {"k": "Lambda", "params": params, "paramTypes": [], "defaultArgs": [], "returnType": "", "body": body, "line": ln}
+}
+
+fn nTernary(c, a, b, ln) {
+    return {"k": "Ternary", "condition": c, "thenExpr": a, "elseExpr": b, "line": ln}
+}
+
+fn nSuper(method, ln) {
+    return {"k": "Super", "method": method, "line": ln}
+}
+
+fn nAddressOf(x, ln) {
+    return {"k": "AddressOf", "operand": x, "line": ln}
+}
+
+fn nDeref(x, ln) {
+    return {"k": "Deref", "operand": x, "line": ln}
+}
+
+fn nArrow(obj, member, ln) {
+    return {"k": "Arrow", "object": obj, "member": member, "line": ln}
+}
+
+fn nListComp(expr, vars, iterable, cond, ln) {
+    return {"k": "ListComp", "expr": expr, "vars": vars, "iterable": iterable, "condition": cond, "line": ln}
+}
+
+fn nTuple(elements, ln) {
+    return {"k": "Tuple", "elements": elements, "line": ln}
+}
+
+fn nNew(typeName, args, ln) {
+    return {"k": "New", "typeName": typeName, "args": args, "isArray": false, "sizeExpr": nil, "line": ln}
+}
+
+fn nVarDecl(isConst, name, init, typeHint, ln) {
+    return {"k": "VarDecl", "isConst": isConst, "name": name, "initializer": init, "typeHint": typeHint,
+            "isPointer": false, "isExported": false, "cTyped": false, "perInstance": false, "isStatic": false, "line": ln}
+}
+
+fn nFunctionDecl(name, ln) {
+    return {"k": "FunctionDecl", "name": name, "params": [], "paramTypes": [], "paramIsRef": [], "defaultArgs": [],
+            "returnType": "", "body": nil, "isExported": false, "cppParamTypes": [], "cReturnType": "",
+            "pythonScope": false, "line": ln}
+}
+
+fn nGlobal(names, isNonlocal, ln) {
+    return {"k": "Global", "names": names, "isNonlocal": isNonlocal, "line": ln}
+}
+
+fn nReturn(value, ln) {
+    return {"k": "Return", "value": value, "line": ln}
+}
+
+fn nIf(c, thenB, elseB, ln) {
+    return {"k": "If", "condition": c, "thenBranch": thenB, "elseBranch": elseB, "line": ln}
+}
+
+fn nWhile(c, body, post, ln) {
+    return {"k": "While", "condition": c, "body": body, "post": post, "line": ln}
+}
+
+fn nFor(var1, var2, iterable, body, ln) {
+    return {"k": "For", "var": var1, "var2": var2, "iterable": iterable, "body": body, "line": ln}
+}
+
+fn nBlock(statements, ln) {
+    return {"k": "Block", "statements": statements, "line": ln}
+}
+
+fn nExprStmt(e, ln) {
+    return {"k": "ExprStmt", "expr": e, "line": ln}
+}
+
+fn nPrint(args, newline, ln) {
+    return {"k": "Print", "args": args, "newline": newline, "sep": " ", "end": "\n", "line": ln}
+}
+
+fn nInput(target, prompt, ln) {
+    return {"k": "Input", "target": target, "prompt": prompt, "lvalueTarget": nil, "line": ln}
+}
+
+fn nBreak(ln) {
+    return {"k": "Break", "line": ln}
+}
+
+fn nContinue(ln) {
+    return {"k": "Continue", "line": ln}
+}
+
+fn nRaise(value, ln) {
+    return {"k": "Raise", "value": value, "line": ln}
+}
+
+# handlers: [{"errorType", "alias", "body"}]
+fn nTry(body, ln) {
+    return {"k": "Try", "body": body, "handlers": [], "finallyBody": nil, "line": ln}
+}
+
+# imports: [{"name", "alias"}]
+fn nImport(module, ln) {
+    return {"k": "Import", "module": module, "imports": [], "line": ln}
+}
+
+fn nClass(name, ln) {
+    return {"k": "Class", "name": name, "base": "", "methods": [], "staticMethods": [], "fields": [], "line": ln}
+}

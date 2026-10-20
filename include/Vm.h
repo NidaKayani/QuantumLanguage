@@ -124,6 +124,15 @@ public:
     // Expose globals so the REPL can persist state across calls.
     std::shared_ptr<Environment> globals;
 
+    // Java library natives (VmJavaLib.cpp) calling back into Java code: a
+    // functional-interface value (lambda or implementing object), and a
+    // virtual method of any Java value by dispatch key ("compareTo(Object)").
+    QuantumValue javaCallback(const QuantumValue &fn, const std::string &key, const std::vector<QuantumValue> &args)
+    {
+        return javaCallFunctional(fn, key, args);
+    }
+    QuantumValue javaInvokeKey(const QuantumValue &recv, const std::string &key, std::vector<QuantumValue> args);
+
 private:
     // Value stack
     std::deque<QuantumValue> stack_;
@@ -157,6 +166,10 @@ private:
 
     long long stepCount_ = 0;
     static constexpr long long MAX_STEPS = 200'000'000;
+    // The instruction budget: MAX_STEPS guards the playground against
+    // runaway scripts; a compiled language's program (C/C++, Java) runs
+    // unbounded, under its runner's wall-clock timeout instead.
+    long long maxSteps_ = MAX_STEPS;
     std::vector<std::pair<QuantumValue, size_t>> pendingInstances_;
 
     // ── Native registration ───────────────────────────────────────────────────
@@ -164,6 +177,35 @@ private:
     void registerStlNatives(); // <algorithm>-style free functions (VmStl.cpp)
     void registerCppNatives(); // runtime of the typed C/C++ front-end (VmCpp.cpp)
     void registerJsRuntimeNatives(); // URL, window, encodeURIComponent (VmJsRuntime.cpp)
+    void registerJavaNatives();      // runtime of the Java front-end (VmJava*.cpp)
+
+    // ── Java (VmJava.cpp) ─────────────────────────────────────────────────────
+    // Set by __j_runtime() at the start of a Java program: errors raised by
+    // the VM reach catch blocks as Java exception descriptors, and recursion
+    // past kJavaMaxFrames is a StackOverflowError.
+    bool javaMode_ = false;
+    static constexpr size_t kJavaMaxFrames = 9000;
+    // Op::J_INVOKE: virtual / interface dispatch on the receiver at stack_[recvIdx].
+    void javaInvoke(const QuantumValue &desc, size_t recvIdx, int argc, int line, Chunk::InvokeCache *cache = nullptr);
+    // A method call on a receiver that is not an object: a String, a boxed
+    // number / Character / Boolean, an array, or a lambda.
+    QuantumValue javaValueInvoke(const QuantumValue &recv, const std::string &key,
+                                 std::vector<QuantumValue> &args, int line);
+    // Removes stack_[pos], keeping open upvalues on later slots attached.
+    void eraseFromStack(size_t pos);
+    // The Java call stack as "Class.method(File.java:line)" frames, innermost first.
+    std::vector<std::string> javaStackTrace() const;
+    // Calls a functional-interface value (a lambda, or an object implementing
+    // the interface's method `key`) from native code.
+    QuantumValue javaCallFunctional(const QuantumValue &fn, const std::string &key,
+                                    const std::vector<QuantumValue> &args);
+    // obj.toString() for any Java value, from native code.
+    std::string javaToString(const QuantumValue &v);
+    // jop::BOXJ / BOXS / BOXB: the java.lang.Long / Short / Byte box of an
+    // integer, from the valueOf cache for -128..127.
+    QuantumValue javaBox(int op, const QuantumValue &v);
+    std::shared_ptr<QuantumClass> javaBoxClass_[4];
+    std::vector<QuantumValue> javaBoxCache_[4];
     // Globals that yield to a same-named member inside a method: common
     // identifiers like `next`/`count`/`find` registered as STL algorithms
     // must not shadow a C++ class's own `next` field or `find()` method under
@@ -182,9 +224,16 @@ private:
     void runFrame(size_t stopDepth = 0);
 
     // ── Stack helpers ─────────────────────────────────────────────────────────
-    void push(QuantumValue v);
-    QuantumValue pop();
-    QuantumValue &peek(int offset = 0);
+    void push(QuantumValue v) { stack_.push_back(std::move(v)); }
+    QuantumValue pop()
+    {
+        if (stack_.empty())
+            throw RuntimeError("VM stack underflow");
+        QuantumValue v = std::move(stack_.back());
+        stack_.pop_back();
+        return v;
+    }
+    QuantumValue &peek(int offset = 0) { return stack_[stack_.size() - 1 - offset]; }
 
     // ── Call helpers ──────────────────────────────────────────────────────────
     void callValue(QuantumValue callee, int argCount, int line);

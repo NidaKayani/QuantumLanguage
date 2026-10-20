@@ -10,6 +10,52 @@
 namespace cpp
 {
 
+// The C standard header declaring library function `fn`, or nullptr when C
+// has no such function (a C++-only name like max / to_string / getline).
+const char *cLibraryHeader(const std::string &fn)
+{
+    static const std::map<std::string, const char *> h = [] {
+        std::map<std::string, const char *> m;
+        auto add = [&](const char *header, std::initializer_list<const char *> names) {
+            for (const char *n : names)
+                m[n] = header;
+        };
+        add("stdio.h", {"printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf",
+                        "vsnprintf", "scanf", "fscanf", "sscanf", "getchar", "putchar", "puts", "fputs",
+                        "fgets", "gets", "fgetc", "fputc", "getc", "putc", "ungetc", "fopen", "fclose",
+                        "fflush", "fread", "fwrite", "fseek", "ftell", "rewind", "feof", "ferror", "clearerr",
+                        "remove", "rename", "tmpfile", "perror", "setbuf", "setvbuf", "freopen"});
+        add("stdlib.h", {"malloc", "calloc", "realloc", "free", "abs", "labs", "llabs", "div", "ldiv",
+                         "atoi", "atol", "atoll", "atof", "strtol", "strtoll", "strtoul", "strtoull", "strtod",
+                         "strtof", "strtold", "rand", "srand", "qsort", "bsearch", "exit", "_Exit", "abort",
+                         "atexit", "system", "getenv", "aligned_alloc"});
+        add("string.h", {"strlen", "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp", "strchr",
+                         "strrchr", "strstr", "strtok", "memcpy", "memmove", "memset", "memcmp", "memchr",
+                         "strdup", "strndup", "strspn", "strcspn", "strpbrk", "strerror", "strcoll",
+                         "strxfrm", "strnlen"});
+        add("ctype.h", {"isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "ispunct",
+                        "isprint", "isxdigit", "iscntrl", "isgraph", "isblank", "toupper", "tolower"});
+        add("math.h", {"sqrt", "cbrt", "exp", "exp2", "log", "log2", "log10", "log1p", "expm1", "sin", "cos",
+                       "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+                       "floor", "ceil", "round", "trunc", "fabs", "nearbyint", "rint", "erf", "erfc",
+                       "tgamma", "lgamma", "sqrtf", "floorf", "ceilf", "fabsf", "roundf", "sinf", "cosf",
+                       "powf", "pow", "atan2", "fmod", "hypot", "fmax", "fmin", "copysign", "remainder",
+                       "fdim", "lround", "llround", "lrint", "llrint", "isnan", "isinf", "isfinite",
+                       "signbit", "isnormal", "frexp", "ldexp", "modf", "fma"});
+        add("time.h", {"time", "clock", "difftime", "localtime", "gmtime", "strftime", "mktime", "asctime",
+                       "ctime"});
+        add("assert.h", {"assert"});
+        add("stdarg.h", {"va_start", "va_arg", "va_end", "va_copy"});
+        add("setjmp.h", {"setjmp", "longjmp"});
+        add("signal.h", {"signal", "raise"});
+        add("unistd.h", {"sleep", "usleep", "getpid"});
+        add("conio.h", {"getch", "getche", "kbhit"});
+        return m;
+    }();
+    auto it = h.find(fn);
+    return it == h.end() ? nullptr : it->second;
+}
+
 namespace
 {
 std::vector<ASTNodePtr> args1(ASTNodePtr a)
@@ -51,11 +97,12 @@ ASTNodePtr Lowerer::streamKind(const TP &t)
     std::string k = "?";
     switch (t->k)
     {
-    case T::Int: case T::Enum: k = t->isUnsigned ? "u" : "i"; break;
+    case T::Int: case T::Enum: k = isI64(t) ? (t->isUnsigned ? "L" : "l") : t->isUnsigned ? "u" : "i"; break;
     case T::Float: k = t->name == "float" ? "f" : "d"; break;
     case T::Char: k = "c"; break;
     case T::Bool: k = "b"; break;
-    case T::Str: case T::CStr: k = "s"; break;
+    case T::Str: k = isCBuf(t) ? "z" : "s"; break;
+    case T::CStr: k = "z"; break; // a C string: up to its NUL
     case T::Ptr: case T::UPtr: case T::Nullptr: k = "p"; break;
     case T::Dyn: k = t->name == "manip" ? "m" : t->name == "rdbuf" ? "r" : "?"; break;
     case T::Iter: k = "I"; break;
@@ -69,12 +116,39 @@ ASTNodePtr Lowerer::streamKind(const TP &t)
 XV Lowerer::libName(const std::vector<std::string> &nameIn, int line, bool &found)
 {
     found = true;
+    if (prog_.cMode && !(nameIn.size() == 1 && (nameIn[0] == "stdout" || nameIn[0] == "stderr" ||
+                                                 nameIn[0] == "stdin")))
+    {
+        found = false; // C's library has no streams, manipulators or npos
+        return XV();
+    }
     std::vector<std::string> name = nameIn;
-    if (!name.empty() && name[0] == "std")
+    bool qualified = !name.empty() && name[0] == "std";
+    if (qualified)
         name.erase(name.begin());
     std::string n;
     for (size_t i = 0; i < name.size(); ++i)
         n += (i ? "::" : "") + name[i];
+    bool cGlobal = n == "stdout" || n == "stderr" || n == "stdin";
+    if (!prog_.cMode && !qualified && !cGlobal && !name.empty() && !stdVisible(name[0], currentScope()))
+    {
+        found = false; // std's, but no `using namespace std` / `using std::...` here
+        return XV();
+    }
+    if (!prog_.cMode && (n == "cout" || n == "cerr" || n == "clog" || n == "cin" || n == "endl"))
+    {
+        static const char *io[] = {"iostream", "ostream", "istream", "fstream", "sstream", "bits/stdc++.h"};
+        bool have = false;
+        for (const char *h : io)
+            have = have || prog_.systemHeaders.count(h) > 0;
+        if (!have)
+        {
+            if (qualified)
+                unsupported("'" + n + "' is not a member of 'std'", line);
+            found = false;
+            return XV();
+        }
+    }
     if (n == "cout" || n == "cerr" || n == "clog")
         return mkxv(q::id(n == "cout" ? "__cpp_cout" : "__cpp_cerr", line), mkT(T::Stream, "ostream"), false);
     if (n == "cin")
@@ -98,6 +172,20 @@ XV Lowerer::libName(const std::vector<std::string> &nameIn, int line, bool &foun
         return mkxv(q::str(n, line), mkT(T::Dyn, "FILE"));
     if (n == "ios::app" || n == "ios_base::app")
         return mkxv(q::num(1, line), tInt());
+    static const std::set<std::string> iosFlags = {
+        "fixed", "scientific", "floatfield", "showpoint", "showpos", "boolalpha", "left", "right", "internal",
+        "adjustfield", "uppercase", "hex", "dec", "oct", "basefield", "showbase", "skipws", "unitbuf"};
+    if (n.rfind("ios::", 0) == 0 || n.rfind("ios_base::", 0) == 0)
+    {
+        // ios::fixed ...: the manipulator (setf / unsetf apply it)
+        std::string f = n.substr(n.find("::") + 2);
+        if (iosFlags.count(f))
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(q::str(f, line));
+            return mkxv(q::call("__cpp_manip__", std::move(a), line), manipT());
+        }
+    }
     if (n == "ios::out" || n == "ios::in" || n == "ios::binary" || n == "ios::trunc" || n == "ios_base::out" ||
         n == "ios_base::in" || n == "ios_base::binary" || n == "ios::ate")
         return mkxv(q::num(0, line), tInt());
@@ -207,6 +295,12 @@ XV Lowerer::constructBuiltinType(const TP &t, std::vector<ExprP> &args, bool bra
             return mkxv(q::nil(line), t);
         {
             XV a = lower(0);
+            if (t->name == "shared_ptr" && a.t->k == T::UPtr)
+                return mkxv(copyOf(std::move(a), line), t); // shared_ptr<T> b(a): one more owner
+            if (t->name == "shared_ptr" && a.t->k != T::Nullptr)
+                return mkxv(q::call("__cpp_sp_new__", args1(read(a)), line), t); // shared_ptr<T>(new T)
+            if (a.t->k == T::UPtr)
+                return mkxv(copyOf(std::move(a), line), t);
             a.t = t;
             return a;
         }
@@ -244,9 +338,28 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     handled = true;
     int ln = e->line;
     std::string fn = fnIn;
-    auto lower = [&](size_t i) -> XV { return lowerExpr(args[i]); };
+    if (prog_.cMode)
+    {
+        // A C program has only C's library, and (C99 on, an error since gcc
+        // 14) must include the header that declares a function it calls.
+        const char *header = cLibraryHeader(fn);
+        if (!header)
+        {
+            handled = false;
+            return XV();
+        }
+        if (!prog_.systemHeaders.count(header))
+            unsupported("implicit declaration of function '" + fn + "'; include <" + header + ">", ln);
+    }
+    std::vector<XV> early; // arguments evaluated ahead (right to left)
+    auto lower = [&](size_t i) -> XV
+    {
+        if (i < early.size() && early[i].t)
+            return std::move(early[i]);
+        return lowerExpr(args[i]);
+    };
     auto lowerTo = [&](size_t i, const TP &t) -> XV
-    { return convert(lowerExprTo(args[i], t), t, ln); };
+    { return convert(i < early.size() && early[i].t ? std::move(early[i]) : lowerExprTo(args[i], t), t, ln); };
     auto targType = [&](size_t i) -> TP
     { return i < targs.size() && targs[i].type ? resolveType(targs[i].type, currentScope()) : nullptr; };
     auto need = [&](size_t n)
@@ -357,6 +470,15 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
         }
         if (isObjectRep(a.t))
             return mkxv(q::call("__cpp_swap_obj__", args2(read(a), read(b)), ln), tVoid());
+        if ((a.lk == XV::StrCh || b.lk == XV::StrCh) && a.lk != XV::RV && b.lk != XV::RV)
+        {
+            // characters of strings: through a temporary
+            ASTNodePtr t = simple(peekRead(a), ln);
+            std::vector<ASTNodePtr> s;
+            s.push_back(store(a, peekRead(b), ln));
+            s.push_back(store(b, std::move(t), ln));
+            return mkxv(q::call("__cpp_seq__", std::move(s), ln), tVoid());
+        }
         XV ra = addressOf(std::move(a), ln), rb = addressOf(std::move(b), ln);
         return mkxv(q::call("__cpp_swap__", args2(read(ra), read(rb)), ln), tVoid());
     }
@@ -459,6 +581,7 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     {
         size_t first = fn == "printf" ? 0 : fn == "snprintf" ? 2 : 1;
         need(first + 1);
+        preEvalArgs(args, early, first + 1, nullptr);
         std::vector<ASTNodePtr> kinds, vals;
         ASTNodePtr target = q::str("stdout", ln);
         XV dstBuf;
@@ -468,8 +591,11 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
             XV f = lower(0);
             target = read(f);
         }
+        XV limit;
         if (toBuf)
             dstBuf = lower(0);
+        if (fn == "snprintf")
+            limit = lower(1);
         XV fmt = lower(first);
         for (size_t i = first + 1; i < args.size(); ++i)
         {
@@ -484,17 +610,46 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
         a.push_back(q::arr(std::move(vals), ln));
         ASTNodePtr c = q::call("__cpp_printf__", std::move(a), ln);
         if (toBuf)
-        {
-            ASTNodePtr text = simple(std::move(c), ln);
-            ASTNodePtr st = store(dstBuf, q::clone(text), ln);
-            return mkxv(q::call("__cpp_seq__", args2(std::move(st), q::call("__cpp_size__", args1(std::move(text)), ln)), ln), tInt());
-        }
+            return mkxv(q::call("__cpp_cs_sprintf__", args3(charPtr(dstBuf, ln), std::move(c), fn == "snprintf" ? read(limit) : q::num(-1, ln)), ln), tInt());
         return mkxv(std::move(c), tInt());
     }
     if (fn == "puts")
     {
+        need(1);
         XV s = lower(0);
-        return mkxv(q::call("__cpp_puts__", args1(read(s)), ln), tInt());
+        return mkxv(q::call("__cpp_puts__", args1(charPtr(s, ln)), ln), tInt());
+    }
+    if (fn == "fputs")
+    {
+        need(2);
+        XV s = lower(0), f = lower(1);
+        return mkxv(q::call("__cpp_fputs__", args2(charPtr(s, ln), read(f)), ln), tInt());
+    }
+    if (fn == "fputc" || fn == "putc")
+    {
+        need(2);
+        XV c = lowerTo(0, tInt()), f = lower(1);
+        return mkxv(q::call("__cpp_fputc__", args2(read(c), read(f)), ln), tInt());
+    }
+    if (fn == "fgetc" || fn == "getc")
+    {
+        need(1);
+        lower(0);
+        return mkxv(q::call("__cpp_getchar__", {}, ln), tInt());
+    }
+    if (fn == "fgets" || fn == "gets")
+    {
+        need(1);
+        XV d = lower(0);
+        ASTNodePtr n = q::num(-1, ln);
+        if (fn == "fgets")
+        {
+            need(3);
+            XV nx = lowerTo(1, tInt());
+            n = read(nx);
+            lower(2); // stdin
+        }
+        return mkxv(q::call("__cpp_fgets__", args2(charPtr(d, ln), std::move(n)), ln), tCStr());
     }
     if (fn == "putchar")
     {
@@ -503,17 +658,222 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     }
     if (fn == "getchar")
         return mkxv(q::call("__cpp_getchar__", {}, ln), tInt());
+    // <stdarg.h>: a va_list is [rest arguments, next index]
+    if (fn == "va_start")
+    {
+        need(1);
+        XV ap = lower(0);
+        std::vector<ASTNodePtr> cur;
+        cur.push_back(q::id("__va", ln));
+        cur.push_back(q::num(0, ln));
+        return mkxv(store(ap, q::arr(std::move(cur), ln), ln), tVoid());
+    }
+    if (fn == "va_arg")
+    {
+        need(2);
+        XV ap = lower(0);
+        TP t = args.size() > 1 && args[1]->type ? resolveType(args[1]->type, currentScope()) : tDyn();
+        XV v = mkxv(q::call("__cpp_va_arg__", args1(read(ap)), ln), tDyn());
+        v.t = t;
+        return v;
+    }
+    if (fn == "va_end")
+    {
+        need(1);
+        XV ap = lower(0);
+        return mkxv(q::call("__cpp_seq__", args2(read(ap), q::nil(ln)), ln), tVoid());
+    }
+    if (fn == "va_copy")
+    {
+        need(2);
+        XV d = lower(0), s = lower(1);
+        return mkxv(store(d, q::call("__cpp_va_copy__", args1(read(s)), ln), ln), tVoid());
+    }
+    if (fn == "vprintf" || fn == "vfprintf" || fn == "vsprintf" || fn == "vsnprintf")
+    {
+        size_t first = fn == "vprintf" ? 0 : fn == "vsnprintf" ? 2 : 1;
+        need(first + 2);
+        bool toBuf = fn == "vsprintf" || fn == "vsnprintf";
+        ASTNodePtr target = q::str("stdout", ln);
+        XV dstBuf;
+        if (fn == "vfprintf")
+        {
+            XV f = lower(0);
+            target = read(f);
+        }
+        if (toBuf)
+            dstBuf = lower(0);
+        XV fmt = lower(first), ap = lower(first + 1);
+        std::vector<ASTNodePtr> a;
+        a.push_back(toBuf ? q::str("string", ln) : std::move(target));
+        a.push_back(read(fmt));
+        a.push_back(q::arr({}, ln));
+        a.push_back(q::call("__cpp_va_rest__", args1(read(ap)), ln));
+        ASTNodePtr c = q::call("__cpp_printf__", std::move(a), ln);
+        if (toBuf)
+        {
+            ASTNodePtr lim = q::num(-1, ln);
+            if (fn == "vsnprintf")
+            {
+                XV l = lower(1);
+                lim = read(l);
+            }
+            return mkxv(q::call("__cpp_cs_sprintf__", args3(charPtr(dstBuf, ln), std::move(c), std::move(lim)), ln), tInt());
+        }
+        return mkxv(std::move(c), tInt());
+    }
+    // scanf / sscanf / fscanf(stdin, ...): each argument is where a value goes
+    if (fn == "scanf" || fn == "sscanf" || fn == "fscanf")
+    {
+        size_t first = fn == "scanf" ? 0 : 1;
+        need(first + 1);
+        ASTNodePtr source = q::nil(ln);
+        if (fn == "sscanf")
+        {
+            XV s = lower(0);
+            source = charPtr(s, ln);
+        }
+        else if (fn == "fscanf")
+            lower(0); // stdin
+        XV fmt = lower(first);
+        std::vector<ASTNodePtr> refs;
+        for (size_t i = first + 1; i < args.size(); ++i)
+        {
+            XV x = lower(i);
+            if (x.t->k == T::Str || x.t->k == T::CStr)
+            {
+                refs.push_back(charPtr(x, ln)); // char buf[N]: a char* into the buffer
+                continue;
+            }
+            refs.push_back(read(x));
+        }
+        std::vector<ASTNodePtr> a;
+        a.push_back(std::move(source));
+        a.push_back(read(fmt));
+        a.push_back(q::arr(std::move(refs), ln));
+        return mkxv(q::call("__cpp_scanf__", std::move(a), ln), tInt());
+    }
+    if (fn == "strtok")
+    {
+        need(2);
+        XV s = lower(0), d = lower(1);
+        return mkxv(q::call("__cpp_strtok__", args2(charPtr(s, ln), charPtr(d, ln)), ln), tCStr());
+    }
+    if (fn == "strdup" || fn == "strndup")
+    {
+        need(1);
+        XV s = lower(0);
+        ASTNodePtr n = q::num(-1, ln);
+        if (fn == "strndup")
+        {
+            XV nx = lower(1);
+            n = read(nx);
+        }
+        return mkxv(q::call("__cpp_cs_dup__", args2(charPtr(s, ln), std::move(n)), ln), tCStr());
+    }
+    // memcpy / memmove / memset / memcmp on arrays and blocks: by element
+    if (fn == "memcpy" || fn == "memmove" || fn == "memset" || fn == "memcmp")
+    {
+        need(3);
+        XV d = lower(0);
+        TP dt = d.t;
+        TP elem = dt->k == T::Ptr || dt->k == T::Array ? (dt->a.empty() ? tDyn() : dt->a[0]) : dt;
+        long es = std::max(1L, sizeOfType(elem));
+        if (dt->k == T::Str || dt->k == T::CStr)
+        {
+            // char buffers: bytes
+            bool viaStore = d.lk == XV::Var && dt->k == T::Str; // a std::string variable
+            ASTNodePtr dp = viaStore ? peekRead(d) : charPtr(d, ln);
+            XV s = lower(1), n = lower(2);
+            ASTNodePtr c;
+            if (fn == "memset")
+                c = q::call("__cpp_cs_memset__", args3(std::move(dp), read(s), read(n)), ln);
+            else if (fn == "memcmp")
+                return mkxv(q::call("__cpp_cs_memcmp__", args3(std::move(dp), charPtr(s, ln), read(n)), ln), tInt());
+            else
+                c = q::call("__cpp_cs_memcpy__", args3(std::move(dp), charPtr(s, ln), read(n)), ln);
+            if (viaStore)
+                c = store(d, std::move(c), ln);
+            return mkxv(std::move(c), tCStr());
+        }
+        auto pt = mkT(T::Ptr);
+        pt->a.push_back(elem);
+        if (dt->k == T::Array)
+            d = convert(std::move(d), pt, ln);
+        if (fn == "memset")
+        {
+            XV v = lower(1), n = lower(2);
+            std::vector<ASTNodePtr> a;
+            a.push_back(read(d));
+            a.push_back(read(v));
+            a.push_back(q::num((double)es, ln));
+            a.push_back(read(n));
+            a.push_back(q::boolean(isFloat(elem), ln));
+            return mkxv(q::call("__cpp_memset__", std::move(a), ln), pt);
+        }
+        XV s = lower(1);
+        if (s.t->k == T::Array)
+            s = convert(std::move(s), pt, ln);
+        XV n = lower(2);
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(d));
+        a.push_back(read(s));
+        a.push_back(q::num((double)es, ln));
+        a.push_back(read(n));
+        if (fn == "memcmp")
+            return mkxv(q::call("__cpp_memcmp__", std::move(a), ln), tInt());
+        a.push_back(planFor(elem));
+        return mkxv(q::call("__cpp_memcpy__", std::move(a), ln), pt);
+    }
+    // the heap: blocks are typed by the pointer they are converted to
+    if (fn == "malloc" || fn == "calloc" || fn == "realloc" || fn == "aligned_alloc")
+    {
+        need(fn == "malloc" ? 1 : 2);
+        XV r;
+        r.t = mkT(T::Ptr);
+        r.t->a.push_back(tVoid());
+        r.alloc = std::make_shared<XV::Alloc>();
+        ASTNodePtr bytes;
+        if (fn == "calloc")
+        {
+            XV n = lower(0), s = lower(1);
+            bytes = q::bin("*", read(n), read(s), ln);
+        }
+        else
+        {
+            XV b = lower(fn == "malloc" ? 0 : 1);
+            bytes = read(b);
+        }
+        if (fn == "realloc")
+        {
+            XV old = lower(0);
+            r.alloc->old = std::make_shared<ASTNodePtr>(read(old));
+            r.v = q::nil(ln);
+        }
+        else
+            r.v = q::str("", ln); // used as raw bytes: a char block
+        r.alloc->bytes = std::make_shared<ASTNodePtr>(std::move(bytes));
+        return r;
+    }
+    if (fn == "free")
+    {
+        need(1);
+        XV p = lower(0);
+        return mkxv(q::call("__cpp_seq__", args2(read(p), q::nil(ln)), ln), tVoid());
+    }
     if (fn == "strlen")
     {
+        need(1);
         XV s = lower(0);
-        return mkxv(q::call("__cpp_size__", args1(read(s)), ln), tSize());
+        return mkxv(q::call("__cpp_strlen__", args1(charPtr(s, ln)), ln), tSize());
     }
     if (fn == "strcmp" || fn == "strncmp" || fn == "strcasecmp" || fn == "_stricmp")
     {
+        need(2);
         XV a = lower(0), b = lower(1);
         std::vector<ASTNodePtr> v;
-        v.push_back(read(a));
-        v.push_back(read(b));
+        v.push_back(charPtr(a, ln));
+        v.push_back(charPtr(b, ln));
         if (fn == "strncmp")
         {
             XV n = lower(2);
@@ -526,21 +886,86 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     }
     if (fn == "strcpy" || fn == "strncpy" || fn == "strcat" || fn == "strncat")
     {
+        need(2);
         XV d = lower(0), s = lower(1);
-        ASTNodePtr src = read(s);
+        bool viaStore = d.lk == XV::Var && d.t->k == T::Str; // a std::string variable
+        std::vector<ASTNodePtr> v;
+        v.push_back(viaStore ? peekRead(d) : charPtr(d, ln));
+        v.push_back(charPtr(s, ln));
         if (fn == "strncpy" || fn == "strncat")
         {
+            need(3);
             XV n = lower(2);
-            src = q::call("__cpp_substr__", args3(std::move(src), q::num(0, ln), read(n)), ln);
+            v.push_back(read(n));
         }
-        ASTNodePtr v = fn.rfind("strcat", 0) == 0 || fn == "strncat" ? q::bin("+", peekRead(d), std::move(src), ln) : std::move(src);
-        return mkxv(store(d, std::move(v), ln), tCStr());
+        else
+            v.push_back(q::num(-1, ln));
+        v.push_back(q::boolean(fn == "strcat" || fn == "strncat", ln));
+        ASTNodePtr c = q::call("__cpp_cs_strcpy__", std::move(v), ln);
+        if (viaStore)
+            c = store(d, std::move(c), ln);
+        return mkxv(std::move(c), tCStr());
     }
-    if (fn == "strchr" || fn == "strstr")
+    if (fn == "strchr" || fn == "strrchr")
     {
-        XV s = lower(0), c = lower(1);
-        ASTNodePtr needle = c.t->k == T::Char || isIntegral(c.t) ? chr(read(c), ln) : read(c);
-        return mkxv(q::call("__cpp_strfind__", args2(read(s), std::move(needle)), ln), tCStr());
+        need(2);
+        XV s = lower(0), c = lowerTo(1, tInt());
+        return mkxv(q::call("__cpp_cs_chr__", args3(charPtr(s, ln), read(c), q::boolean(fn == "strrchr", ln)), ln), tCStr());
+    }
+    if (fn == "strstr")
+    {
+        need(2);
+        XV s = lower(0), n = lower(1);
+        return mkxv(q::call("__cpp_cs_strstr__", args2(charPtr(s, ln), charPtr(n, ln)), ln), tCStr());
+    }
+    if (fn == "strspn" || fn == "strcspn" || fn == "strpbrk")
+    {
+        need(2);
+        XV s = lower(0), set = lower(1);
+        int mode = fn == "strspn" ? 0 : fn == "strcspn" ? 1 : 2;
+        return mkxv(q::call("__cpp_cs_span__", args3(charPtr(s, ln), charPtr(set, ln), q::num(mode, ln)), ln),
+                    mode == 2 ? tCStr() : tSize());
+    }
+    if (fn == "qsort" || fn == "bsearch")
+    {
+        // (base, n, size, cmp) / (key, base, n, size, cmp): elements reach the comparator by pointer
+        size_t b0 = fn == "bsearch" ? 1 : 0;
+        need(b0 + 4);
+        ASTNodePtr key;
+        if (fn == "bsearch")
+        {
+            XV k = lower(0);
+            key = read(k);
+        }
+        XV base = lower(b0);
+        TP et = base.t->k == T::Array || base.t->k == T::Ptr ? (base.t->a.empty() ? tDyn() : base.t->a[0]) : tDyn();
+        ASTNodePtr bp;
+        if (base.t->k == T::Array)
+        {
+            std::vector<ASTNodePtr> r;
+            r.push_back(read(base));
+            r.push_back(q::num(0, ln));
+            bp = q::arr(std::move(r), ln); // [array, 0], whatever the elements are
+        }
+        else
+            bp = read(base);
+        XV n = lower(b0 + 1);
+        lower(b0 + 2);
+        XV cmp = lower(b0 + 3);
+        if (cmp.isFuncName)
+            cmp = convert(std::move(cmp), mkT(T::Func), ln);
+        int mode = isCBuf(et) ? 2 : (isObjectRep(et) && et->k != T::Array) ? 1 : 0;
+        std::vector<ASTNodePtr> v;
+        if (fn == "bsearch")
+            v.push_back(std::move(key));
+        v.push_back(std::move(bp));
+        v.push_back(read(n));
+        v.push_back(read(cmp));
+        v.push_back(q::num(mode, ln));
+        auto pt = mkT(T::Ptr);
+        pt->a.push_back(mkT(T::Void, "void"));
+        return mkxv(q::call(fn == "qsort" ? "__cpp_qsort__" : "__cpp_bsearch__", std::move(v), ln),
+                    fn == "qsort" ? tVoid() : pt);
     }
     if (fn == "exit" || fn == "_Exit" || fn == "quick_exit")
     {
@@ -624,7 +1049,10 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
         if (t->k == T::Class && t->cls)
         {
             std::vector<ExprP> a = args;
-            return mkxv(ctorCall(t->cls, a, false, ln), pt);
+            ASTNodePtr obj = ctorCall(t->cls, a, false, ln);
+            if (fn == "make_shared")
+                obj = q::call("__cpp_sp_new__", args1(std::move(obj)), ln); // one owner
+            return mkxv(std::move(obj), pt);
         }
         if (isObjectRep(t))
         {
@@ -873,8 +1301,36 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     if (fn == "sort" || fn == "stable_sort" || fn == "partial_sort")
     {
         need(2);
-        XV a = lower(0);
         size_t lastIdx = fn == "partial_sort" ? 2 : 1;
+        auto memberCall = [&](const ExprP &x, const char *m) -> ExprP
+        {
+            if (x->k == EK::Call && x->kids.size() == 1 && x->kids[0]->k == EK::Member && x->kids[0]->op == m &&
+                !x->kids[0]->kids.empty())
+                return x->kids[0]->kids[0];
+            return nullptr;
+        };
+        ExprP rb = memberCall(args[0], "rbegin"), re = memberCall(args[lastIdx], "rend");
+        if (fn != "partial_sort" && rb && re && rb->k == EK::Name && re->k == EK::Name && rb->name == re->name)
+        {
+            // sort(v.rbegin(), v.rend()): the container, in descending order
+            XV c = lowerExpr(rb);
+            TP el = elemType(c.t);
+            ASTNodePtr cv = simple(read(c), ln);
+            std::vector<ASTNodePtr> f, l, v;
+            f.push_back(q::clone(cv));
+            f.push_back(q::num(0, ln));
+            l.push_back(q::clone(cv));
+            l.push_back(q::call("__cpp_size__", args1(std::move(cv)), ln));
+            v.push_back(q::arr(std::move(f), ln));
+            v.push_back(q::arr(std::move(l), ln));
+            if (el->k != T::Dyn)
+                lambdaHints_ = {el, el};
+            v.push_back(cmpArg(lastIdx + 1));
+            lambdaHints_.clear();
+            v.push_back(q::boolean(true, ln));
+            return mkxv(q::call("__cpp_sort__", std::move(v), ln), tVoid());
+        }
+        XV a = lower(0);
         XV b = lower(lastIdx);
         std::vector<ASTNodePtr> v;
         TP el = deref(a.t);
@@ -1416,7 +1872,7 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
         if (m == "count" || m == "contains")
         {
             XV k = lowerTo(0, kt);
-            XV r = call("__cpp_dict_count__", args2(self(), read(k)), m == "count" ? tSize() : tBool());
+            XV r = call("__cpp_dict_count__", args3(self(), read(k), q::boolean(t->multi, ln)), m == "count" ? tSize() : tBool());
             return r;
         }
         if (m == "find" || m == "lower_bound" || m == "upper_bound")
@@ -1576,10 +2032,21 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
         if (m == "reset")
         {
             ASTNodePtr v = args.empty() ? q::nil(ln) : read(*std::make_shared<XV>(lower(0)));
+            if (t->name == "shared_ptr" && !args.empty())
+                v = q::call("__cpp_sp_new__", args1(std::move(v)), ln);
+            if (ownsResource(t) && canHoist_ && pre_)
+            {
+                // the old pointee is let go
+                ASTNodePtr old = simple(peekRead(obj), ln);
+                std::vector<ASTNodePtr> a;
+                a.push_back(store(obj, std::move(v), ln));
+                a.push_back(destroyValue(t, std::move(old), ln));
+                return mkxv(q::call("__cpp_seq__", std::move(a), ln), tVoid());
+            }
             return mkxv(store(obj, std::move(v), ln), tVoid());
         }
         if (m == "use_count")
-            return mkxv(q::num(1, ln), tLL());
+            return mkxv(q::call("__cpp_sp_count__", args1(self()), ln), tLL());
         if (m == "swap")
         {
             XV o = lower(0);

@@ -81,6 +81,11 @@ int main(int argc, char *argv[])
     }
 #endif
 
+    // --strict / --stage-marker may precede any command or file.
+    std::vector<char *> args = takeGlobalFlags(argc, argv);
+    argc = static_cast<int>(args.size()) - 1;
+    argv = args.data();
+
     // ══════════════════════════════════════════════════════════════
     //  QRUN MODE  (qrun.exe) — always interpret, never bundle
     // ══════════════════════════════════════════════════════════════
@@ -122,6 +127,18 @@ int main(int argc, char *argv[])
     // Hidden: run one file in this process for the batch runner (child worker).
     if (a1 == "--__runone" && argc >= 3)
         return runSingleFileForTest(argv[2]);
+    // Self-hosting support (selfhost/): the C++ front-end's tokens and
+    // bytecode, to check the Quantum-written compiler against, and a runner
+    // for bytecode files that compiler writes.
+    if (a1 == "--dump-tokens" && argc >= 3)
+        return dumpTokens(argv[2]);
+    if (a1 == "--emit-qbc" && argc >= 4)
+        return emitBytecodeFile(argv[2], argv[3]);
+    if (a1 == "--exec" && argc >= 3)
+    {
+        g_scriptArgv.assign(argv + 2, argv + argc);
+        return execBytecodeFile(argv[2]);
+    }
     // Any supported source file runs natively on the Quantum VM —
     // .js/.py/.rb/.c/.cpp go through the same multi-syntax front-end as .sa,
     // so no node/python/gcc/g++ is required.

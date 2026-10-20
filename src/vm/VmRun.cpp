@@ -1,4 +1,6 @@
 #include "Vm.h"
+#include "JavaOps.h"
+#include "VmJava.h"
 #include "Error.h"
 #include "Disassembler.h"
 #include <cstdlib>
@@ -49,7 +51,7 @@ void VM::runFrame(size_t stopDepth)
             continue;
         }
 
-        if (++stepCount_ > MAX_STEPS)
+        if (++stepCount_ > maxSteps_)
             throw RuntimeError("Execution step limit exceeded (possible infinite loop)");
 
         const Instruction &instr = code[frame.ip++];
@@ -79,7 +81,7 @@ void VM::runFrame(size_t stopDepth)
         {
         // ── Constants & stack ──────────────────────────────────────────────
         case Op::LOAD_CONST:
-            push(consts[instr.operand]);
+            stack_.push_back(consts[instr.operand]);
             break;
         case Op::LOAD_NIL:
             push(QuantumValue());
@@ -91,7 +93,9 @@ void VM::runFrame(size_t stopDepth)
             push(QuantumValue(false));
             break;
         case Op::POP:
-            pop();
+            if (stack_.empty())
+                throw RuntimeError("VM stack underflow");
+            stack_.pop_back();
             break;
         case Op::DUP:
             push(peek(0));
@@ -121,7 +125,7 @@ void VM::runFrame(size_t stopDepth)
         {
             // Names for the next CALL's arguments ("" = positional).
             pendingKwNames_.clear();
-            const std::string joined = consts[instr.operand].asString();
+            const std::string joined = std::get<std::string>(consts[instr.operand].data);
             size_t startPos = 0;
             while (true)
             {
@@ -137,7 +141,7 @@ void VM::runFrame(size_t stopDepth)
         // ── Globals ───────────────────────────────────────────────────────
         case Op::DEFINE_GLOBAL:
         {
-            const std::string &name = consts[instr.operand].asString();
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             globals->define(name, pop());
             weakGlobals_.erase(name); // a user definition replaces a weak builtin
             if (name.compare(0, 6, "__op__") == 0)
@@ -146,14 +150,30 @@ void VM::runFrame(size_t stopDepth)
         }
         case Op::DEFINE_CONST:
         {
-            const std::string &name = consts[instr.operand].asString();
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             globals->define(name, pop(), true);
             weakGlobals_.erase(name);
             break;
         }
         case Op::LOAD_GLOBAL:
         {
-            const std::string &name = consts[instr.operand].asString();
+            if (javaMode_)
+            {
+                // a Java program's globals are its own classes, methods and
+                // static fields: their slots are cached per chunk
+                auto &slots = frame.closure->chunk->globalSlots;
+                if (slots.size() != consts.size())
+                    slots.assign(consts.size(), nullptr);
+                QuantumValue *&p = slots[instr.operand];
+                if (!p)
+                    p = globals->slot(std::get<std::string>(consts[instr.operand].data));
+                if (p)
+                {
+                    stack_.push_back(*p);
+                    break;
+                }
+            }
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             // A weak builtin (e.g. the STL `next`) yields to a same-named
             // member of `this` inside a method: a node's own `next` field.
             if (!weakGlobals_.empty() && weakGlobals_.count(name))
@@ -252,7 +272,21 @@ void VM::runFrame(size_t stopDepth)
         }
         case Op::STORE_GLOBAL:
         {
-            const std::string &name = consts[instr.operand].asString();
+            if (javaMode_)
+            {
+                auto &slots = frame.closure->chunk->globalSlots;
+                if (slots.size() != consts.size())
+                    slots.assign(consts.size(), nullptr);
+                QuantumValue *&p = slots[instr.operand];
+                if (!p)
+                    p = globals->slot(std::get<std::string>(consts[instr.operand].data));
+                if (p)
+                {
+                    *p = stack_.back();
+                    break;
+                }
+            }
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             // Implicit self: only inside a method (params[0] == "self"),
             // and only when the name is not already a known global.
             auto &params = frame.closure->chunk->params;
@@ -282,9 +316,9 @@ void VM::runFrame(size_t stopDepth)
         {
             size_t idx = frame.stackBase + instr.operand;
             if (idx < stack_.size())
-                push(stack_[idx]);
+                stack_.push_back(stack_[idx]);
             else
-                push(QuantumValue());
+                stack_.emplace_back();
             break;
         }
         case Op::STORE_LOCAL:
@@ -380,9 +414,13 @@ void VM::runFrame(size_t stopDepth)
             frame.ip += instr.operand;
             break;
         case Op::JUMP_IF_FALSE:
-            if (!peek(0).isTruthy())
+        {
+            const QuantumValue &c = stack_.back();
+            const bool *b = std::get_if<bool>(&c.data);
+            if (b ? !*b : !c.isTruthy())
                 frame.ip += instr.operand;
             break;
+        }
         case Op::JUMP_IF_TRUE:
             if (peek(0).isTruthy())
                 frame.ip += instr.operand;
@@ -437,6 +475,12 @@ void VM::runFrame(size_t stopDepth)
         case Op::CALL:
         {
             int argCount = instr.operand;
+            if (pendingKwNames_.empty())
+                if (auto *cl = std::get_if<std::shared_ptr<Closure>>(&stack_[stack_.size() - argCount - 1].data))
+                {
+                    callClosure(*cl, argCount, line);
+                    break;
+                }
             QuantumValue callee = stack_[stack_.size() - argCount - 1];
 
             // Keyword arguments from a preceding KW_NAMES: bind them to the
@@ -839,7 +883,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::GET_MEMBER:
         {
-            const std::string &name = consts[instr.operand].asString();
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             QuantumValue obj = pop();
 
             if (obj.isNil())
@@ -1013,7 +1057,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::SET_MEMBER:
         {
-            const std::string &name = consts[instr.operand].asString();
+            const std::string &name = std::get<std::string>(consts[instr.operand].data);
             QuantumValue val = pop();
             QuantumValue obj = peek(0);
 
@@ -1121,7 +1165,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::BIND_METHOD:
         {
-            const std::string &methodName = consts[instr.operand].asString();
+            const std::string &methodName = std::get<std::string>(consts[instr.operand].data);
             QuantumValue fn = pop();
             QuantumValue &classVal = peek(0);
             if (!classVal.isClass())
@@ -1221,7 +1265,7 @@ void VM::runFrame(size_t stopDepth)
         }
 
         case Op::GET_SUPER:
-            getSuper(consts[instr.operand].asString(), line);
+            getSuper(std::get<std::string>(consts[instr.operand].data), line);
             break;
 
         // ── Exceptions ────────────────────────────────────────────────────
@@ -1243,6 +1287,10 @@ void VM::runFrame(size_t stopDepth)
                 std::string msg = val.isString() ? val.asString() : val.toString();
                 throw RuntimeError(msg, line);
             }
+            // Java: a handler outside this runFrame (native code called back
+            // into the program) is reached by unwinding the C++ stack too.
+            if (javaMode_ && handlers_.back().frameDepth < stopDepth)
+                throw CppThrow(val);
             ExceptionHandler h = handlers_.back();
             handlers_.pop_back();
             while (frames_.size() > h.frameDepth)
@@ -1336,6 +1384,95 @@ void VM::runFrame(size_t stopDepth)
             break;
         }
 
+        // ── Java (VmJava.cpp) ─────────────────────────────────────────────
+        case Op::J_BIN:
+        {
+            {
+                QuantumValue &av = stack_[stack_.size() - 2];
+                const int64_t *px = std::get_if<int64_t>(&av.data);
+                const int64_t *py = std::get_if<int64_t>(&stack_.back().data);
+                if (px && py)
+                {
+                    const int64_t x = *px, y = *py;
+                    bool done = true;
+                    switch (instr.operand)
+                    {
+                    case jop::IADD: av.data = (int64_t)(int32_t)(uint32_t)(uint64_t)(x + y); break;
+                    case jop::ISUB: av.data = (int64_t)(int32_t)(uint32_t)(uint64_t)(x - y); break;
+                    case jop::IMUL: av.data = (int64_t)(int32_t)(uint32_t)((uint64_t)x * (uint64_t)y); break;
+                    case jop::IAND: case jop::LAND: av.data = x & y; break;
+                    case jop::IOR: case jop::LOR: av.data = x | y; break;
+                    case jop::IXOR: case jop::LXOR: av.data = x ^ y; break;
+                    case jop::LADD: av.data = (int64_t)((uint64_t)x + (uint64_t)y); break;
+                    case jop::LSUB: av.data = (int64_t)((uint64_t)x - (uint64_t)y); break;
+                    case jop::LMUL: av.data = (int64_t)((uint64_t)x * (uint64_t)y); break;
+                    case jop::LT: av.data = x < y; break;
+                    case jop::LE: av.data = x <= y; break;
+                    case jop::GT: av.data = x > y; break;
+                    case jop::GE: av.data = x >= y; break;
+                    case jop::EQ: av.data = x == y; break;
+                    case jop::NE: av.data = x != y; break;
+                    default: done = false;
+                    }
+                    if (done)
+                    {
+                        stack_.pop_back();
+                        break;
+                    }
+                }
+            }
+            QuantumValue r = javaBin(instr.operand, stack_[stack_.size() - 2], stack_.back());
+            stack_.pop_back();
+            stack_.back() = std::move(r);
+            break;
+        }
+        case Op::J_UN:
+            if (instr.operand >= jop::BOXJ && instr.operand <= jop::BOXC)
+                stack_.back() = javaBox(instr.operand, stack_.back());
+            else
+                stack_.back() = javaUn(instr.operand, stack_.back());
+            break;
+        case Op::J_INVOKE:
+        {
+            int argc = instr.operand & 0xFF;
+            auto &ic = frame.closure->chunk->invokeCache;
+            if (ic.size() != code.size())
+                ic.resize(code.size());
+            javaInvoke(consts[instr.operand >> 8], stack_.size() - argc - 1, argc, line, &ic[frame.ip - 1]);
+            break;
+        }
+        case Op::J_GETF:
+            stack_.back() = javaGetField(stack_.back(), std::get<std::string>(consts[instr.operand].data));
+            break;
+        case Op::J_PUTF:
+        {
+            QuantumValue v = pop();
+            javaPutField(stack_.back(), std::get<std::string>(consts[instr.operand].data), v);
+            stack_.back() = std::move(v);
+            break;
+        }
+        case Op::J_ALOAD:
+        {
+            QuantumValue r = javaArrayLoad(stack_[stack_.size() - 2], stack_.back());
+            stack_.pop_back();
+            stack_.back() = std::move(r);
+            break;
+        }
+        case Op::J_ASTORE:
+        {
+            QuantumValue v = pop();
+            javaArrayStore(stack_[stack_.size() - 2], stack_.back(), v);
+            stack_.pop_back();
+            stack_.back() = std::move(v);
+            break;
+        }
+        case Op::J_INSTOF:
+            stack_.back() = QuantumValue(javaInstanceOf(stack_.back(), std::get<std::string>(consts[instr.operand].data)));
+            break;
+        case Op::J_CAST:
+            javaCheckCast(stack_.back(), std::get<std::string>(consts[instr.operand].data));
+            break;
+
         // ── Unhandled ─────────────────────────────────────────────────────
         default:
             throw RuntimeError("VM: unhandled opcode " +
@@ -1350,6 +1487,12 @@ void VM::runFrame(size_t stopDepth)
             // invocation — rethrow so the C++ stack unwinds through it.
             if (handlers_.empty() || handlers_.back().frameDepth < stopDepth)
                 throw;
+            // Java: an error raised by the VM itself (/ by zero, an index out
+            // of bounds, ...) becomes an exception descriptor, its stack trace
+            // taken now, while the frames are still there.
+            QuantumValue javaCaught;
+            if (javaMode_ && !dynamic_cast<CppThrow *>(&e))
+                javaCaught = javaErrorDescriptor(e, javaStackTrace());
             ExceptionHandler h = handlers_.back();
             handlers_.pop_back();
             while (frames_.size() > h.frameDepth)
@@ -1359,6 +1502,8 @@ void VM::runFrame(size_t stopDepth)
                 stack_.pop_back();
             if (auto *thrown = dynamic_cast<CppThrow *>(&e))
                 push(thrown->value);
+            else if (javaMode_)
+                push(javaCaught);
             else if (e.line > 0 && std::getenv("QUANTUM_DEBUG_CPPFE"))
                 push(QuantumValue(std::string(e.what()) + " (line " + std::to_string(e.line) + ")"));
             else

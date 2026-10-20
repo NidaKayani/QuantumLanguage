@@ -4,6 +4,7 @@
 #include "Parser.h"
 #include "qpm/QpmJson.h"
 #include "qpm/QpmManifest.h"
+#include "qpm/QpmPaths.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,11 +34,16 @@ namespace
         return true;
     }
 
+    // Defined with the `# @use` code further down.
+    bool isFile(const fs::path &p);
+    fs::path packageMain(const fs::path &pkgDir);
+
     // Resolution order for `module`, searched from the importing file's
     // own directory upward (like Node's node_modules walk):
-    //   1. <dir>/<module>.sa                          (local sibling file)
-    //   2. <dir>/node_modules/<module>/<module>.sa      (installed package)
-    //   3. <dir>/node_modules/<module>/index.sa         (installed package, index convention)
+    //   1. <dir>/<module>.sa                               (local sibling file)
+    //   2. <dir>/quantum_qubits/<module>/: <module>.sa, else index.sa, else its
+    //      manifest's "main"                               (package installed by qpm)
+    //   3. the same in <dir>/node_modules/<module>/        (packages from older qpm versions)
     //   4. repeat 2-3 in each parent directory up to the filesystem root
     fs::path resolveModulePath(const std::string &module, const fs::path &fromDir)
     {
@@ -48,13 +54,20 @@ namespace
         fs::path dir = fromDir;
         for (;;)
         {
-            fs::path pkgMain = dir / "node_modules" / module / (module + ".sa");
-            if (fs::exists(pkgMain))
-                return pkgMain;
-
-            fs::path pkgIndex = dir / "node_modules" / module / "index.sa";
-            if (fs::exists(pkgIndex))
-                return pkgIndex;
+            for (const char *folder : {qpm::kQubitsDir, qpm::kNodeModulesDir})
+            {
+                fs::path pkgDir = dir / folder / module;
+                std::error_code ec;
+                if (!fs::is_directory(pkgDir, ec))
+                    continue;
+                if (isFile(pkgDir / (module + ".sa")))
+                    return pkgDir / (module + ".sa");
+                if (isFile(pkgDir / "index.sa"))
+                    return pkgDir / "index.sa";
+                fs::path main = packageMain(pkgDir);
+                if (isFile(main))
+                    return main;
+            }
 
             if (!dir.has_parent_path() || dir == dir.parent_path())
                 break;
@@ -292,8 +305,10 @@ namespace
         std::vector<fs::path> searchDirs; // package directories, in order
     };
 
-    // <root>/node_modules, then each of the root manifest's (package.qon,
-    // package.json or requirements.txt) "quantum.paths" entries (relative to <root>).
+    // <root>/quantum_qubits (where qpm installs Quantum packages), <root>/node_modules
+    // (packages from older qpm versions), then each of the root manifest's
+    // (package.qon, package.json or requirements.txt) "quantum.paths" entries
+    // (relative to <root>).
     UseOptions useOptionsFor(const fs::path &entryDir)
     {
         UseOptions opts;
@@ -310,7 +325,8 @@ namespace
             if (!dir.has_parent_path() || dir == dir.parent_path())
                 break;
         }
-        opts.searchDirs.push_back(opts.root / "node_modules");
+        opts.searchDirs.push_back(opts.root / qpm::kQubitsDir);
+        opts.searchDirs.push_back(opts.root / qpm::kNodeModulesDir);
         if (!manifestPath.empty())
         {
             try

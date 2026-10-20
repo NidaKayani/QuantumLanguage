@@ -93,7 +93,8 @@ int runSingleFileForTest(const std::string &path)
         std::this_thread::sleep_for(std::chrono::seconds(20));
         std::cout << "\n"
                   << QTEST_ERR_MARKER
-                  << "TimeoutError\x1F0\x1F0\x1Fexecution exceeded 20s "
+                  // Split literals: "\x1F0" would be one (out-of-range) escape.
+                  << "TimeoutError\x1F" "0\x1F" "0\x1F" "execution exceeded 20s "
                      "(possible infinite loop)\n";
         std::cout.flush();
         std::_Exit(2);
@@ -103,7 +104,7 @@ int runSingleFileForTest(const std::string &path)
     if (!f.is_open())
     {
         std::cout << "\n"
-                  << QTEST_ERR_MARKER << "OpenError\x1F0\x1F0\x1FCannot open file\n";
+                  << QTEST_ERR_MARKER << "OpenError\x1F" "0\x1F" "0\x1F" "Cannot open file\n";
         return 2;
     }
     std::ostringstream ss;
@@ -307,12 +308,12 @@ static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path>
         {
             if (e.is_directory())
             {
-                // node_modules (npm dependency trees, e.g. downloaded by qpm) and
+                // node_modules / quantum_qubits (dependency trees downloaded by qpm) and
                 // dotfolders (.git, .bin, ...) are never test fixtures — walking
                 // into them would sweep up thousands of real-world .js files this
                 // compiler was never meant to run, drowning the actual test signal.
                 std::string dirName = e.path().filename().string();
-                if (dirName == "node_modules" || (!dirName.empty() && dirName[0] == '.'))
+                if (dirName == "node_modules" || dirName == "quantum_qubits" || (!dirName.empty() && dirName[0] == '.'))
                     continue;
                 subdirs.push_back(e.path());
             }

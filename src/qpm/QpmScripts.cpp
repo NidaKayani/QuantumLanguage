@@ -1,6 +1,7 @@
 #include "QpmScripts.h"
 #include "QpmJson.h"
 #include "QpmManifest.h"
+#include "QpmPaths.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -90,8 +91,10 @@ namespace qpm
                 GetEnvironmentVariableW(L"PATH", &current[0], needed);
                 current.resize(needed - 1);
             }
-            std::wstring binDir = utf8ToWide((projectDir / "node_modules" / ".bin").string());
-            wPath = binDir + L";" + current;
+            // Commands of installed packages: Quantum ones first, then npm ones.
+            std::wstring qubitsBin = utf8ToWide((projectDir / kQubitsDir / ".bin").string());
+            std::wstring npmBin = utf8ToWide((projectDir / kNodeModulesDir / ".bin").string());
+            wPath = qubitsBin + L";" + npmBin + L";" + current;
         }
         SetEnvironmentVariableW(L"PATH", wPath.c_str());
 

@@ -116,6 +116,7 @@ public:
             Token t;
             t.file = file_;
             t.line = line_;
+            t.col = column();
             t.bol = bol;
             t.spaceBefore = space;
             bol = false;
@@ -139,6 +140,15 @@ private:
     int line_ = 1;
 
     char peek(size_t k) const { return i_ + k < s_.size() ? s_[i_ + k] : '\0'; }
+
+    // 1-based column of s_[i_] on its line (for compiler-style diagnostics).
+    int column() const
+    {
+        if (i_ == 0)
+            return 1;
+        size_t nl = s_.rfind('\n', i_ - 1);
+        return nl == std::string::npos ? (int)i_ + 1 : (int)(i_ - nl);
+    }
 
     // An escape sequence after the backslash at s_[i_] (which is consumed).
     void escape(std::string &out)
@@ -402,8 +412,11 @@ public:
         def("NAN", "(0.0/0.0)");
     }
 
+    bool cMode_ = false;
+
     void runMain(const fs::path &path, const std::string &source)
     {
+        out.cMode = cMode_;
         mainKey_ = pathKey(path);
         included_.insert(mainKey_);
         queued_.insert(mainKey_);
@@ -422,6 +435,58 @@ public:
         end.kind = TK::End;
         end.tu = tu_;
         out.tokens.push_back(end);
+        if (cMode_)
+            toCTokens();
+    }
+
+    // C has none of C++'s extra keywords, and no `::` operator: `class`,
+    // `new`, `this`, ... are ordinary identifiers (int class = 3; is C), so
+    // C++ constructs fail exactly as they do in a C compiler.
+    void toCTokens()
+    {
+        static const std::set<std::string> cppOnly = {
+            "catch", "class", "concept", "consteval", "constinit", "const_cast", "co_await", "co_return",
+            "co_yield", "decltype", "delete", "dynamic_cast", "explicit", "export", "friend", "mutable",
+            "namespace", "new", "noexcept", "operator", "private", "protected", "public",
+            "reinterpret_cast", "requires", "static_cast", "template", "this", "throw", "try", "typeid",
+            "typename", "using", "virtual", "and", "and_eq", "bitand", "bitor", "compl", "not", "not_eq",
+            "or", "or_eq", "xor", "xor_eq", "char16_t", "char32_t", "char8_t", "wchar_t"};
+        std::vector<Token> toks;
+        toks.reserve(out.tokens.size());
+        for (Token &t : out.tokens)
+        {
+            if (t.kind == TK::Ident && cppOnly.count(t.text))
+                t.text = std::string(1, kPlainIdent) + t.text;
+            if (t.kind == TK::Punct && t.text == "::")
+            {
+                Token a = t, b = t;
+                a.text = b.text = ":";
+                b.col = t.col + 1;
+                b.bol = false;
+                b.spaceBefore = false;
+                toks.push_back(a);
+                toks.push_back(b);
+                continue;
+            }
+            toks.push_back(std::move(t));
+        }
+        out.tokens.swap(toks);
+    }
+
+    static bool isCStandardHeader(const std::string &h)
+    {
+        static const std::set<std::string> c = {
+            // ISO C (through C23)
+            "assert.h", "complex.h", "ctype.h", "errno.h", "fenv.h", "float.h", "inttypes.h", "iso646.h",
+            "limits.h", "locale.h", "math.h", "setjmp.h", "signal.h", "stdalign.h", "stdarg.h",
+            "stdatomic.h", "stdbit.h", "stdbool.h", "stdckdint.h", "stddef.h", "stdint.h", "stdio.h",
+            "stdlib.h", "stdnoreturn.h", "string.h", "tgmath.h", "threads.h", "time.h", "uchar.h",
+            "wchar.h", "wctype.h",
+            // POSIX / platform headers a C toolchain on Windows (MinGW) ships
+            "unistd.h", "strings.h", "fcntl.h", "dirent.h", "malloc.h", "memory.h", "conio.h", "windows.h",
+            "process.h", "io.h", "direct.h", "getopt.h", "pthread.h", "libgen.h", "search.h", "utime.h",
+            "alloca.h", "sys/types.h", "sys/stat.h", "sys/time.h", "sys/timeb.h", "sys/utime.h"};
+        return c.count(h) > 0;
     }
 
 private:
@@ -613,7 +678,26 @@ private:
                     }
                 }
             }
-            return; // <system> headers: the library is built in
+            // <system> headers: the library is built in. Remember which ones
+            // the program asked for; a C program only has C's.
+            std::string header;
+            size_t k = 1;
+            if (d[1].kind == TK::Punct && d[1].text == "<")
+                for (k = 2; k < d.size() && !(d[k].kind == TK::Punct && d[k].text == ">"); ++k)
+                    header += d[k].text;
+            if (!header.empty())
+            {
+                out.systemHeaders.insert(header);
+                if (cMode_ && !isCStandardHeader(header))
+                {
+                    Unsupported u("fatal: " + header + ": No such file or directory",
+                                  d[1].file < (int)out.files.size() ? out.files[d[1].file] : "", d[1].line);
+                    u.col = d[1].col;
+                    u.syntax = true;
+                    throw u;
+                }
+            }
+            return;
         }
         if (name == "error")
             fail("#error in source", hash);
@@ -965,6 +1049,7 @@ private:
 Preprocessed preprocess(const std::string &path, const std::string &source)
 {
     Preprocessor pp;
+    pp.cMode_ = fileExtLower(path) == ".c";
     std::string src = source;
     if (src.size() >= 3 && (unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB &&
         (unsigned char)src[2] == 0xBF)

@@ -1,7 +1,8 @@
 #pragma once
 // Dependency resolution + install orchestration: reads package.json, walks
-// the npm registry to resolve a dependency tree, downloads + extracts
-// tarballs into node_modules, writes .bin shims and qpm-lock.json.
+// the registry to resolve a dependency tree, downloads + extracts tarballs
+// (Quantum packages from the QPM registry into quantum_qubits/, npm packages
+// into node_modules/), writes .bin shims and qpm-lock.json.
 
 #include <string>
 #include <vector>

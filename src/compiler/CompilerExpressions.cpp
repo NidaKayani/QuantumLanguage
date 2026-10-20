@@ -169,9 +169,8 @@ void Compiler::compileAssign(AssignExpr &e, int line)
             if (it != cops.end())
                 emit(it->second, 0, line);
         }
-        emit(Op::DUP, 0, line);
+        // every store leaves the value on the stack: it is the expression's value
         emitStore(name, line);
-        emit(Op::POP, 0, line);
         return;
     }
 
@@ -299,8 +298,131 @@ void Compiler::compileAssign(AssignExpr &e, int line)
     compileExpr(*e.value);
 }
 
+// ─── Java intrinsics ─────────────────────────────────────────────────────────
+// The Java front-end lowers to calls of these names; each compiles to a few
+// instructions (no call). __jx_old__() stands for the value an __jx_aupd__ /
+// __jx_fupd__ update already pushed (it is the update's first operand).
+bool Compiler::compileJavaIntrinsic(CallExpr &e, int line)
+{
+    const std::string &fn = e.callee->as<Identifier>().name;
+    auto &a = e.args;
+    auto strArg = [&](size_t i) -> const std::string &
+    {
+        static const std::string none;
+        return i < a.size() && a[i]->is<StringLiteral>() ? a[i]->as<StringLiteral>().value : none;
+    };
+    auto opArg = [&](size_t i) -> int32_t
+    { return i < a.size() && a[i]->is<NumberLiteral>() ? (int32_t)a[i]->as<NumberLiteral>().value : 0; };
+    if (fn == "__jx_int__")
+    {
+        emit(Op::LOAD_CONST, addConst(QuantumValue::ofLong(std::stoll(strArg(0)))), line);
+        return true;
+    }
+    if (fn == "__jx_bin__" && a.size() == 3)
+    {
+        compileExpr(*a[1]);
+        compileExpr(*a[2]);
+        emit(Op::J_BIN, opArg(0), line);
+        return true;
+    }
+    if (fn == "__jx_un__" && a.size() == 2)
+    {
+        compileExpr(*a[1]);
+        emit(Op::J_UN, opArg(0), line);
+        return true;
+    }
+    if (fn == "__jx_inv__" && a.size() >= 2)
+    {
+        QuantumValue desc;
+        if (a[0]->is<ArrayLiteral>())
+        {
+            auto arr = std::make_shared<Array>();
+            for (auto &el : a[0]->as<ArrayLiteral>().elements)
+                arr->push_back(QuantumValue(el->as<StringLiteral>().value));
+            desc = QuantumValue(arr);
+        }
+        else
+            desc = QuantumValue(strArg(0));
+        int argc = (int)a.size() - 2;
+        emit(Op::LOAD_NIL, 0, line); // the callee slot J_INVOKE fills
+        for (size_t i = 1; i < a.size(); ++i)
+            compileExpr(*a[i]);
+        emit(Op::J_INVOKE, (addConst(desc) << 8) | argc, line);
+        return true;
+    }
+    if (fn == "__jx_getf__" && a.size() == 2)
+    {
+        compileExpr(*a[0]);
+        emit(Op::J_GETF, addStr(strArg(1)), line);
+        return true;
+    }
+    if (fn == "__jx_putf__" && a.size() == 3)
+    {
+        compileExpr(*a[0]);
+        compileExpr(*a[2]);
+        emit(Op::J_PUTF, addStr(strArg(1)), line);
+        return true;
+    }
+    if (fn == "__jx_fupd__" && a.size() == 3)
+    {
+        compileExpr(*a[0]);
+        emit(Op::DUP, 0, line);
+        emit(Op::J_GETF, addStr(strArg(1)), line);
+        compileExpr(*a[2]);
+        emit(Op::J_PUTF, addStr(strArg(1)), line);
+        return true;
+    }
+    if (fn == "__jx_aload__" && a.size() == 2)
+    {
+        compileExpr(*a[0]);
+        compileExpr(*a[1]);
+        emit(Op::J_ALOAD, 0, line);
+        return true;
+    }
+    if (fn == "__jx_astore__" && a.size() == 3)
+    {
+        compileExpr(*a[0]);
+        compileExpr(*a[1]);
+        compileExpr(*a[2]);
+        emit(Op::J_ASTORE, 0, line);
+        return true;
+    }
+    if (fn == "__jx_aupd__" && a.size() == 3)
+    {
+        compileExpr(*a[0]);
+        compileExpr(*a[1]);
+        emit(Op::DUP_TWO, 0, line);
+        emit(Op::J_ALOAD, 0, line);
+        compileExpr(*a[2]);
+        emit(Op::J_ASTORE, 0, line);
+        return true;
+    }
+    if (fn == "__jx_old__")
+        return true;
+    if (fn == "__jx_seq__" && !a.empty())
+    {
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            compileExpr(*a[i]);
+            if (i + 1 < a.size())
+                emit(Op::POP, 0, line);
+        }
+        return true;
+    }
+    if ((fn == "__jx_instof__" || fn == "__jx_cast__") && a.size() == 2)
+    {
+        compileExpr(*a[0]);
+        emit(fn == "__jx_cast__" ? Op::J_CAST : Op::J_INSTOF, addStr(strArg(1)), line);
+        return true;
+    }
+    return false;
+}
+
 void Compiler::compileCall(CallExpr &e, int line)
 {
+    if (e.callee->is<Identifier>() && e.callee->as<Identifier>().name.rfind("__jx_", 0) == 0 &&
+        compileJavaIntrinsic(e, line))
+        return;
     // `cout << x` segment (Parser::parseStreamInsertions): tell __cout__
     // whether x is declared a double (1) or an integer (2).
     if (e.callee->is<Identifier>() && e.callee->as<Identifier>().name == "__cout__" &&

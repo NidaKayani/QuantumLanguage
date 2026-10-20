@@ -111,7 +111,7 @@ namespace
             std::string name = p.filename().string();
             if (it->is_directory(ec))
             {
-                if (name.empty() || name[0] == '.' || name == "build" || name == "node_modules")
+                if (name.empty() || name[0] == '.' || name == "build" || name == "node_modules" || name == "quantum_qubits")
                     it.disable_recursion_pending();
                 continue;
             }
@@ -191,6 +191,30 @@ void printParseError(std::ostream &os, const std::string &path, const std::strin
 
 // ─── runFile — interpret a source file in-place (no exe created) ──────────────
 
+bool g_stageMarker = false;
+
+std::vector<char *> takeGlobalFlags(int argc, char *argv[])
+{
+    std::vector<char *> rest;
+    bool flagsDone = false;
+    for (int i = 0; i < argc; ++i)
+    {
+        std::string a = argv[i];
+        if (i > 0 && !flagsDone && a == "--strict")
+            g_strictMode = true;
+        else if (i > 0 && !flagsDone && a == "--stage-marker")
+            g_stageMarker = true;
+        else
+        {
+            if (i > 0 && hasSupportedExt(a))
+                flagsDone = true; // the script's own arguments follow
+            rest.push_back(argv[i]);
+        }
+    }
+    rest.push_back(nullptr);
+    return rest;
+}
+
 void runFile(const std::string &path, bool debug)
 {
     std::ifstream file(path);
@@ -207,12 +231,24 @@ void runFile(const std::string &path, bool debug)
     try
     {
         compiled = applyDialect(ss.str(), path);
+        auto chunk = compileSource(compiled, path, debug);
+        if (g_stageMarker)
+        {
+            std::cerr << kStageMarker;
+            std::cerr.flush();
+        }
         VM vm;
-        vm.run(compileSource(compiled, path, debug));
+        vm.run(chunk);
     }
     catch (const ParseError &e)
     {
         printParseError(std::cerr, path, ss.str(), compiled, e);
+        std::exit(1);
+    }
+    catch (const CompileError &e)
+    {
+        std::cerr << e.what();
+        std::cerr.flush();
         std::exit(1);
     }
     catch (const QuantumError &e)
@@ -246,13 +282,18 @@ int checkFile(const std::string &path)
     // C/C++: whatever compileSource would use — the typed front-end when the
     // program is within its subset
     const std::string ext = fileExtLower(path);
-    if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx") && !std::getenv("QUANTUM_OLD_CPP"))
+    if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx" || ext == ".java") && !std::getenv("QUANTUM_OLD_CPP"))
     {
         try
         {
             compileSource(ss.str(), path, false);
             std::cout << Colors::GREEN << "[OK] " << Colors::RESET << path << "\n";
             return 0;
+        }
+        catch (const CompileError &e)
+        {
+            std::cerr << e.what();
+            return 1;
         }
         catch (const QuantumError &e)
         {
@@ -311,7 +352,7 @@ void printHelp(const char *prog)
               << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
               << "  " << prog << " build [name] [--run]  Build a C/C++ project natively (= qpm build)\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
-              << "  Supported files: .sa .js .py .rb .c .cpp — all run natively on the\n"
+              << "  Supported files: .sa .js .py .rb .c .cpp .java — all run natively on the\n"
               << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
               << "  quantum hello.sa            → hello.exe created and run\n"
               << "  quantum prog.c              → prog.exe created and run (no gcc)\n"

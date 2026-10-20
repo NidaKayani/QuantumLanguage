@@ -8,7 +8,8 @@ enum class ValueType : uint8_t {
     VAL_NUMBER = 2,
     VAL_STRING = 3,
     VAL_ARRAY = 4,
-    VAL_CLOSURE = 5
+    VAL_CLOSURE = 5,
+    VAL_LONG = 6
 };
 
 template <typename T>
@@ -52,6 +53,9 @@ void Serializer::writeValue(std::vector<uint8_t>& out, const QuantumValue& val) 
     } else if (val.isNumber()) {
         writeRaw(out, ValueType::VAL_NUMBER);
         writeRaw(out, val.asNumber());
+    } else if (val.isLong()) {
+        writeRaw(out, ValueType::VAL_LONG);
+        writeRaw(out, val.asLong());
     } else if (val.isString()) {
         writeRaw(out, ValueType::VAL_STRING);
         writeString(out, val.asString());
@@ -79,6 +83,8 @@ QuantumValue Serializer::readValue(const std::vector<uint8_t>& data, size_t& off
             return QuantumValue(readRaw<uint8_t>(data, offset) != 0);
         case ValueType::VAL_NUMBER:
             return QuantumValue(readRaw<double>(data, offset));
+        case ValueType::VAL_LONG:
+            return QuantumValue::ofLong(readRaw<int64_t>(data, offset));
         case ValueType::VAL_STRING:
             return QuantumValue(readString(data, offset));
         case ValueType::VAL_ARRAY: {

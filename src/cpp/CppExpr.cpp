@@ -2,6 +2,9 @@
 // assignment, members, indexing, casts, lambdas, construction, calls with
 // overload resolution, conversions and copies. (See CppLower.cpp.)
 #include "CppLower.h"
+#include "JavaOps.h"
+
+#include <cstring>
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +14,59 @@
 
 namespace cpp
 {
+
+// 64-bit integers run as exact int64 values (narrower ones as doubles)
+static ASTNodePtr i64Const(int64_t v, int ln)
+{
+    std::vector<ASTNodePtr> a;
+    a.push_back(q::str(std::to_string(v), ln));
+    return q::call("__jx_int__", std::move(a), ln);
+}
+
+static ASTNodePtr jop1(int op, ASTNodePtr x, int ln)
+{
+    std::vector<ASTNodePtr> a;
+    a.push_back(q::num(op, ln));
+    a.push_back(std::move(x));
+    return q::call("__jx_un__", std::move(a), ln);
+}
+
+static ASTNodePtr jop2(int op, ASTNodePtr x, ASTNodePtr y, int ln)
+{
+    std::vector<ASTNodePtr> a;
+    a.push_back(q::num(op, ln));
+    a.push_back(std::move(x));
+    a.push_back(std::move(y));
+    return q::call("__jx_bin__", std::move(a), ln);
+}
+
+// The exact value of an integer literal's text (0x / 0b / octal, ' separators, suffixes)
+static bool literalValue(std::string s, uint64_t &out)
+{
+    s.erase(std::remove(s.begin(), s.end(), '\''), s.end());
+    while (!s.empty() && std::strchr("uUlLzZ", s.back()))
+        s.pop_back();
+    if (s.empty())
+        return false;
+    int base = 10;
+    size_t i = 0;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        base = 16, i = 2;
+    else if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B'))
+        base = 2, i = 2;
+    else if (s.size() > 1 && s[0] == '0')
+        base = 8, i = 1;
+    uint64_t v = 0;
+    for (; i < s.size(); ++i)
+    {
+        int d = std::isdigit((unsigned char)s[i]) ? s[i] - '0' : std::isxdigit((unsigned char)s[i]) ? std::tolower(s[i]) - 'a' + 10 : 99;
+        if (d >= base)
+            return false;
+        v = v * base + d;
+    }
+    out = v;
+    return true;
+}
 
 XV Lowerer::mkxv(ASTNodePtr v, TP t, bool temp)
 {
@@ -53,6 +109,14 @@ ASTNodePtr Lowerer::peekRead(const XV &x)
     case XV::StrCh:
     {
         std::vector<ASTNodePtr> a;
+        if (x.base->lk == XV::Idx && x.base->t->k == T::Str)
+        {
+            // a string held in a slot: read in place
+            a.push_back(q::clone(x.base->obj));
+            a.push_back(q::clone(x.base->key));
+            a.push_back(q::clone(x.key));
+            return q::call("__cpp_str_get__", std::move(a), ln);
+        }
         a.push_back(peekRead(*x.base));
         a.push_back(q::clone(x.key));
         return q::call("__cpp_str_at__", std::move(a), ln);
@@ -91,10 +155,28 @@ ASTNodePtr Lowerer::store(XV &t, ASTNodePtr value, int line)
     case XV::StrCh:
     {
         std::vector<ASTNodePtr> a;
-        a.push_back(peekRead(*t.base));
+        XV &b = *t.base;
+        if (b.t->k == T::CStr)
+        {
+            // through a char*: into the buffer it points into
+            a.push_back(peekRead(b));
+            a.push_back(q::clone(t.key));
+            a.push_back(std::move(value));
+            return q::call("__cpp_cs_put__", std::move(a), line);
+        }
+        if (b.lk == XV::Idx)
+        {
+            // a string held in a slot: written in place
+            a.push_back(q::clone(b.obj));
+            a.push_back(q::clone(b.key));
+            a.push_back(q::clone(t.key));
+            a.push_back(std::move(value));
+            return q::call("__cpp_str_put__", std::move(a), line);
+        }
+        a.push_back(peekRead(b));
         a.push_back(q::clone(t.key));
         a.push_back(std::move(value));
-        return store(*t.base, q::call("__cpp_str_set__", std::move(a), line), line);
+        return store(b, q::call("__cpp_str_set__", std::move(a), line), line);
     }
     case XV::RV:
         break;
@@ -107,8 +189,75 @@ ASTNodePtr Lowerer::store(XV &t, ASTNodePtr value, int line)
     unsupported("assignment to a value that is not an lvalue", line);
 }
 
+ASTNodePtr Lowerer::trackTemp(ASTNodePtr v, const TP &t, int line)
+{
+    if (tempsTracked_ < 0 || !t || t->k != T::Class || !t->cls || !needsDtor(t->cls))
+        return v;
+    ++tempsTracked_;
+    std::vector<ASTNodePtr> a;
+    a.push_back(std::move(v));
+    return q::call("__cpp_temp__", std::move(a), line);
+}
+
+void Lowerer::untrackTemp(XV &x)
+{
+    // the temporary is owned from here (a variable, a return value, a by-value parameter)
+    if (!x.v)
+        return;
+    if (auto *c = std::get_if<CallExpr>(&x.v->node))
+        if (c->callee && std::holds_alternative<Identifier>(c->callee->node) &&
+            std::get<Identifier>(c->callee->node).name == "__cpp_temp__" && c->args.size() == 1)
+        {
+            ASTNodePtr inner = std::move(c->args[0]);
+            x.v = std::move(inner);
+        }
+}
+
+ASTNodePtr Lowerer::endTemps(ASTNodePtr stmt, const std::string &mark, int line)
+{
+    std::vector<ASTNodePtr> st;
+    st.push_back(q::var(mark, q::call("__cpp_temps_mark__", {}, line), line));
+    if (stmt)
+        st.push_back(std::move(stmt));
+    std::vector<ASTNodePtr> a;
+    a.push_back(q::id(mark, line));
+    st.push_back(q::exprStmt(q::call("__cpp_temps_end__", std::move(a), line), line));
+    return q::block(std::move(st), line);
+}
+
 ASTNodePtr Lowerer::copyOf(XV x, int line)
 {
+    if (x.t->k == T::UPtr && !x.temp)
+    {
+        // a moved smart pointer leaves its source empty; a shared_ptr copy is one more owner
+        if (x.moved && x.lk != XV::RV)
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(peekRead(x));
+            a.push_back(store(x, q::nil(line), line));
+            return q::call("__cpp_first__", std::move(a), line);
+        }
+        if (x.t->name == "shared_ptr" && !x.moved)
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(read(x));
+            return q::call("__cpp_sp_copy__", std::move(a), line);
+        }
+    }
+    if (needsCopy(x.t) && !x.temp && !x.moved && x.t->k == T::Class && x.t->cls)
+        if (FuncInfo *cc = userCopyCtor(x.t->cls))
+        {
+            // a user copy constructor runs for every copy
+            ClassInfo *c = x.t->cls;
+            std::vector<ExprP> one(1);
+            std::vector<XV> lowered;
+            lowered.push_back(std::move(x));
+            std::vector<ASTNodePtr> al;
+            al.push_back(q::id(c->desc(), line));
+            al.push_back(q::num(c->nslots, line));
+            XV r = callArgs(cc, one, q::call("__cpp_alloc__", std::move(al), line), line, false, &lowered);
+            return read(r);
+        }
     if (needsCopy(x.t) && !x.temp && !x.moved)
     {
         std::vector<ASTNodePtr> a;
@@ -232,6 +381,8 @@ int Lowerer::convCost(const TP &from, const TP &to, const XV *x)
     }
     if (from->k == T::CStr && to->k == T::Str)
         return 2;
+    if (isCBuf(from) && to->k == T::CStr)
+        return 1; // array-to-pointer
     if (from->k == T::Str && to->k == T::CStr)
         return 9;
     if (from->k == T::Nullptr && (to->k == T::Ptr || to->k == T::UPtr || to->k == T::Func || to->k == T::CStr ||
@@ -302,13 +453,31 @@ int Lowerer::convCost(const TP &from, const TP &to, const XV *x)
 XV Lowerer::convert(XV x, const TP &to, int line, bool forInit)
 {
     (void)forInit;
+    if (x.alloc && to)
+    {
+        if (to->k == T::Ptr && !to->a.empty() && to->a[0]->k != T::Void && to->a[0]->k != T::Dyn)
+            return materializeAlloc(x, to->a[0], line);
+        if (to->k == T::CStr)
+            return materializeAlloc(x, tChar(), line);
+    }
     if (!to || to->k == T::Dyn || to->k == T::Void)
         return x;
     const TP from = x.t;
-    if (from->k == T::Dyn)
+    if (from->k == T::Dyn && !(x.isFuncName && to->k == T::Func))
     {
         x.t = to;
         return x;
+    }
+    // a char buffer decays to a char* into it; a char* or char buffer read
+    // as a std::string is the C string up to its NUL
+    if (isCBuf(from) && to->k == T::CStr)
+        return mkxv(charPtr(x, line), to);
+    if (to->k == T::Str && !isCBuf(to) &&
+        (isCBuf(from) || (from->k == T::CStr && !(x.v && std::holds_alternative<StringLiteral>(x.v->node)))))
+    {
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(x));
+        return mkxv(q::call("__cpp_cs_str__", std::move(a), line), to);
     }
     if (x.isFuncName && to->k == T::Func)
     {
@@ -326,7 +495,48 @@ XV Lowerer::convert(XV x, const TP &to, int line, bool forInit)
     }
     if (sameType(from, to))
         return x;
+    // to / from a 64-bit integer: an exact int64 value
+    if (isI64(to) && !isI64(from) && isArith(from))
+    {
+        if (x.v && std::holds_alternative<NumberLiteral>(x.v->node) && !isFloat(from))
+            return mkxv(i64Const((int64_t)std::get<NumberLiteral>(x.v->node).value, line), to);
+        return mkxv(jop1(jop::D2L, read(x), line), to);
+    }
+    if (isI64(from) && !isI64(to) && isArith(to) && to->k != T::Bool && to->k != T::Enum)
+    {
+        ASTNodePtr v = read(x);
+        long bytes = sizeOfType(to);
+        if (isFloat(to))
+            return mkxv(jop1(jop::I2D, std::move(v), line), to);
+        if (to->isUnsigned && bytes < 8)
+            v = jop2(jop::LAND, std::move(v), i64Const(bytes >= 4 ? 4294967295LL : bytes == 2 ? 65535 : 255, line), line);
+        else if (bytes == 1)
+            v = jop1(jop::I2B, std::move(v), line);
+        else if (bytes == 2)
+            v = jop1(jop::I2S, std::move(v), line);
+        else if (bytes == 4)
+            v = jop1(jop::L2I, std::move(v), line);
+        if (bytes < 8)
+            v = jop1(jop::I2D, std::move(v), line);
+        return mkxv(std::move(v), to);
+    }
     auto num = [&](XV &v) { return read(v); };
+    if ((isArith(to) && to->k != T::Bool) && !explicitConv_ &&
+        (from->k == T::CStr || from->k == T::Str || from->k == T::Ptr || from->k == T::Vector || from->k == T::Map ||
+         from->k == T::Set || from->k == T::Pair || from->k == T::Tuple || from->k == T::Func || from->k == T::Iter ||
+         from->k == T::Array || from->k == T::Stream))
+    {
+        bool ptrish = from->k == T::CStr || from->k == T::Ptr || from->k == T::Array || (isCBuf(from));
+        if (prog_.cMode)
+            unsupported(ptrish ? "initialization of '" + diagType(to) + "' from '" + diagType(from) +
+                                     "' makes integer from pointer without a cast [-Wint-conversion]"
+                               : "incompatible types when initializing type '" + diagType(to) + "' using type '" +
+                                     diagType(from) + "'",
+                        line);
+        unsupported(ptrish ? "invalid conversion from '" + diagType(from) + "' to '" + diagType(to) + "' [-fpermissive]"
+                           : "cannot convert '" + diagType(from) + "' to '" + diagType(to) + "'",
+                    line);
+    }
     switch (to->k)
     {
     case T::Int:
@@ -408,7 +618,7 @@ XV Lowerer::convert(XV x, const TP &to, int line, bool forInit)
             std::vector<ASTNodePtr> e;
             e.push_back(read(x));
             e.push_back(q::num(0, line));
-            if (isObjectRep(to->a[0]))
+            if (isObjectRep(to->a[0]) && to->a[0]->k != T::Array)
             {
                 std::vector<ASTNodePtr> a;
                 a.push_back(q::arr(std::move(e), line));
@@ -582,6 +792,83 @@ ASTNodePtr Lowerer::toBool(XV x, int line)
 
 XV Lowerer::localXV(Local *l)
 {
+    XV x = localXVRaw(l);
+    if (l->isConst)
+    {
+        x.constLv = true;
+        x.constName = "variable '" + l->name + "'";
+    }
+    return x;
+}
+
+bool Lowerer::stdVisible(const std::string &name, Scope *sc)
+{
+    for (Scope *s = sc; s; s = s->parent)
+    {
+        if (s == std_)
+            return true;
+        for (Scope *u : s->usings)
+            if (u == std_)
+                return true;
+        auto ud = s->usingDecls.find(name);
+        if (ud != s->usingDecls.end() && ud->second.aliasDecl && !ud->second.aliasDecl->name.empty() &&
+            ud->second.aliasDecl->name[0] == "std")
+            return true;
+    }
+    return false;
+}
+
+void Lowerer::checkAccess(ClassInfo *owner, const std::string &access, const std::string &what, int line)
+{
+    if (access == "public" || !owner)
+        return;
+    std::function<bool(ClassInfo *)> derives = [&](ClassInfo *c)
+    {
+        for (ClassInfo *b : c->bases)
+            if (b == owner || derives(b))
+                return true;
+        return false;
+    };
+    // members of the class (and of classes nested in it), and for protected
+    // ones of derived classes; friends
+    for (FnCtx *f = fn_; f; f = f->parent)
+        for (ClassInfo *c = f->cls; c; c = c->outer ? c->outer->cls : nullptr)
+        {
+            if (c == owner || (access == "protected" && derives(c)) || owner->friends.count(c->name))
+                return;
+        }
+    if (curFn_ && owner->friends.count(curFn_->name))
+        return;
+    unsupported("'" + what + "' is " + access + " within this context", line);
+}
+
+std::string Lowerer::diagType(const TP &t)
+{
+    if (!t)
+        return "?";
+    switch (t->k)
+    {
+    case T::Str:
+        return isCBuf(t) ? "char [" + std::to_string(std::max(0L, t->n)) + "]" : "std::string";
+    case T::CStr:
+        return prog_.cMode ? "char *" : "const char*";
+    case T::Ptr:
+        return (t->a.empty() ? std::string("void") : diagType(t->a[0])) + "*";
+    case T::Class:
+        return t->cls ? t->cls->name : "?";
+    case T::Void:
+        return "void";
+    case T::Bool:
+        return "bool";
+    case T::Vector: case T::Map: case T::Set:
+        return "std::" + t->name + "<...>";
+    default:
+        return t->name.empty() ? t->str() : t->name;
+    }
+}
+
+XV Lowerer::localXVRaw(Local *l)
+{
     XV x;
     x.t = l->t;
     if (l->alias)
@@ -677,7 +964,13 @@ XV Lowerer::lowerName(const ExprP &e)
             {
                 XV x;
                 x.t = f->type;
-                if (f->isStatic)
+                if (f->isStatic && isCBuf(f->type))
+                {
+                    x.lk = XV::Idx;
+                    x.obj = q::id(f->global, ln);
+                    x.key = q::num(0, ln);
+                }
+                else if (f->isStatic)
                 {
                     x.lk = XV::Var;
                     x.var = f->global;
@@ -715,6 +1008,18 @@ XV Lowerer::lowerName(const ExprP &e)
             x.t = s->type ? s->type : tDyn();
             x.lk = XV::Var;
             x.var = s->global;
+            if (s->isConst)
+            {
+                x.constLv = true;
+                x.constName = "variable '" + name.back() + "'";
+            }
+            if (isCBuf(x.t))
+            {
+                // a char buffer: in a cell
+                x.lk = XV::Idx;
+                x.obj = q::id(s->global, ln);
+                x.key = q::num(0, ln);
+            }
             return x;
         }
         case Symbol::Enumerator:
@@ -744,7 +1049,243 @@ XV Lowerer::lowerName(const ExprP &e)
     unsupported("unknown name '" + full + "'", ln);
 }
 
+// ─── Sizes and the heap ────────────────────────────────────────────────────
+
+long Lowerer::alignOfType(const TP &t)
+{
+    switch (t->k)
+    {
+    case T::Char:
+    case T::Bool:
+        return 1;
+    case T::Str:
+        return isCBuf(t) ? 1 : 8;
+    case T::Int:
+    case T::Float:
+    case T::Enum:
+        return std::min(sizeOfType(t), 16L);
+    case T::Array:
+        return t->a.empty() ? 1 : alignOfType(t->a[0]);
+    case T::Class:
+    {
+        long al = 1;
+        if (t->cls)
+        {
+            for (ClassInfo *b : t->cls->bases)
+            {
+                auto bt = mkT(T::Class);
+                bt->cls = b;
+                al = std::max(al, alignOfType(bt));
+            }
+            for (auto &f : t->cls->fields)
+                if (!f.isStatic && f.type)
+                    al = std::max(al, alignOfType(f.type));
+            if (t->cls->polymorphic)
+                al = std::max(al, 8L);
+        }
+        return al;
+    }
+    case T::Pair:
+    case T::Tuple:
+    {
+        long al = 1;
+        for (auto &x : t->a)
+            al = std::max(al, alignOfType(x));
+        return al;
+    }
+    default:
+        return 8;
+    }
+}
+
+long Lowerer::sizeOfType(const TP &t)
+{
+    auto roundUp = [](long n, long a) { return a > 1 ? (n + a - 1) / a * a : n; };
+    switch (t->k)
+    {
+    case T::Char:
+    case T::Bool:
+        return 1;
+    case T::Int:
+        if (t->name.find("long long") != std::string::npos || t->name == "size_t" || t->name.find("int64") != std::string::npos ||
+            t->name.find("ptrdiff") != std::string::npos)
+            return 8;
+        if (t->name.find("short") != std::string::npos || t->name.find("int16") != std::string::npos)
+            return 2;
+        if (t->name.find("int8") != std::string::npos)
+            return 1;
+        return 4; // int, long (LLP64)
+    case T::Float:
+        return t->name == "float" ? 4 : t->name == "long double" ? 16 : 8;
+    case T::Enum:
+        return 4;
+    case T::Array:
+        return t->n > 0 && !t->a.empty() ? t->n * sizeOfType(t->a[0]) : 0;
+    case T::Str:
+        return isCBuf(t) ? std::max(0L, t->n) : 32;
+    case T::Vector:
+        return t->name == "vector" ? 24 : t->name == "deque" ? 80 : t->name == "list" ? 24 : 40;
+    case T::Map:
+    case T::Set:
+        return t->sorted ? 48 : 56;
+    case T::Pair:
+    case T::Tuple:
+    {
+        long off = 0;
+        for (auto &x : t->a)
+            off = roundUp(off, alignOfType(x)) + sizeOfType(x);
+        return std::max(1L, roundUp(off, alignOfType(t)));
+    }
+    case T::Class:
+    {
+        if (!t->cls)
+            return 1;
+        long off = t->cls->polymorphic && t->cls->bases.empty() ? 8 : 0;
+        for (ClassInfo *b : t->cls->bases)
+        {
+            auto bt = mkT(T::Class);
+            bt->cls = b;
+            off = roundUp(off, alignOfType(bt)) + sizeOfType(bt);
+        }
+        bool any = off > 0;
+        long start = off;
+        for (auto &f : t->cls->fields)
+        {
+            if (f.isStatic || !f.type)
+                continue;
+            if (t->cls->isUnion)
+                off = std::max(off, roundUp(start, alignOfType(f.type)) + sizeOfType(f.type)); // overlaid
+            else
+                off = roundUp(off, alignOfType(f.type)) + sizeOfType(f.type);
+            any = true;
+        }
+        return any ? roundUp(off, alignOfType(t)) : 1;
+    }
+    default:
+        return 8; // pointers, references, functions, smart pointers
+    }
+}
+
+XV Lowerer::materializeAlloc(XV &x, const TP &elem, int line)
+{
+    std::shared_ptr<XV::Alloc> a = x.alloc;
+    x.alloc = nullptr;
+    TP pt = mkT(T::Ptr);
+    pt->a.push_back(elem);
+    // char blocks are strings in this model
+    if (elem->k == T::Char)
+    {
+        std::vector<ASTNodePtr> s;
+        if (a->old)
+        {
+            s.push_back(std::move(*a->old));
+            return mkxv(q::call("__cpp_cs_realloc__", std::move(s), line), tCStr());
+        }
+        std::vector<ASTNodePtr> e;
+        e.push_back(q::str("", line));
+        s.push_back(std::move(*a->bytes));
+        s.push_back(q::call("__cpp_cs_new__", std::move(e), line));
+        return mkxv(q::call("__cpp_seq__", std::move(s), line), tCStr());
+    }
+    std::vector<ASTNodePtr> args;
+    if (a->old)
+        args.push_back(std::move(*a->old));
+    args.push_back(std::move(*a->bytes));
+    args.push_back(q::num((double)std::max(1L, sizeOfType(elem)), line));
+    args.push_back(defaultValue(elem, line));
+    args.push_back(planFor(elem));
+    args.push_back(q::boolean(elem->k == T::Class, line));
+    return mkxv(q::call(a->old ? "__cpp_realloc__" : "__cpp_malloc__", std::move(args), line), pt);
+}
+
 // ─── Operators ─────────────────────────────────────────────────────────────
+
+ASTNodePtr Lowerer::charPtr(XV &x, int line)
+{
+    // a string held in a slot: [container, key, 0] points into it
+    if (x.t->k == T::Str && x.lk == XV::Idx)
+    {
+        std::vector<ASTNodePtr> e;
+        e.push_back(q::clone(x.obj));
+        e.push_back(q::clone(x.key));
+        e.push_back(q::num(0, line));
+        return q::arr(std::move(e), line);
+    }
+    return read(x);
+}
+
+long Lowerer::bufInitSize(const std::vector<ExprP> &args, bool braced)
+{
+    // char s[] = "abc" / {"abc"}: 4;  char s[] = {'a', 'b'}: 2
+    if (args.size() == 1 && args[0]->k == EK::Str)
+        return (long)args[0]->str.size() + 1;
+    if (args.size() == 1 && args[0]->k == EK::InitList)
+        return bufInitSize(args[0]->kids, true);
+    return braced ? (long)args.size() : -1;
+}
+
+long Lowerer::initSlots(const TP &t)
+{
+    if (t->k == T::Array && !t->a.empty())
+        return std::max(t->n, 1L) * initSlots(t->a[0]);
+    if (t->k == T::Class && t->cls && t->cls->aggregate && t->cls->ctors.empty())
+    {
+        long n = 0;
+        for (ClassInfo *b : t->cls->bases)
+        {
+            auto bt = mkT(T::Class);
+            bt->cls = b;
+            n += initSlots(bt);
+        }
+        for (auto &f : t->cls->fields)
+            if (!f.isStatic)
+                n += initSlots(f.type);
+        return std::max(n, 1L);
+    }
+    return 1;
+}
+
+long Lowerer::arrayInitSize(const TP &t, const std::vector<ExprP> &args, bool braced)
+{
+    // int a[] = {1, 2, 3}: 3;  int m[][2] = {{1, 2}, {3, 4}} or {1, 2, 3, 4}: 2 rows
+    const std::vector<ExprP> *kids = &args;
+    if (!braced && args.size() == 1 && args[0]->k == EK::InitList)
+        kids = &args[0]->kids;
+    else if (!braced)
+        return -1;
+    TP et = t->a.empty() ? tDyn() : t->a[0];
+    bool designated = false;
+    for (auto &k : *kids)
+        designated = designated || k->designIndex;
+    if (designated)
+    {
+        long pos = 0, end = 0;
+        for (auto &k : *kids)
+        {
+            if (k->designIndex)
+                pos = (long)evalConst(k->designIndex, currentScope());
+            end = std::max(end, ++pos);
+        }
+        return end;
+    }
+    if (et->k != T::Array)
+        return (long)kids->size();
+    long perRow = 1;
+    for (TP r = et; r->k == T::Array && !r->a.empty(); r = r->a[0])
+        perRow *= std::max(r->n, 1L);
+    long rows = 0, loose = 0;
+    for (auto &k : *kids)
+    {
+        if (k->k == EK::InitList)
+        {
+            rows += (loose + perRow - 1) / perRow + 1;
+            loose = 0;
+        }
+        else
+            ++loose;
+    }
+    return rows + (loose + perRow - 1) / perRow;
+}
 
 XV Lowerer::addressOf(XV x, int line)
 {
@@ -752,6 +1293,17 @@ XV Lowerer::addressOf(XV x, int line)
         return convert(std::move(x), mkT(T::Func), line);
     auto pt = mkT(T::Ptr);
     pt->a.push_back(x.t);
+    if (x.t->k == T::Array)
+    {
+        // pointers to arrays are [block, offset] references (a decayed 2-D
+        // array is one too): &arr is a one-element block holding it
+        std::vector<ASTNodePtr> cell;
+        cell.push_back(read(x));
+        std::vector<ASTNodePtr> e;
+        e.push_back(q::arr(std::move(cell), line));
+        e.push_back(q::num(0, line));
+        return mkxv(q::arr(std::move(e), line), pt);
+    }
     if (isObjectRep(x.t))
     {
         XV r = mkxv(read(x), pt);
@@ -789,7 +1341,25 @@ XV Lowerer::addressOf(XV x, int line)
         return mkxv(q::arr(std::move(e), line), pt);
     }
     case XV::StrCh:
+    {
+        // &buf[i]: a char* into the buffer
+        XV &b = *x.base;
+        std::vector<ASTNodePtr> e;
+        if (b.t->k == T::CStr)
+        {
+            e.push_back(peekRead(b));
+            e.push_back(q::clone(x.key));
+            return mkxv(q::call("__cpp_cs_add__", std::move(e), line), tCStr());
+        }
+        if (b.lk == XV::Idx)
+        {
+            e.push_back(q::clone(b.obj));
+            e.push_back(q::clone(b.key));
+            e.push_back(q::clone(x.key));
+            return mkxv(q::arr(std::move(e), line), tCStr());
+        }
         unsupported("pointer into a std::string", line);
+    }
     case XV::RV:
     {
         std::vector<ASTNodePtr> cell;
@@ -811,7 +1381,7 @@ XV Lowerer::derefXV(XV x, int line)
     {
     case T::Ptr:
     case T::UPtr:
-        if (isObjectRep(inner) || inner->k == T::Func)
+        if ((isObjectRep(inner) && !(t->k == T::Ptr && inner->k == T::Array)) || inner->k == T::Func)
         {
             XV r = mkxv(read(x), inner, false);
             return r;
@@ -846,10 +1416,12 @@ XV Lowerer::derefXV(XV x, int line)
     }
     case T::CStr:
     {
-        std::vector<ASTNodePtr> a;
-        a.push_back(read(x));
-        a.push_back(q::num(0, line));
-        return mkxv(q::call("__cpp_str_at__", std::move(a), line), tChar());
+        XV res;
+        res.t = tChar();
+        res.lk = XV::StrCh;
+        res.base = std::make_shared<XV>(mkxv(simple(read(x), line), t));
+        res.key = q::num(0, line);
+        return res;
     }
     case T::Func:
         return x;
@@ -889,10 +1461,43 @@ XV Lowerer::incdec(XV x, bool inc, bool postfix, int line)
         b.push_back(q::num(inc ? -1 : 1, line));
         return mkxv(q::call(t->k == T::Iter ? "__cpp_it_add__" : "__cpp_ref_add__", std::move(b), line), t);
     }
+    if (t->k == T::CStr)
+    {
+        // char*: p++ yields the saved old pointer
+        std::vector<ASTNodePtr> a;
+        a.push_back(std::move(cur));
+        a.push_back(q::num(inc ? 1 : -1, line));
+        ASTNodePtr st = store(x, q::call("__cpp_cs_add__", std::move(a), line), line);
+        if (!postfix)
+            return mkxv(std::move(st), t);
+        std::vector<ASTNodePtr> b;
+        b.push_back(peekRead(x));
+        b.push_back(std::move(st));
+        return mkxv(q::call("__cpp_first__", std::move(b), line), t);
+    }
     if (t->k == T::Bool)
         next = q::boolean(inc, line);
     else
         next = q::bin(op, std::move(cur), q::num(1, line), line);
+    if (isIntegral(t) && t->isUnsigned && t->k != T::Bool)
+    {
+        // unsigned arithmetic wraps around (unsigned u = 0; u--;)
+        long bytes = sizeOfType(t);
+        if (bytes < 8)
+        {
+            std::vector<ASTNodePtr> w;
+            w.push_back(std::move(next));
+            w.push_back(q::num(std::ldexp(1.0, (int)(8 * bytes)), line));
+            next = q::call("__cpp_wrap__", std::move(w), line);
+        }
+        else
+        {
+            std::vector<ASTNodePtr> w;
+            w.push_back(std::move(next));
+            w.push_back(q::str(t->name, line));
+            next = q::call("__cpp_uwrap__", std::move(w), line);
+        }
+    }
     ASTNodePtr st = store(x, std::move(next), line);
     if (!postfix)
         return mkxv(std::move(st), t);
@@ -996,21 +1601,62 @@ XV Lowerer::userOperator(const std::string &op, std::vector<ExprP> &operands, st
 XV Lowerer::arith(const std::string &op, XV a, XV b, int line)
 {
     TP ta = a.t, tb = b.t;
-    // strings
-    if (op == "+" && (isStringy(ta) || isStringy(tb)) && !(ta->k == T::CStr && isIntegral(tb)) &&
-        !(tb->k == T::CStr && isIntegral(ta) && ta->k != T::Char))
+    // char* / char buffers: pointer arithmetic
+    auto cptrT = [](const TP &t) { return t->k == T::CStr || isCBuf(t); };
+    if (cptrT(ta) && isIntegral(tb) && (op == "+" || op == "-"))
     {
-        ASTNodePtr l = ta->k == T::Char ? chr(read(a), line) : read(a);
-        ASTNodePtr r = tb->k == T::Char ? chr(read(b), line) : read(b);
-        return mkxv(q::bin("+", std::move(l), std::move(r), line), tStr());
-    }
-    if (ta->k == T::CStr && isIntegral(tb) && (op == "+" || op == "-"))
-    {
+        a = convert(std::move(a), tCStr(), line);
         std::vector<ASTNodePtr> args;
         args.push_back(read(a));
         args.push_back(op == "-" ? q::un("-", read(b), line) : read(b));
-        return mkxv(q::call("__cpp_str_from__", std::move(args), line), tCStr());
+        return mkxv(q::call("__cpp_cs_add__", std::move(args), line), tCStr());
     }
+    if (cptrT(tb) && isIntegral(ta) && ta->k != T::Char && op == "+")
+        return arith(op, std::move(b), std::move(a), line);
+    if (cptrT(ta) && cptrT(tb) && op == "-")
+    {
+        a = convert(std::move(a), tCStr(), line);
+        b = convert(std::move(b), tCStr(), line);
+        std::vector<ASTNodePtr> args;
+        args.push_back(read(a));
+        args.push_back(read(b));
+        return mkxv(q::call("__cpp_cs_diff__", std::move(args), line), mkT(T::Int, "long long"));
+    }
+    auto stdStr = [](const TP &t) { return t->k == T::Str && !isCBuf(t); };
+    if ((stdStr(ta) || stdStr(tb)) && ta->k != T::Dyn && tb->k != T::Dyn && ta->k != T::Class && tb->k != T::Class &&
+        !(op == "+" && (isStringy(ta) || ta->k == T::Char) && (isStringy(tb) || tb->k == T::Char)))
+        unsupported("no match for 'operator" + op + "' (operand types are '" + diagType(ta) + "' and '" + diagType(tb) +
+                        "')",
+                    line);
+    // strings
+    if (op == "+" && (isStringy(ta) || isStringy(tb)))
+    {
+        auto text = [&](XV &x) -> ASTNodePtr
+        {
+            if (x.t->k == T::Char)
+                return chr(read(x), line);
+            if (isCBuf(x.t) || (x.t->k == T::CStr && !(x.v && std::holds_alternative<StringLiteral>(x.v->node))))
+            {
+                std::vector<ASTNodePtr> c;
+                c.push_back(read(x));
+                return q::call("__cpp_cs_str__", std::move(c), line);
+            }
+            return read(x);
+        };
+        ASTNodePtr l = text(a);
+        ASTNodePtr r = text(b);
+        return mkxv(q::bin("+", std::move(l), std::move(r), line), tStr());
+    }
+    // a C array in arithmetic is a pointer to its first element
+    if (ta->k == T::Array && !ta->a.empty() && (op == "+" || op == "-") && isIntegral(tb))
+    {
+        auto pt = mkT(T::Ptr);
+        pt->a.push_back(ta->a[0]);
+        a = convert(std::move(a), pt, line);
+        ta = a.t;
+    }
+    if (tb->k == T::Array && !tb->a.empty() && op == "+" && isIntegral(ta))
+        return arith(op, std::move(b), std::move(a), line);
     // pointers / iterators
     if ((ta->k == T::Ptr || ta->k == T::Iter) && (op == "+" || op == "-") && isIntegral(tb))
     {
@@ -1021,6 +1667,18 @@ XV Lowerer::arith(const std::string &op, XV a, XV b, int line)
     }
     if (tb->k == T::Iter && op == "+" && isIntegral(ta))
         return arith(op, std::move(b), std::move(a), line);
+    if (op == "-" && ((ta->k == T::Ptr && tb->k == T::Array) || (ta->k == T::Array && tb->k == T::Ptr)))
+    {
+        // p - arr: the array is a pointer to its first element
+        auto pt = mkT(T::Ptr);
+        pt->a.push_back(ta->k == T::Ptr ? (ta->a.empty() ? tDyn() : ta->a[0]) : tb->a.empty() ? tDyn() : tb->a[0]);
+        if (ta->k == T::Array)
+            a = convert(std::move(a), pt, line);
+        else
+            b = convert(std::move(b), pt, line);
+        ta = a.t;
+        tb = b.t;
+    }
     if ((ta->k == T::Ptr || ta->k == T::Iter) && op == "-" && (tb->k == T::Ptr || tb->k == T::Iter))
     {
         std::vector<ASTNodePtr> args;
@@ -1089,6 +1747,39 @@ XV Lowerer::compareOp(const std::string &op, XV a, XV b, int line)
         return viaNative("__cpp_same__", op == "!="); // refs compare by (container, key)
     if ((ta->k == T::CStr && tb->k == T::Nullptr) || (tb->k == T::CStr && ta->k == T::Nullptr))
         return viaNative("__cpp_same__", op == "!=");
+    // char* / char buffers: by position
+    auto cptrT = [](const TP &t) { return t->k == T::CStr || isCBuf(t); };
+    if (cptrT(ta) && cptrT(tb) && (ta->k == T::CStr || tb->k == T::CStr || prog_.cMode))
+    {
+        a = convert(std::move(a), tCStr(), line);
+        b = convert(std::move(b), tCStr(), line);
+        if (op == "==" || op == "!=")
+            return viaNative("__cpp_same__", op == "!=");
+        std::vector<ASTNodePtr> args;
+        args.push_back(read(a));
+        args.push_back(read(b));
+        return mkxv(q::bin(op, q::call("__cpp_cs_diff__", std::move(args), line), q::num(0, line), line), tBool());
+    }
+    // std::string vs char*: by text
+    if (ta->k == T::Str && !isCBuf(ta) && tb->k == T::CStr)
+        b = convert(std::move(b), ta, line);
+    if (tb->k == T::Str && !isCBuf(tb) && ta->k == T::CStr)
+        a = convert(std::move(a), tb, line);
+    // pointers into the same block: compared by offset
+    if ((ta->k == T::Ptr || ta->k == T::Array) && (tb->k == T::Ptr || tb->k == T::Array) &&
+        (op == "<" || op == "<=" || op == ">" || op == ">="))
+    {
+        auto pt = mkT(T::Ptr);
+        pt->a.push_back(ta->k == T::Ptr ? (ta->a.empty() ? tDyn() : ta->a[0]) : ta->a[0]);
+        if (ta->k == T::Array)
+            a = convert(std::move(a), pt, line);
+        if (tb->k == T::Array)
+            b = convert(std::move(b), pt, line);
+        std::vector<ASTNodePtr> args;
+        args.push_back(read(a));
+        args.push_back(read(b));
+        return mkxv(q::bin(op, q::call("__cpp_it_diff__", std::move(args), line), q::num(0, line), line), tBool());
+    }
     if (ta->k == T::Iter || tb->k == T::Iter)
     {
         if (op == "==" || op == "!=")
@@ -1135,6 +1826,8 @@ XV Lowerer::lowerUnary(const ExprP &e)
     if (op == "++" || op == "--")
     {
         XV x = lowerExpr(e->kids[0]);
+        if (x.constLv)
+            unsupported(std::string(op == "++" ? "increment" : "decrement") + " of read-only " + x.constName, ln);
         if (x.t->k == T::Class)
         {
             std::vector<ExprP> ops = {e->kids[0]};
@@ -1331,6 +2024,8 @@ XV Lowerer::lowerAssign(const ExprP &e)
     int ln = e->line;
     std::string op = e->op;
     XV t = lowerExpr(e->kids[0]);
+    if (t.constLv)
+        unsupported("assignment of read-only " + t.constName, ln);
     if (t.t->k == T::Dyn && t.t->name == "tie" && op == "=")
     {
         // std::tie(a, b) = pair / tuple
@@ -1382,6 +2077,15 @@ XV Lowerer::lowerAssign(const ExprP &e)
         v = convert(std::move(v), t.t, ln);
         ASTNodePtr val = copyOf(std::move(v), ln);
         TP tt = t.t;
+        if (tt->k == T::UPtr && ownsResource(tt) && canHoist_ && pre_)
+        {
+            // the old pointee is released after the new one is in place
+            ASTNodePtr old = simple(peekRead(t), ln);
+            std::vector<ASTNodePtr> a;
+            a.push_back(store(t, std::move(val), ln));
+            a.push_back(destroyValue(tt, std::move(old), ln));
+            return mkxv(q::call("__cpp_first__", std::move(a), ln), tt, false);
+        }
         return mkxv(store(t, std::move(val), ln), tt, false);
     }
     // compound: a op= b  →  a = a op b
@@ -1405,11 +2109,15 @@ XV Lowerer::lowerAssign(const ExprP &e)
 XV Lowerer::fieldOf(XV obj, ClassInfo *c, const std::string &name, int line, bool &found)
 {
     found = false;
+    ClassInfo *owner = nullptr;
     std::function<FieldInfo *(ClassInfo *)> field = [&](ClassInfo *k) -> FieldInfo *
     {
         for (auto &f : k->fields)
             if (f.name == name)
+            {
+                owner = k;
                 return &f;
+            }
         for (ClassInfo *b : k->bases)
             if (FieldInfo *f = field(b))
                 return f;
@@ -1419,8 +2127,14 @@ XV Lowerer::fieldOf(XV obj, ClassInfo *c, const std::string &name, int line, boo
     if (!f)
         return obj;
     found = true;
+    checkAccess(owner, f->access, diagType(f->type) + " " + owner->name + "::" + name, line);
     XV x;
     x.t = f->type;
+    if (f->isConst)
+    {
+        x.constLv = true;
+        x.constName = "member '" + owner->name + "::" + name + "'";
+    }
     if (f->isStatic)
     {
         x.lk = XV::Var;
@@ -1524,6 +2238,14 @@ XV Lowerer::lowerIndex(const ExprP &e)
         XV x;
         x.t = tChar();
         ASTNodePtr key = simple(read(i), ln);
+        if (t->k == T::CStr)
+        {
+            // through a char*: writes reach the buffer it points into
+            x.lk = XV::StrCh;
+            x.base = std::make_shared<XV>(mkxv(simple(read(obj), ln), t));
+            x.key = std::move(key);
+            return x;
+        }
         if (obj.lk != XV::RV && t->k == T::Str)
         {
             auto base = std::make_shared<XV>(std::move(obj));
@@ -1601,7 +2323,7 @@ XV Lowerer::lowerCast(const ExprP &e)
     if (to->k == T::Class && x.t->k != T::Class)
     {
         std::vector<ExprP> args = e->kids;
-        return mkxv(ctorCall(to->cls, args, false, ln), to);
+        return mkxv(trackTemp(ctorCall(to->cls, args, false, ln), to, ln), to);
     }
     if (to->k == T::Ptr && x.t->k == T::Ptr)
     {
@@ -1613,7 +2335,10 @@ XV Lowerer::lowerCast(const ExprP &e)
         x.t = to;
         return x;
     }
+    bool savedExplicit = explicitConv_;
+    explicitConv_ = true;
     XV r = convert(std::move(x), to, ln);
+    explicitConv_ = savedExplicit;
     r.t = to;
     r.temp = true;
     return r;
@@ -1624,7 +2349,98 @@ TP Lowerer::lambdaReturn(const LambdaP &l)
     return l->ret ? resolveType(l->ret, currentScope()) : tDyn();
 }
 
+// The single names an expression / statement mentions (nested lambdas included)
+static void namesUsed(const ExprP &e, std::set<std::string> &out);
+static void namesUsed(const StmtP &s, std::set<std::string> &out)
+{
+    if (!s)
+        return;
+    namesUsed(s->expr, out);
+    for (const auto &d : s->decls)
+        for (const auto &a : d.args)
+            namesUsed(a, out);
+    for (const auto &b : s->body)
+        namesUsed(b, out);
+    namesUsed(s->init, out);
+    namesUsed(s->then, out);
+    namesUsed(s->els, out);
+    namesUsed(s->cond2, out);
+    namesUsed(s->step, out);
+    namesUsed(s->condDecl, out);
+    for (const auto &c : s->catches)
+        namesUsed(c.body, out);
+}
+static void namesUsed(const ExprP &e, std::set<std::string> &out)
+{
+    if (!e)
+        return;
+    if (e->k == EK::Name && e->name.size() == 1)
+        out.insert(e->name[0]);
+    for (const auto &k : e->kids)
+        namesUsed(k, out);
+    if (e->lambda)
+    {
+        namesUsed(e->lambda->body, out);
+        for (const auto &c : e->lambda->captures)
+            if (!c.empty() && c[0] != '&')
+                out.insert(c);
+    }
+}
+
 XV Lowerer::lowerLambda(const ExprP &e)
+{
+    int ln = e->line;
+    const Lambda &l = *e->lambda;
+    // Captured by value ([x], [=]): copies taken now, bound under the same
+    // names by a function called at once, so the closure sees the copies.
+    std::vector<Local> byValue;
+    {
+        std::set<std::string> used;
+        if (l.captureAllByValue)
+            namesUsed(l.body, used);
+        for (const auto &c : l.captures)
+            if (!c.empty() && c[0] != '&' && c != "this" && c != "*this" && c != "=")
+                used.insert(c);
+        for (const auto &c : l.captures)
+            if (!c.empty() && c[0] == '&')
+                used.erase(c.substr(1));
+        for (const auto &n : used)
+            if (Local *loc = fn_ ? findLocal(n) : nullptr)
+                if (!loc->alias)
+                    byValue.push_back(*loc);
+    }
+    XV lam = lowerLambdaBody(e);
+    if (byValue.empty())
+        return lam;
+    std::vector<std::string> ps;
+    std::vector<ASTNodePtr> args;
+    for (Local &loc : byValue)
+    {
+        ps.push_back(loc.q);
+        XV cur = localXV(&loc);
+        cur.constLv = false;
+        ASTNodePtr v = copyOf(std::move(cur), ln);
+        if (loc.boxed || loc.refSlot)
+        {
+            // the closure reads it through a cell: a cell of its own
+            std::vector<ASTNodePtr> cell, ref;
+            cell.push_back(std::move(v));
+            v = q::arr(std::move(cell), ln);
+            if (loc.refSlot)
+            {
+                ref.push_back(std::move(v));
+                ref.push_back(q::num(0, ln));
+                v = q::arr(std::move(ref), ln);
+            }
+        }
+        args.push_back(std::move(v));
+    }
+    std::vector<ASTNodePtr> body;
+    body.push_back(q::ret(read(lam), ln));
+    return mkxv(q::call(q::lambda(ps, q::block(std::move(body), ln), ln), std::move(args), ln), lam.t);
+}
+
+XV Lowerer::lowerLambdaBody(const ExprP &e)
 {
     int ln = e->line;
     const Lambda &l = *e->lambda;
@@ -1667,6 +2483,7 @@ XV Lowerer::lowerLambda(const ExprP &e)
     for (const auto &s : l.body->body)
         if (auto ls = lowerStmt(s))
             stmts.push_back(std::move(ls));
+    emitDestroy(0, stmts);
     popScope();
     if (ctx.ret->k == T::Dyn && ctx.deducedRet)
         ft->a[0] = ctx.deducedRet;
@@ -1786,17 +2603,69 @@ ASTNodePtr Lowerer::ctorCall(ClassInfo *c, std::vector<ExprP> &args, bool braced
     }
     if (braced && cands.empty())
     {
-        // aggregate: fields in order, the rest default
+        // aggregate: fields in order (or as designated), the rest default; a
+        // scalar where an array / struct member starts takes as many scalars
+        // as the member holds (brace elision: `Queue q = {0}`)
+        std::vector<const FieldInfo *> fields;
+        for (const auto &f : c->fields)
+            if (!f.isStatic)
+                fields.push_back(&f);
+        std::vector<ExprP> given(fields.size());
+        size_t fi = 0;
+        for (size_t k = 0; k < args.size(); ++k)
+        {
+            const ExprP &x = args[k];
+            if (!x->designator.empty())
+                for (size_t j = 0; j < fields.size(); ++j)
+                    if (fields[j]->name == x->designator)
+                        fi = j;
+            if (fi >= fields.size())
+                break;
+            TP ft = fields[fi]->type;
+            long slots = x->k == EK::InitList ? 1 : initSlots(ft);
+            if (slots > 1 && x->k != EK::InitList && isArith(probeType(x)))
+            {
+                auto row = std::make_shared<Expr>();
+                row->k = EK::InitList;
+                row->line = x->line;
+                row->kids.push_back(x);
+                while ((long)row->kids.size() < slots && k + 1 < args.size() && args[k + 1]->k != EK::InitList &&
+                       args[k + 1]->designator.empty() && !args[k + 1]->designIndex)
+                    row->kids.push_back(args[++k]);
+                given[fi++] = row;
+            }
+            else
+                given[fi++] = x;
+        }
         std::vector<ASTNodePtr> a;
         a.push_back(alloc());
-        size_t i = 0;
-        for (const auto &f : c->fields)
+        if (c->isUnion && !fields.empty())
         {
-            if (f.isStatic)
-                continue;
-            if (i < args.size())
+            // a union: the one member given (the first by default)
+            size_t g = 0;
+            for (size_t j = 0; j < given.size(); ++j)
+                if (given[j])
+                {
+                    g = j;
+                    break;
+                }
+            if (given[g])
             {
-                XV v = lowerExprTo(args[i], f.type);
+                XV v = lowerExprTo(given[g], fields[g]->type);
+                v = convert(std::move(v), fields[g]->type, line);
+                a.push_back(copyOf(std::move(v), line));
+            }
+            else
+                a.push_back(defaultValue(fields[0]->type, line));
+            return q::call(c->aggFn(), std::move(a), line);
+        }
+        size_t i = 0;
+        for (const FieldInfo *fp : fields)
+        {
+            const FieldInfo &f = *fp;
+            if (given[i])
+            {
+                XV v = lowerExprTo(given[i], f.type);
                 v = convert(std::move(v), f.type, line);
                 a.push_back(copyOf(std::move(v), line));
             }
@@ -1847,8 +2716,12 @@ XV Lowerer::lowerConstruct(const ExprP &e)
     if (t->k == T::Class && t->cls)
     {
         if (e->braced)
-            return listInit(t, args, ln);
-        return mkxv(ctorCall(t->cls, args, false, ln), t);
+        {
+            XV r = listInit(t, args, ln);
+            r.v = trackTemp(read(r), t, ln);
+            return r;
+        }
+        return mkxv(trackTemp(ctorCall(t->cls, args, false, ln), t, ln), t);
     }
     if (t->k == T::Dyn && (t->name == "less" || t->name == "greater" || t->name == "hash"))
         return mkxv(q::str(t->name, ln), t); // std::greater<int>(): a comparator tag
@@ -2084,6 +2957,28 @@ XV Lowerer::listInit(const TP &t, std::vector<ExprP> &kids, int line)
             }
         }
         std::vector<ExprP> &items = elided.empty() ? kids : elided;
+        bool designated = false;
+        for (auto &k : items)
+            designated = designated || k->designIndex;
+        if (designated && t->k == T::Array)
+        {
+            std::map<long, ASTNodePtr> placed;
+            long pos = 0, end = 0;
+            for (auto &k : items)
+            {
+                if (k->designIndex)
+                    pos = (long)evalConst(k->designIndex, currentScope());
+                XV x = lowerExprTo(k, et);
+                x = convert(std::move(x), et, line);
+                placed[pos] = copyOf(std::move(x), line);
+                end = std::max(end, ++pos);
+            }
+            std::vector<ASTNodePtr> el;
+            long n = t->n >= 0 ? t->n : end;
+            for (long i = 0; i < n; ++i)
+                el.push_back(placed.count(i) ? std::move(placed[i]) : defaultValue(et, line));
+            return mkxv(q::arr(std::move(el), line), t);
+        }
         std::vector<ASTNodePtr> el;
         for (auto &k : items)
         {
@@ -2156,6 +3051,8 @@ XV Lowerer::listInit(const TP &t, std::vector<ExprP> &kids, int line)
         if (kids.size() == 1)
         {
             XV x = lowerExpr(kids[0]);
+            if (isCBuf(t) && isIntegral(x.t))
+                return mkxv(chr(read(x), line), t); // char s[8] = {0}
             return convert(std::move(x), t, line);
         }
         {
@@ -2228,9 +3125,160 @@ FuncInfo *Lowerer::pickOverload(const std::vector<FuncInfo *> &cands, std::vecto
     return best;
 }
 
+// ─── Function templates ────────────────────────────────────────────────────
+// A call of a function template is a call of its instance for the template
+// arguments given or deduced from the arguments' types, lowered with them
+// bound; a template whose arguments can't all be found stays dynamic.
+
+void Lowerer::deduce(const TypeNameP &p, const TP &a, const std::vector<std::string> &tps, std::map<std::string, TP> &bind)
+{
+    if (!p || !a || a->k == T::Dyn || a->k == T::InitList)
+        return;
+    if (p->name.size() == 1 && std::find(tps.begin(), tps.end(), p->name[0]) != tps.end() &&
+        (p->targs.empty() || p->targs.back().empty()))
+    {
+        // T, const T&, T&&, T*
+        TP v = a;
+        if (p->pointers > 0)
+        {
+            if (a->k == T::Ptr && !a->a.empty())
+                v = a->a[0];
+            else if (a->k == T::CStr && p->pointers == 1)
+                v = tChar();
+            else
+                return;
+        }
+        if (isCBuf(v))
+            v = tCStr(); // an array argument decays
+        if (!bind.count(p->name[0]))
+            bind[p->name[0]] = v;
+        return;
+    }
+    // vector<T>, map<K, V>, pair<A, B>, ...: the argument's type arguments
+    if (!p->targs.empty() && !p->targs.back().empty())
+    {
+        const auto &ta = p->targs.back();
+        for (size_t i = 0; i < ta.size() && i < a->a.size(); ++i)
+            if (ta[i].type)
+                deduce(ta[i].type, a->a[i], tps, bind);
+    }
+}
+
+FuncInfo *Lowerer::instantiate(FuncInfo *f, const std::vector<XV> &vals, const std::vector<TArg> &targs, int line)
+{
+    const DeclP &d = f->decl;
+    if (!d || d->templateParams.empty() || f->cls || !f->def)
+        return f;
+    const auto &tps = d->templateParams;
+    std::map<std::string, TP> bind;
+    for (size_t i = 0; i < targs.size() && i < tps.size(); ++i)
+        if (targs[i].type)
+            bind[tps[i]] = resolveType(targs[i].type, currentScope());
+    for (size_t i = 0; i < vals.size() && i < d->params.size(); ++i)
+        if (vals[i].t)
+            deduce(d->params[i].type, vals[i].t, tps, bind);
+    std::string key = f->mangled + "<";
+    for (size_t i = 0; i < tps.size(); ++i)
+    {
+        auto it = bind.find(tps[i]);
+        if (it == bind.end() || !it->second || it->second->k == T::Dyn)
+            return f; // not all known: the dynamic version
+        key += (i ? "," : "") + it->second->str();
+    }
+    key += ">";
+    auto known = instances_.find(key);
+    if (known != instances_.end())
+        return known->second;
+    funcs_.push_back(std::make_unique<FuncInfo>(*f));
+    FuncInfo *g = funcs_.back().get();
+    g->isTemplate = false;
+    g->lowered = false;
+    g->mangled = key;
+    g->scope = newScope(f->scope ? f->scope->qname : "", f->scope);
+    for (const auto &b : bind)
+    {
+        Symbol s;
+        s.kind = Symbol::Type;
+        s.type = b.second;
+        g->scope->syms[b.first] = s;
+    }
+    instances_[key] = g;
+    int savedLine = line_;
+    resolveFunc(g);
+    line_ = savedLine;
+    allFuncs_.push_back(g);
+    (void)line;
+    return g;
+}
+
+static bool hasSideEffects(const ExprP &e)
+{
+    if (!e)
+        return false;
+    switch (e->k)
+    {
+    case EK::Call: case EK::Assign: case EK::Postfix: case EK::New: case EK::Delete: case EK::Throw:
+        return true;
+    case EK::Unary:
+        if (e->op == "++" || e->op == "--")
+            return true;
+        break;
+    case EK::Lambda: case EK::SizeofT: case EK::SizeofE:
+        return false;
+    default:
+        break;
+    }
+    for (auto &k : e->kids)
+        if (hasSideEffects(k))
+            return true;
+    return false;
+}
+
+void Lowerer::preEvalArgs(const std::vector<ExprP> &args, std::vector<XV> &out, size_t from,
+                          const std::function<TP(size_t)> &target)
+{
+    out.clear();
+    out.resize(args.size());
+    if (!canHoist_ || !pre_)
+        return;
+    int n = 0;
+    for (size_t i = from; i < args.size(); ++i)
+        n += hasSideEffects(args[i]) ? 1 : 0;
+    if (n < 2)
+        return;
+    for (size_t i = args.size(); i-- > from;)
+    {
+        if (!hasSideEffects(args[i]))
+            continue;
+        TP t = target ? target(i) : nullptr;
+        XV x = t ? lowerExprTo(args[i], t) : lowerExpr(args[i]);
+        if (x.isFuncName || x.alloc)
+            continue; // no value yet: lowered again in order
+        if (x.lk == XV::RV && x.v)
+            x.v = simple(std::move(x.v), args[i]->line);
+        else if (x.lk == XV::Idx)
+        {
+            x.obj = simple(std::move(x.obj), args[i]->line);
+            x.key = simple(std::move(x.key), args[i]->line);
+        }
+        else if (x.lk != XV::Var)
+            continue;
+        out[i] = std::move(x);
+    }
+}
+
 XV Lowerer::callArgs(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int line, bool virt,
                      std::vector<XV> *lowered)
 {
+    std::vector<XV> early;
+    if (!lowered)
+    {
+        preEvalArgs(args, early, 0, [&](size_t i) -> TP
+                    { return i < f->params.size() && !(f->paramRef[i] && !isObjectRep(f->params[i]) && f->params[i]->k != T::Dyn)
+                                 ? f->params[i]
+                                 : nullptr; });
+        lowered = &early;
+    }
     // arguments already lowered by the caller are used as they are
     auto argXV = [&](size_t i, const TP &target) -> XV
     {
@@ -2278,6 +3326,8 @@ XV Lowerer::callArgs(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int
         XV x = argXV(i, pt);
         x = convert(std::move(x), pt, line);
         bool byValue = !(i < f->paramConstRef.size() && f->paramConstRef[i]) && !f->paramRef[i];
+        if (byValue)
+            untrackTemp(x);
         a.push_back(byValue ? copyOf(std::move(x), line) : read(x));
     }
     // default arguments, read in the function's own scope
@@ -2323,6 +3373,8 @@ XV Lowerer::callArgs(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int
     bool returnsRef = f->def && f->def->ret && (f->def->ret->ref || f->def->ret->rref);
     if (!f->def && f->decl && f->decl->ret)
         returnsRef = f->decl->ret->ref || f->decl->ret->rref;
+    if (!returnsRef && !f->isCtor)
+        c = trackTemp(std::move(c), f->ret, line); // a class returned by value: a temporary
     return mkxv(std::move(c), f->ret, !returnsRef);
 }
 
@@ -2467,6 +3519,8 @@ XV Lowerer::lowerCall(const ExprP &e)
                 FuncInfo *f = pickOverload(fn.overloads, vals, ln, false);
                 if (!f)
                     unsupported("no matching function " + name.back(), ln);
+                if (f->isTemplate)
+                    f = instantiate(f, vals, callee->targs, ln);
                 if (f->cls && !f->isStatic)
                 {
                     if (!fn_ || !fn_->hasThis)
@@ -2561,6 +3615,8 @@ XV Lowerer::lowerCall(const ExprP &e)
             FuncInfo *f = pickOverload(ms, vals, ln, true);
             if (!f)
                 unsupported("no matching method " + m, ln);
+            if (f->cls)
+                checkAccess(f->cls, f->access, f->cls->name + "::" + m, ln);
             if (f->isStatic)
                 return callArgs(f, args, nullptr, ln, false);
             bool qualified = false;
@@ -2615,6 +3671,9 @@ XV Lowerer::lowerExpr(const ExprP &e)
             }();
         else if (e->isLong || e->num > 2147483647.0)
             t = tLL();
+        uint64_t exact = 0;
+        if (isI64(t) && literalValue(e->str, exact))
+            return mkxv(i64Const((int64_t)exact, ln), t);
         return mkxv(q::num(e->num, ln), t);
     }
     case EK::Float:
@@ -2644,6 +3703,8 @@ XV Lowerer::lowerExpr(const ExprP &e)
     case EK::Postfix:
     {
         XV x = lowerExpr(e->kids[0]);
+        if (x.constLv)
+            unsupported(std::string(e->op == "++" ? "increment" : "decrement") + " of read-only " + x.constName, ln);
         if (x.t->k == T::Class)
         {
             std::vector<ExprP> ops = {e->kids[0]};
@@ -2692,35 +3753,28 @@ XV Lowerer::lowerExpr(const ExprP &e)
     case EK::Cast:
         return lowerCast(e);
     case EK::SizeofT:
-        return mkxv(q::num((double)evalConst(e, currentScope()), ln), tSize());
+        return mkxv(q::num((double)sizeOfType(resolveType(e->type, currentScope())), ln), tSize());
     case EK::SizeofE:
     {
         XV x = lowerExpr(e->kids[0]);
-        std::function<long(const TP &)> sz = [&](const TP &t) -> long
-        {
-            switch (t->k)
-            {
-            case T::Char: case T::Bool: return 1;
-            case T::Int: return t->name.find("long long") != std::string::npos ? 8 : t->name.find("short") != std::string::npos ? 2 : 4;
-            case T::Float: return t->name == "float" ? 4 : 8;
-            case T::Array: return t->n > 0 ? t->n * sz(t->a[0]) : 0;
-            case T::Str: return 32;
-            default: return 8;
-            }
-        };
         if (x.t->k == T::CStr && x.v && std::holds_alternative<StringLiteral>(x.v->node))
             return mkxv(q::num((double)std::get<StringLiteral>(x.v->node).value.size() + 1, ln), tSize());
-        return mkxv(q::num((double)sz(x.t), ln), tSize());
+        return mkxv(q::num((double)sizeOfType(x.t), ln), tSize());
     }
     case EK::New:
         return lowerNew(e);
     case EK::Delete:
     {
+        // the object's destructor (its dynamic class's), then it is gone
         XV x = lowerExpr(e->kids[0]);
         std::vector<ASTNodePtr> a;
         a.push_back(read(x));
-        a.push_back(q::nil(ln));
-        return mkxv(q::call("__cpp_seq__", std::move(a), ln), tVoid());
+        if (e->newArray)
+        {
+            a.push_back(q::boolean(true, ln));
+            return mkxv(q::call("__cpp_destroy_each__", std::move(a), ln), tVoid());
+        }
+        return mkxv(q::call("__cpp_delete__", std::move(a), ln), tVoid());
     }
     case EK::Lambda:
         return lowerLambda(e);

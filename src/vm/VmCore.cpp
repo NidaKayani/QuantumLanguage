@@ -48,6 +48,7 @@ VM::VM()
     registerStlNatives();
     registerCppNatives();
     registerJsRuntimeNatives();
+    registerJavaNatives();
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -71,24 +72,6 @@ void VM::run(std::shared_ptr<Chunk> chunk)
 
 // ─── Stack helpers ────────────────────────────────────────────────────────────
 
-void VM::push(QuantumValue v)
-{
-    stack_.push_back(std::move(v));
-}
-
-QuantumValue VM::pop()
-{
-    if (stack_.empty())
-        throw RuntimeError("VM stack underflow");
-    QuantumValue v = std::move(stack_.back());
-    stack_.pop_back();
-    return v;
-}
-
-QuantumValue &VM::peek(int offset)
-{
-    return stack_[stack_.size() - 1 - offset];
-}
 
 void VM::runtimeError(const std::string &msg, int line)
 {
@@ -101,6 +84,8 @@ double VM::toNumber(const QuantumValue &v, const std::string &ctx, int line)
         return toNumber(v.asNative()->fn({}), ctx, line);
     if (v.isNumber())
         return v.asNumber();
+    if (v.isLong())
+        return (double)v.asLong();
     if (v.isString())
     {
         try
@@ -124,6 +109,15 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
         return a.asBool() == b.asBool();
     if (a.isNumber() && b.isNumber())
         return a.asNumber() == b.asNumber();
+    if ((a.isLong() || a.isNumber()) && (b.isLong() || b.isNumber()))
+    {
+        // an exact 64-bit integer and a number: equal only as the same integer
+        if (a.isLong() && b.isLong())
+            return a.asLong() == b.asLong();
+        const QuantumValue &l = a.isLong() ? a : b, &d = a.isLong() ? b : a;
+        double x = d.asNumber();
+        return x == std::floor(x) && std::fabs(x) < 9.3e18 && (long double)x == (long double)l.asLong();
+    }
     if (a.isString() && b.isString())
         return a.asString() == b.asString();
     if (a.isArray() && b.isArray())
@@ -368,6 +362,65 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         }
     }
 
+    // C/C++ 64-bit integers (long long, uint64_t, size_t constants): exact,
+    // wrapping two's-complement arithmetic while both operands are integers
+    if (cppNumerics_ && (L.isLong() || R.isLong()))
+    {
+        auto asInt = [](const QuantumValue &v, int64_t &out) -> bool
+        {
+            if (v.isLong())
+            {
+                out = v.asLong();
+                return true;
+            }
+            if (v.isNumber())
+            {
+                double d = v.asNumber();
+                if (d != std::floor(d) || !(std::fabs(d) < 9.2e18))
+                    return false;
+                out = (int64_t)d;
+                return true;
+            }
+            if (v.isBool())
+            {
+                out = v.asBool() ? 1 : 0;
+                return true;
+            }
+            return false;
+        };
+        int64_t a = 0, b = 0;
+        if (asInt(L, a) && asInt(R, b))
+        {
+            uint64_t ua = (uint64_t)a, ub = (uint64_t)b;
+            switch (op)
+            {
+            case Op::ADD: return QuantumValue::ofLong((int64_t)(ua + ub));
+            case Op::SUB: return QuantumValue::ofLong((int64_t)(ua - ub));
+            case Op::MUL: return QuantumValue::ofLong((int64_t)(ua * ub));
+            case Op::MOD:
+                if (b == 0)
+                    throw RuntimeError("Modulo by zero", line);
+                return QuantumValue::ofLong(b == -1 ? 0 : a % b);
+            case Op::DIV:
+                return QuantumValue((double)a / (double)b); // integer division is __cpp_idiv__
+            case Op::BIT_AND: return QuantumValue::ofLong(a & b);
+            case Op::BIT_OR: return QuantumValue::ofLong(a | b);
+            case Op::BIT_XOR: return QuantumValue::ofLong(a ^ b);
+            case Op::LSHIFT: return QuantumValue::ofLong((int64_t)(ua << (b & 63)));
+            case Op::RSHIFT: return QuantumValue::ofLong(a >> (b & 63));
+            case Op::LT: return QuantumValue(a < b);
+            case Op::LTE: return QuantumValue(a <= b);
+            case Op::GT: return QuantumValue(a > b);
+            case Op::GTE: return QuantumValue(a >= b);
+            default: break;
+            }
+        }
+        if (L.isLong())
+            L = QuantumValue((double)L.asLong());
+        if (R.isLong())
+            R = QuantumValue((double)R.asLong());
+    }
+
     // Numeric arithmetic
     double l = 0, r = 0;
     bool hasNum = L.isNumber() || R.isNumber();
@@ -481,12 +534,16 @@ QuantumValue VM::execUnary(Op op, const QuantumValue &v, int line)
     case Op::NEG:
         if (v.isNumber())
             return QuantumValue(-v.asNumber());
+        if (v.isLong())
+            return QuantumValue::ofLong((int64_t)(0 - (uint64_t)v.asLong()));
         throw TypeError("Unary - on " + v.typeName(), line);
     case Op::NOT:
         return QuantumValue(!v.isTruthy());
     case Op::BIT_NOT:
         if (v.isNumber())
             return QuantumValue((double)(~(long long)v.asNumber()));
+        if (v.isLong())
+            return QuantumValue::ofLong(~v.asLong());
         throw TypeError("Bitwise ~ on " + v.typeName(), line);
     default:
         throw RuntimeError("Unknown unary op", line);
@@ -700,22 +757,28 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
         kwPassed_.clear();
         return;
     }
+    if (javaMode_ && frames_.size() >= kJavaMaxFrames)
+        throw QuantumError("java.lang.StackOverflowError", "", line);
     // Recorded before padding: a parameter default applies only to an
     // argument the caller left out, never to an explicitly passed nil.
     int suppliedArgs = argCount;
 
     // --- Varargs (*args) support ---
-    int varargIndex = -1;
-    for (int i = 0; i < (int)params.size(); ++i)
+    if (ch.varargIndex == -2)
     {
-        if (params[i].size() >= 2 && params[i][0] == '*' && params[i][1] == '*')
-            continue; // skip **kwargs params
-        if (!params[i].empty() && params[i][0] == '*')
+        ch.varargIndex = -1;
+        for (int i = 0; i < (int)params.size(); ++i)
         {
-            varargIndex = i;
-            break;
+            if (params[i].size() >= 2 && params[i][0] == '*' && params[i][1] == '*')
+                continue; // skip **kwargs params
+            if (!params[i].empty() && params[i][0] == '*')
+            {
+                ch.varargIndex = i;
+                break;
+            }
         }
     }
+    int varargIndex = ch.varargIndex;
 
     if (varargIndex != -1)
     {
@@ -762,7 +825,7 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
     }
 
     size_t stackBase = stack_.size() - argCount;
-    frames_.push_back({closure, 0, stackBase, suppliedArgs});
+    frames_.push_back({std::move(closure), 0, stackBase, suppliedArgs});
 }
 
 std::shared_ptr<Dict> takeKwargs(std::vector<QuantumValue> &args)

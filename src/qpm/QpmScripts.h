@@ -9,8 +9,9 @@ namespace qpm
 {
 
     // Runs scripts[scriptName] from <projectDir>/package.json with
-    // node_modules/.bin prepended to PATH. Returns the child process's exit
-    // code, or 1 with an error printed to stderr if the script can't be found.
+    // quantum_qubits/.bin and node_modules/.bin prepended to PATH. Returns the
+    // child process's exit code, or 1 with an error printed to stderr if the
+    // script can't be found.
     int runScript(const std::string &projectDir, const std::string &scriptName);
 
 } // namespace qpm

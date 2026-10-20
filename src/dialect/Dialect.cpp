@@ -22,7 +22,7 @@ bool hasSupportedExt(const std::string &path)
 {
     std::string ext = fileExtLower(path);
     return ext == ".sa" || ext == ".js" || ext == ".py" ||
-           ext == ".rb" || ext == ".c" || ext == ".cpp";
+           ext == ".rb" || ext == ".c" || ext == ".cpp" || ext == ".java";
 }
 
 // `int main(int argc, char** argv)` gets the command line: sys.argv holds the
