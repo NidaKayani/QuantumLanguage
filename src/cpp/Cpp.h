@@ -39,6 +39,8 @@ struct Unsupported : std::runtime_error
 {
     std::string file;
     int line;
+    int col = 0;          // 0 = unknown (lowering errors carry only a line)
+    bool syntax = false;  // raised by the parser: not valid C/C++ syntax
     Unsupported(const std::string &msg, const std::string &f = "", int l = 0)
         : std::runtime_error(msg), file(f), line(l) {}
 };
@@ -63,6 +65,7 @@ struct Token
     std::string value; // decoded bytes of a string / char literal
     int file = 0;
     int line = 0;
+    int col = 0;               // 1-based column of its first character
     bool bol = false;          // first token on its line
     bool spaceBefore = false;  // whitespace precedes it (for # stringification)
     int tu = 0;                // translation unit (anonymous namespaces)
@@ -72,7 +75,25 @@ struct Preprocessed
 {
     std::vector<Token> tokens; // ends with an End token
     std::vector<std::string> files;
+    // A .c program: compiled as C, not C++. C++-only keywords are ordinary
+    // identifiers (their tokens carry kPlainIdent in front of the text, so no
+    // keyword test matches them), `::` is two ':' tokens, and only C's
+    // standard headers exist.
+    bool cMode = false;
+    std::set<std::string> systemHeaders; // every #include <name> seen
 };
+
+// Prefix of the text of a C++-keyword token in a C program (a plain
+// identifier there): `class` -> "\x01class". cPlainName() strips it.
+inline const char kPlainIdent = '\x01';
+inline std::string cPlainName(const std::string &s)
+{
+    std::string out;
+    for (char c : s)
+        if (c != kPlainIdent)
+            out += c;
+    return out;
+}
 
 // The program: `path` and, appended, the implementation files of the local
 // headers it includes (x.h → x.cpp / src/x.cpp), each a translation unit.
@@ -108,10 +129,14 @@ struct TypeName
     bool ref = false;           // T&
     bool rref = false;          // T&&
     std::vector<ExprP> arrayDims; // T x[N][M]; null = []
+    // A parameter T x[N][M]: a pointer (the first dimension decays) to T[M] —
+    // the dimensions of the pointee, applied before `pointers`.
+    std::vector<ExprP> pointeeDims;
     // Function types: std::function<R(Args)>, function pointers.
     bool isFunction = false;
     TypeNameP ret;
     std::vector<TypeNameP> params;
+    bool elaborated = false;    // written `struct X` / `union X` / `enum X`
     bool isAuto() const { return name.size() == 1 && name[0] == "auto"; }
     std::string str() const;
 };
@@ -173,6 +198,8 @@ struct Expr
     bool braced = false;       // Construct with {} / New with {}
     bool newArray = false;
     LambdaP lambda;
+    std::string designator;    // in a brace list: .field = e
+    ExprP designIndex;         // in a brace list: [i] = e
 };
 
 struct VarDeclarator
@@ -303,12 +330,17 @@ struct Decl
     bool anonymous = false;
     // using-declaration / directive: name
     bool inheritingCtor = false; // using Base::Base;
+    // class members: public / protected / private; classes: who is a friend
+    std::string access = "public";
+    std::vector<std::string> friendNames;
 };
 
 struct Program
 {
     std::vector<DeclP> decls;
     std::vector<std::string> files;
+    bool cMode = false; // see Preprocessed::cMode
+    std::set<std::string> systemHeaders;
 };
 
 Program parse(const Preprocessed &pp);

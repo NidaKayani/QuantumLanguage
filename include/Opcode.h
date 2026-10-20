@@ -123,6 +123,20 @@ enum class Op : uint8_t
     // Keyword arguments: constants[operand] names the arguments of the CALL
     // that follows, '\x1f'-separated in argument order ("" = positional).
     KW_NAMES,
+
+    // ── Java (src/java/; operations in include/JavaOps.h) ─────────────────
+    // Appended last so bytecode bundled by older builds keeps its numbering.
+    J_BIN,    // operand jop::Bin:   [a, b] -> [a op b]
+    J_UN,     // operand jop::Un:    [a] -> [op a]
+    J_INVOKE, // operand (constant << 8) | argc: [slot, receiver, args...] -> [result].
+              // constants[...] is the method key "name(sig)", or [key, fallback global]
+              // for an interface default method (used when the receiver lacks it).
+    J_GETF,   // operand: field name constant. [obj] -> [obj.field]
+    J_PUTF,   // operand: field name constant. [obj, v] -> [v]
+    J_ALOAD,  // [array, index] -> [element]
+    J_ASTORE, // [array, index, v] -> [v]
+    J_INSTOF, // operand: type descriptor constant. [v] -> [bool]
+    J_CAST,   // operand: type descriptor constant. [v] -> [v] (ClassCastException)
 };
 
 // ─── Instruction ─────────────────────────────────────────────────────────────
@@ -145,6 +159,17 @@ struct Chunk
     std::vector<std::string> params;
     std::vector<bool> paramIsRef;
     int upvalueCount = 0;
+    int varargIndex = -2; // the *args parameter (-1: none); -2 until a first call computes it
+    // Java: the global each name constant refers to (VM::LOAD_GLOBAL / STORE_GLOBAL)
+    std::vector<QuantumValue *> globalSlots;
+    // Java: per J_INVOKE instruction, the receiver class last seen and the
+    // method it dispatched to (a monomorphic inline cache)
+    struct InvokeCache
+    {
+        const QuantumClass *klass = nullptr;
+        std::shared_ptr<Closure> method;
+    };
+    std::vector<InvokeCache> invokeCache;
 
     // Append an instruction; returns its index.
     size_t emit(Op op, int32_t operand = 0, int line = 0)

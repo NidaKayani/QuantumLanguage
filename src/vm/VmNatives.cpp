@@ -188,6 +188,7 @@ void VM::registerNatives()
     reg("__cpp_runtime__", [this](std::vector<QuantumValue>) -> QuantumValue
         {
         cppNumerics_ = true;
+        maxSteps_ = INT64_MAX;
         return QuantumValue(); });
     // Whether a C++ member's declared type can be default-constructed: a
     // class or a library constructor (vector, map, ...), not an enum.

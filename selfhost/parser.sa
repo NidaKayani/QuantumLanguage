@@ -1,0 +1,1533 @@
+# Quantum parser, written in Quantum: a port of src/parser/*.cpp. Part 1 —
+# the parser's state, token helpers, and statements up to `switch`
+# (parser_stmt2.sa, parser_expr.sa and parser_lit.sa hold the rest).
+# @use "./lexer.sa"
+# @use "./ast.sa"
+
+let P_TOKS = []
+let P_POS = 0
+let P_N = 0
+let P_INCALL = false         # inCallArgList
+let P_BRACEINIT = 0          # braceInitDepth_
+let P_FNISCPP = []           # fnIsCpp_
+let P_NEXTCPP = false        # nextFnIsCpp_
+let P_NEXTRET = ""           # nextFnReturnType_
+let P_PYDEPTH = 0            # pyDepth_
+let P_NEXTPY = false         # nextFnIsPython_
+let P_PYFILE = false         # pythonFile_
+# counters that, as C++ function statics, run across every parse
+let P_DESTRUCT_N = 0
+let P_SW_N = 0
+
+fn parseError(msg, ln) {
+    raise "ParseError: " + msg + " (line " + str(ln) + ")"
+}
+
+# ── token helpers ────────────────────────────────────────────────────────────
+
+fn pCur() {
+    return P_TOKS[P_POS]
+}
+
+fn pAt(i) {
+    if i < P_N {
+        return P_TOKS[i]
+    }
+    return P_TOKS[P_N - 1]
+}
+
+fn pPeek(off) {
+    return pAt(P_POS + off)
+}
+
+fn pType() {
+    return P_TOKS[P_POS][0]
+}
+
+fn pValue() {
+    return P_TOKS[P_POS][1]
+}
+
+fn pLine() {
+    return P_TOKS[P_POS][2]
+}
+
+fn pConsume() {
+    let t = P_TOKS[P_POS]
+    P_POS = P_POS + 1
+    return t
+}
+
+fn pExpect(type, msg) {
+    if P_TOKS[P_POS][0] != type {
+        parseError(msg + " (got '" + P_TOKS[P_POS][1] + "')", P_TOKS[P_POS][2])
+    }
+    return pConsume()
+}
+
+fn pCheck(type) {
+    return P_TOKS[P_POS][0] == type
+}
+
+fn pMatch(type) {
+    if P_TOKS[P_POS][0] == type {
+        P_POS = P_POS + 1
+        return true
+    }
+    return false
+}
+
+fn pAtEnd() {
+    return P_TOKS[P_POS][0] == T_EOF
+}
+
+fn pSkipNewlines() {
+    while P_TOKS[P_POS][0] == T_NEWLINE {
+        P_POS = P_POS + 1
+    }
+}
+
+# the `while (check(NEWLINE) || check(SEMICOLON)) consume();` idiom
+fn pSkipTerms() {
+    while P_TOKS[P_POS][0] == T_NEWLINE or P_TOKS[P_POS][0] == T_SEMICOLON {
+        P_POS = P_POS + 1
+    }
+}
+
+fn pIsIdent(value) {
+    return P_TOKS[P_POS][0] == T_IDENTIFIER and P_TOKS[P_POS][1] == value
+}
+
+fn pTypeAt(i) {
+    if i < P_N {
+        return P_TOKS[i][0]
+    }
+    return -1
+}
+
+fn pInPythonCode() {
+    return P_PYFILE or P_PYDEPTH > 0
+}
+
+fn isCTypeKeyword(t) {
+    return t >= T_TYPE_INT and t <= T_TYPE_UNSIGNED
+}
+
+# Parses a whole token list (one file) into a Block, with fresh parser state;
+# the state of a parse in progress (a @use module is parsed first) is kept.
+fn parseProgram(tokens, pythonFile) {
+    let saved = [P_TOKS, P_POS, P_N, P_INCALL, P_BRACEINIT, P_FNISCPP, P_NEXTCPP, P_NEXTRET, P_PYDEPTH, P_NEXTPY, P_PYFILE]
+    P_TOKS = tokens
+    P_POS = 0
+    P_N = len(tokens)
+    P_INCALL = false
+    P_BRACEINIT = 0
+    P_FNISCPP = []
+    P_NEXTCPP = false
+    P_NEXTRET = ""
+    P_PYDEPTH = 0
+    P_NEXTPY = false
+    P_PYFILE = pythonFile
+    let stmts = []
+    pSkipNewlines()
+    while !pAtEnd() {
+        stmts.push(parseStatement())
+        pSkipNewlines()
+    }
+    P_TOKS = saved[0]
+    P_POS = saved[1]
+    P_N = saved[2]
+    P_INCALL = saved[3]
+    P_BRACEINIT = saved[4]
+    P_FNISCPP = saved[5]
+    P_NEXTCPP = saved[6]
+    P_NEXTRET = saved[7]
+    P_PYDEPTH = saved[8]
+    P_NEXTPY = saved[9]
+    P_PYFILE = saved[10]
+    return nBlock(stmts, 0)
+}
+
+# skips a balanced `( ... )` after an already-consumed token (decorator args, asm)
+fn pSkipParens() {
+    pConsume()
+    let depth = 1
+    while !pAtEnd() and depth > 0 {
+        if pCheck(T_LPAREN) {
+            depth = depth + 1
+        } else if pCheck(T_RPAREN) {
+            depth = depth - 1
+        }
+        pConsume()
+    }
+}
+
+# skips `<...>` template arguments at P_POS (counting >> as two closers)
+fn pSkipTemplateArgs() {
+    pConsume()
+    let tdepth = 1
+    while !pAtEnd() and tdepth > 0 {
+        if pCheck(T_LT) {
+            tdepth = tdepth + 1
+        } else if pCheck(T_GT) {
+            tdepth = tdepth - 1
+        } else if pCheck(T_RSHIFT) {
+            tdepth = tdepth - 2
+            pConsume()
+            continue
+        }
+        pConsume()
+    }
+}
+
+# the index past template arguments starting at index `la` (a '<')
+fn pLookPastTemplate(la, stopAtTerms) {
+    let tdepth = 0
+    while la < P_N {
+        let t = P_TOKS[la][0]
+        if t == T_LT {
+            tdepth = tdepth + 1
+        } else if t == T_GT {
+            tdepth = tdepth - 1
+            la = la + 1
+            if tdepth <= 0 {
+                break
+            }
+            continue
+        } else if t == T_RSHIFT {
+            tdepth = tdepth - 2
+            la = la + 1
+            if tdepth <= 0 {
+                break
+            }
+            continue
+        } else if stopAtTerms and (t == T_SEMICOLON or t == T_NEWLINE or t == T_LBRACE) {
+            break
+        }
+        la = la + 1
+    }
+    return la
+}
+
+# ── statements ───────────────────────────────────────────────────────────────
+
+fn parseStatement() {
+    pSkipNewlines()
+    # Python decorators (@property, @dataclass(...)) are skipped
+    while pCheck(T_DECORATOR) {
+        pConsume()
+        if pCheck(T_IDENTIFIER) {
+            pConsume()
+            if pCheck(T_LPAREN) {
+                pSkipParens()
+            }
+        }
+        pSkipNewlines()
+    }
+    let ln = pLine()
+    # C/C++ storage classes
+    while !pAtEnd() and pCheck(T_IDENTIFIER) {
+        let v = pValue()
+        if v != "static" and v != "extern" and v != "inline" and v != "volatile" and v != "register" and v != "mutable" and v != "constexpr" {
+            break
+        }
+        pConsume()
+    }
+    let t = pType()
+    if t == T_EXPORT {
+        pConsume()
+        let decl = parseStatement()
+        if decl["k"] == "FunctionDecl" or decl["k"] == "VarDecl" {
+            decl["isExported"] = true
+        } else {
+            parseError("`export` can only be used before a function or variable declaration", ln)
+        }
+        return decl
+    }
+    if t == T_LET {
+        pConsume()
+        return parseVarDecl(false)
+    }
+    if t == T_CONST {
+        return parseConstStatement(ln)
+    }
+    if t == T_FN or t == T_DEF or t == T_FUNCTION {
+        let isDef = pCheck(T_DEF)
+        pConsume()
+        if pType() == T_IDENTIFIER {
+            P_NEXTPY = isDef
+            return parseFunctionDecl()
+        }
+        let lam = parseLambda()
+        pSkipTerms()
+        return nExprStmt(lam, lam["line"])
+    }
+    if t == T_CLASS {
+        pConsume()
+        return parseClassDecl()
+    }
+    if t == T_IF {
+        pConsume()
+        return parseIfStmt()
+    }
+    if t == T_WHILE {
+        pConsume()
+        return parseWhileStmt()
+    }
+    if t == T_FOR {
+        pConsume()
+        return parseForStmt()
+    }
+    if t == T_RETURN {
+        pConsume()
+        return parseReturnStmt()
+    }
+    if t == T_PRINT {
+        # print(...) may be a call of a function named print
+        if pTypeAt(P_POS + 1) == T_LPAREN {
+            return parseExprStmt()
+        }
+        pConsume()
+        return parsePrintStmt()
+    }
+    if t == T_INPUT {
+        if pTypeAt(P_POS + 1) == T_LPAREN {
+            let scan = P_POS + 2
+            while scan < P_N and P_TOKS[scan][0] == T_NEWLINE {
+                scan = scan + 1
+            }
+            let looksLikeScanf = false
+            if scan < P_N and P_TOKS[scan][0] == T_STRING {
+                looksLikeScanf = P_TOKS[scan][1].indexOf("%") >= 0
+            }
+            if !looksLikeScanf {
+                return parseExprStmt()
+            }
+        }
+        pConsume()
+        return parseInputStmt()
+    }
+    if t == T_CIN {
+        pConsume()
+        return parseCinStmt()
+    }
+    if t == T_COUT {
+        pConsume()
+        return parseCoutStmt()
+    }
+    if t == T_IMPORT or t == T_FROM {
+        let isFrom = t == T_FROM
+        pConsume()
+        return parseImportStmt(isFrom)
+    }
+    if t == T_BREAK {
+        pConsume()
+        pSkipTerms()
+        return nBreak(ln)
+    }
+    if t == T_CONTINUE {
+        pConsume()
+        pSkipTerms()
+        return nContinue(ln)
+    }
+    if t == T_RAISE {
+        pConsume()
+        let val = nil
+        if !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) and !pCheck(T_RBRACE) and !pAtEnd() {
+            val = parseExpr()
+        }
+        pSkipTerms()
+        return nRaise(val, ln)
+    }
+    if t == T_WITH {
+        return parseWithStmt(ln)
+    }
+    if t == T_TRY {
+        return parseTryStmt(ln)
+    }
+    if t == T_LBRACE {
+        return parseBlock()
+    }
+    if isCTypeKeyword(t) {
+        return parseCTypeStatement(ln)
+    }
+    return parseOtherStatement(ln)
+}
+
+# `const`: a C qualifier before a type, or a Quantum/JS constant
+fn parseConstStatement(ln) {
+    pConsume()
+    if isCTypeKeyword(pType()) {
+        let typeHint = pConsume()[1]
+        while isCTypeKeyword(pType()) {
+            typeHint = typeHint + " " + pConsume()[1]
+        }
+        if pCheck(T_CONST) {
+            pConsume()
+        }
+        let firstDecl = parseCTypeVarDecl(typeHint)
+        pSkipTerms()
+        if !pCheck(T_COMMA) {
+            return firstDecl
+        }
+        let stmts = [firstDecl]
+        while pCheck(T_COMMA) {
+            pConsume()
+            let hint = typeHint
+            if isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                hint = pConsume()[1]
+                while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                    hint = hint + " " + pConsume()[1]
+                }
+            }
+            stmts.push(parseCTypeVarDecl(hint))
+            pSkipTerms()
+        }
+        pSkipTerms()
+        return nBlock(stmts, ln)
+    }
+    # const Node* p / const vector<K>& keys: the declaration without its const
+    if pCheck(T_IDENTIFIER) and P_POS + 1 < P_N {
+        let nt = P_TOKS[P_POS + 1][0]
+        if nt == T_LT or nt == T_IDENTIFIER or nt == T_STAR or nt == T_BIT_AND {
+            return parseStatement()
+        }
+    }
+    return parseVarDecl(true)
+}
+
+# Python `with EXPR as NAME:` → NAME = EXPR; try { body } finally { NAME.close() }
+fn parseWithStmt(ln) {
+    pConsume()
+    let items = []
+    while true {
+        let expr = parseExpr()
+        let name = ""
+        if pCheck(T_AS) {
+            pConsume()
+            if pCheck(T_IDENTIFIER) {
+                name = pConsume()[1]
+            }
+        }
+        items.push([name, expr])
+        if pCheck(T_COMMA) {
+            pConsume()
+            continue
+        }
+        break
+    }
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let body = parseBlock()
+    let finallyStmts = []
+    let i = len(items) - 1
+    while i >= 0 {
+        let name = items[i][0]
+        if name != "" {
+            let call = nCall(nMember(nIdent(name, ln), "close", ln), [], ln)
+            finallyStmts.push(nExprStmt(call, ln))
+        }
+        i = i - 1
+    }
+    let outer = []
+    i = 0
+    while i < len(items) {
+        let name = items[i][0]
+        if name == "" {
+            outer.push(nExprStmt(items[i][1], ln))
+        } else {
+            outer.push(nExprStmt(nAssign("=", nIdent(name, ln), items[i][1], ln), ln))
+        }
+        i = i + 1
+    }
+    let ts = nTry(body, ln)
+    if len(finallyStmts) > 0 {
+        ts["finallyBody"] = nBlock(finallyStmts, ln)
+    }
+    outer.push(ts)
+    return nBlock(outer, ln)
+}
+
+fn parseTryStmt(ln) {
+    pConsume()
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let body = parseBlock()
+    let ts = nTry(body, ln)
+    pSkipNewlines()
+    while pCheck(T_EXCEPT) {
+        pConsume()
+        let clause = {"errorType": "", "alias": "", "body": nil}
+        if !pCheck(T_COLON) and !pCheck(T_NEWLINE) and !pCheck(T_INDENT) {
+            pMatch(T_LPAREN)
+            # C++: catch (const exception& e)
+            if pCheck(T_CONST) {
+                pConsume()
+            }
+            if pCheck(T_IDENTIFIER) {
+                clause["errorType"] = pConsume()[1]
+            } else if isCTypeKeyword(pType()) {
+                clause["errorType"] = pConsume()[1]
+            }
+            while pCheck(T_BIT_AND) or pCheck(T_STAR) {
+                pConsume()
+            }
+            if pCheck(T_IDENTIFIER) and clause["alias"] == "" and pValue() != "as" {
+                clause["alias"] = pConsume()[1]
+            }
+            # except (A, B): the first type only
+            while pCheck(T_COMMA) {
+                pConsume()
+                if pCheck(T_IDENTIFIER) {
+                    pConsume()
+                }
+            }
+            pMatch(T_RPAREN)
+            if pCheck(T_AS) {
+                pConsume()
+                if pCheck(T_IDENTIFIER) {
+                    clause["alias"] = pConsume()[1]
+                }
+            }
+        }
+        pMatch(T_COLON)
+        pSkipNewlines()
+        clause["body"] = parseBlock()
+        ts["handlers"].push(clause)
+        pSkipNewlines()
+    }
+    # Python try/except/else: the else body runs after a body that didn't raise
+    if pCheck(T_ELSE) {
+        pConsume()
+        pMatch(T_COLON)
+        pSkipNewlines()
+        let elseBody = parseBlock()
+        if ts["body"] != nil and ts["body"]["k"] == "Block" and elseBody["k"] == "Block" {
+            let dst = ts["body"]["statements"]
+            let es = elseBody["statements"]
+            let i = 0
+            while i < len(es) {
+                dst.push(es[i])
+                i = i + 1
+            }
+        }
+        pSkipNewlines()
+    }
+    if pCheck(T_FINALLY) {
+        pConsume()
+        pMatch(T_COLON)
+        pSkipNewlines()
+        ts["finallyBody"] = parseBlock()
+    }
+    return ts
+}
+
+fn isValidFuncNameType(t) {
+    return t == T_IDENTIFIER or t == T_INPUT or t == T_PRINT
+}
+
+# int x = 5 / int main() / int a, b, c / void (*fp)() / string line(80, '-')
+fn parseCTypeStatement(ln) {
+    let lookahead = P_POS + 1
+    while lookahead < P_N and (isCTypeKeyword(P_TOKS[lookahead][0]) or P_TOKS[lookahead][0] == T_CONST) {
+        lookahead = lookahead + 1
+    }
+    while lookahead < P_N {
+        let lt = P_TOKS[lookahead][0]
+        if lt != T_STAR and lt != T_BIT_AND and lt != T_POWER and lt != T_CONST {
+            break
+        }
+        lookahead = lookahead + 1
+    }
+    if lookahead < P_N and isValidFuncNameType(P_TOKS[lookahead][0]) {
+        let la2 = lookahead + 1
+        while la2 < P_N and P_TOKS[la2][0] == T_NEWLINE {
+            la2 = la2 + 1
+        }
+        # inside a function body, `string line(width, '-')` / `int n(5)` is a
+        # variable built from constructor arguments, not a function declaration
+        let ctorArgs = false
+        if len(P_FNISCPP) > 0 and la2 + 1 < P_N and P_TOKS[la2][0] == T_LPAREN {
+            let a = P_TOKS[la2 + 1]
+            let after = T_EOF
+            if la2 + 2 < P_N {
+                after = P_TOKS[la2 + 2][0]
+            }
+            ctorArgs = a[0] == T_NUMBER or a[0] == T_STRING or (a[0] == T_IDENTIFIER and after != T_IDENTIFIER and after != T_STAR and after != T_BIT_AND and after != T_CONST and after != T_LT)
+        }
+        if ctorArgs {
+            let typeHint = ""
+            while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                if isCTypeKeyword(pType()) {
+                    if typeHint == "" {
+                        typeHint = pValue()
+                    } else {
+                        typeHint = typeHint + " " + pValue()
+                    }
+                }
+                pConsume()
+            }
+            let varName = pConsume()[1]
+            let vln = pLine()
+            let args = parseArgList()
+            let init = nil
+            if len(args) == 1 and typeHint != "string" {
+                init = args[0]
+            } else {
+                init = nCall(nIdent(typeHint, vln), args, vln)
+            }
+            let decl = nVarDecl(false, varName, init, typeHint, vln)
+            decl["cTyped"] = true
+            pSkipTerms()
+            return decl
+        }
+        if la2 < P_N and P_TOKS[la2][0] == T_LPAREN {
+            # a function definition: its return type, then the function
+            let retType = ""
+            while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                if isCTypeKeyword(pType()) {
+                    if retType == "" {
+                        retType = pValue()
+                    } else {
+                        retType = retType + " " + pValue()
+                    }
+                }
+                pConsume()
+            }
+            while pCheck(T_STAR) or pCheck(T_POWER) or pCheck(T_BIT_AND) or pCheck(T_CONST) {
+                if pCheck(T_STAR) {
+                    retType = retType + "*"
+                } else if pCheck(T_POWER) {
+                    retType = retType + "**"
+                }
+                pConsume()
+            }
+            P_NEXTCPP = true
+            P_NEXTRET = retType
+            return parseFunctionDecl()
+        }
+        let typeHint = pConsume()[1]
+        while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+            typeHint = typeHint + " " + pConsume()[1]
+        }
+        let firstDecl = parseCTypeVarDecl(typeHint)
+        pSkipTerms()
+        if !pCheck(T_COMMA) {
+            return firstDecl
+        }
+        # int a, b, c;  /  int a, *b, c = 5;  /  int a, int b
+        let stmts = [firstDecl]
+        while pCheck(T_COMMA) {
+            pConsume()
+            let hint = typeHint
+            if isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                hint = pConsume()[1]
+                while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                    hint = hint + " " + pConsume()[1]
+                }
+            }
+            stmts.push(parseCTypeVarDecl(hint))
+            pSkipTerms()
+        }
+        pSkipTerms()
+        return nBlock(stmts, ln)
+    }
+    # function pointer: void (*fp)()
+    if lookahead < P_N and P_TOKS[lookahead][0] == T_LPAREN {
+        let typeHint = pConsume()[1]
+        while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+            typeHint = typeHint + " " + pConsume()[1]
+        }
+        let fpDecl = parseCTypeVarDecl(typeHint)
+        pSkipTerms()
+        return fpDecl
+    }
+    return parseExprStmt()
+}
+
+fn parseOtherStatement(ln) {
+    # Python `global a, b` / `nonlocal a` inside a def
+    if pCheck(T_IDENTIFIER) and pInPythonCode() and (pValue() == "global" or pValue() == "nonlocal") and pTypeAt(P_POS + 1) == T_IDENTIFIER {
+        let isNonlocal = pConsume()[1] == "nonlocal"
+        let names = []
+        names.push(pExpect(T_IDENTIFIER, "Expected a name")[1])
+        while pMatch(T_COMMA) {
+            names.push(pExpect(T_IDENTIFIER, "Expected a name")[1])
+        }
+        pSkipTerms()
+        return nGlobal(names, isNonlocal, ln)
+    }
+    # C++ delete / delete[]: no-ops
+    if pIsIdent("delete") {
+        pConsume()
+        if pCheck(T_LBRACKET) {
+            pConsume()
+            if pCheck(T_RBRACKET) {
+                pConsume()
+            }
+        }
+        if !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) and !pAtEnd() {
+            parseExpr()
+        }
+        pSkipTerms()
+        return nBlock([], ln)
+    }
+    # cerr << ... / clog << ...
+    if pCheck(T_IDENTIFIER) and (pValue() == "cerr" or pValue() == "clog") and pTypeAt(P_POS + 1) == T_LSHIFT {
+        pConsume()
+        let call = nCall(nIdent("__cerr__", ln), parseStreamInsertions(), ln)
+        return nExprStmt(call, ln)
+    }
+    # using namespace X; — a no-op
+    if pIsIdent("using") {
+        while !pAtEnd() and !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) {
+            pConsume()
+        }
+        pSkipTerms()
+        return nBlock([], ln)
+    }
+    if pIsIdent("switch") and pTypeAt(P_POS + 1) == T_LPAREN {
+        return parseSwitchStmt()
+    }
+    # template<typename T, ...>: skipped
+    if pIsIdent("template") and pTypeAt(P_POS + 1) == T_LT {
+        pConsume()
+        pConsume()
+        let tdepth = 1
+        while !pAtEnd() and tdepth > 0 {
+            if pCheck(T_LT) {
+                tdepth = tdepth + 1
+            } else if pCheck(T_GT) {
+                tdepth = tdepth - 1
+            } else if pCheck(T_RSHIFT) {
+                tdepth = tdepth - 2
+            }
+            pConsume()
+        }
+        pSkipNewlines()
+        return parseStatement()
+    }
+    # struct Name { ... }; / union Name { ... }: a class
+    if pCheck(T_IDENTIFIER) and (pValue() == "struct" or pValue() == "union") and pTypeAt(P_POS + 1) == T_IDENTIFIER {
+        let laS = P_POS + 2
+        while laS < P_N and P_TOKS[laS][0] == T_NEWLINE {
+            laS = laS + 1
+        }
+        if laS < P_N and P_TOKS[laS][0] == T_LBRACE {
+            pConsume()
+            return parseClassDecl()
+        }
+    }
+    if pIsIdent("enum") {
+        let r = parseEnumStatement(ln)
+        if r != nil {
+            return r
+        }
+    }
+    # __asm__ volatile (...): skipped
+    if pCheck(T_IDENTIFIER) and (pValue() == "__asm__" or pValue() == "asm") {
+        pConsume()
+        if pIsIdent("volatile") {
+            pConsume()
+        }
+        if pCheck(T_LPAREN) {
+            pSkipParens()
+        }
+        pSkipTerms()
+        return nBlock([], ln)
+    }
+    if pIsIdent("typedef") {
+        return parseTypedefStatement(ln)
+    }
+    if pCheck(T_IDENTIFIER) {
+        let r = parseClassTypeDeclaration(ln)
+        if r != nil {
+            return r
+        }
+    }
+    # do { } while (cond);
+    if pIsIdent("do") {
+        pConsume()
+        pSkipNewlines()
+        let body = parseBlock()
+        pSkipNewlines()
+        if pCheck(T_WHILE) {
+            pConsume()
+        } else if pIsIdent("while") {
+            pConsume()
+        }
+        pExpect(T_LPAREN, "Expected '(' after 'while' in do-while")
+        let condition = parseExpr()
+        pExpect(T_RPAREN, "Expected ')' after do-while condition")
+        while pCheck(T_SEMICOLON) or pCheck(T_NEWLINE) {
+            pConsume()
+        }
+        # while (true) { body } with post `if (!cond) break;` (the continue target)
+        let ifBreak = nIf(nUnary("!", condition, ln), nBlock([nBreak(ln)], ln), nil, ln)
+        return nWhile(nBool(true, ln), body, ifBreak, ln)
+    }
+    return parseExprStmt()
+}
+
+# enum [class] Name [: type] { A, B = 5, C };  → constants (and Name::A, Name.A)
+fn parseEnumStatement(ln) {
+    let la = P_POS + 1
+    if la < P_N and (P_TOKS[la][0] == T_CLASS or (P_TOKS[la][0] == T_IDENTIFIER and P_TOKS[la][1] == "struct")) {
+        la = la + 1
+    }
+    let enumName = ""
+    if la < P_N and P_TOKS[la][0] == T_IDENTIFIER {
+        enumName = P_TOKS[la][1]
+        la = la + 1
+    }
+    if la < P_N and P_TOKS[la][0] == T_COLON {
+        while la < P_N and P_TOKS[la][0] != T_LBRACE and P_TOKS[la][0] != T_SEMICOLON and P_TOKS[la][0] != T_NEWLINE {
+            la = la + 1
+        }
+    }
+    let lb = la
+    while lb < P_N and P_TOKS[lb][0] == T_NEWLINE {
+        lb = lb + 1
+    }
+    if !(lb < P_N and P_TOKS[lb][0] == T_LBRACE) {
+        return nil
+    }
+    P_POS = lb + 1
+    let stmts = []
+    let members = []
+    let prev = ""
+    while !pAtEnd() and !pCheck(T_RBRACE) {
+        pSkipNewlines()
+        if pCheck(T_RBRACE) {
+            break
+        }
+        let name = pExpect(T_IDENTIFIER, "Expected enumerator name")[1]
+        let value = nil
+        if pMatch(T_ASSIGN) {
+            value = parseExpr()
+        } else if prev == "" {
+            value = nNumber(0, ln)
+        } else {
+            value = nBinary("+", nIdent(prev, ln), nNumber(1, ln), ln)
+        }
+        stmts.push(nVarDecl(false, name, value, "", ln))
+        if enumName != "" {
+            stmts.push(nVarDecl(false, enumName + "::" + name, nIdent(name, ln), "", ln))
+            members.push([nString(name, ln), nIdent(name, ln)])
+        }
+        prev = name
+        pSkipNewlines()
+        if !pMatch(T_COMMA) {
+            break
+        }
+    }
+    pSkipNewlines()
+    pExpect(T_RBRACE, "Expected '}' to close enum")
+    if enumName != "" {
+        stmts.push(nVarDecl(false, enumName, nDict(members, ln), "", ln))
+    }
+    while !pAtEnd() and !pCheck(T_SEMICOLON) and !pCheck(T_NEWLINE) {
+        pConsume()
+    }
+    pSkipTerms()
+    return nBlock(stmts, ln)
+}
+
+# typedef ...: enumerator constants, and the alias as an empty class
+fn parseTypedefStatement(ln) {
+    pConsume()
+    let isEnum = pCheck(T_IDENTIFIER) and (pValue() == "enum" or pValue() == "struct" or pValue() == "union")
+    let isRawEnum = isEnum and pValue() == "enum"
+    if isEnum {
+        pConsume()
+    }
+    if pCheck(T_IDENTIFIER) and !pCheck(T_LBRACE) {
+        if pTypeAt(P_POS + 1) == T_LBRACE {
+            pConsume()
+        }
+    }
+    let enumerators = []
+    if isRawEnum and pCheck(T_LBRACE) {
+        pConsume()
+        let nextVal = 0
+        while !pCheck(T_RBRACE) and !pAtEnd() {
+            if pCheck(T_NEWLINE) {
+                pConsume()
+                continue
+            }
+            if !pCheck(T_IDENTIFIER) {
+                pConsume()
+                continue
+            }
+            let eName = pConsume()[1]
+            let eVal = nextVal
+            if pMatch(T_ASSIGN) {
+                let neg = false
+                if pCheck(T_MINUS) {
+                    neg = true
+                    pConsume()
+                }
+                if pCheck(T_NUMBER) {
+                    eVal = num(pConsume()[1])
+                    if neg {
+                        eVal = eVal * -1
+                    }
+                } else if pCheck(T_IDENTIFIER) {
+                    let ref = pConsume()[1]
+                    let k = 0
+                    while k < len(enumerators) {
+                        if enumerators[k][0] == ref {
+                            eVal = enumerators[k][1]
+                            break
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            enumerators.push([eName, eVal])
+            nextVal = eVal + 1
+            if pCheck(T_COMMA) {
+                pConsume()
+            }
+        }
+        if pCheck(T_RBRACE) {
+            pConsume()
+        }
+    } else {
+        let depth = 0
+        while !pAtEnd() {
+            if pCheck(T_LBRACE) {
+                depth = depth + 1
+                pConsume()
+            } else if pCheck(T_RBRACE) {
+                depth = depth - 1
+                pConsume()
+                if depth == 0 {
+                    break
+                }
+            } else if pCheck(T_SEMICOLON) and depth == 0 {
+                break
+            } else if pCheck(T_NEWLINE) and depth == 0 {
+                break
+            } else {
+                pConsume()
+            }
+        }
+    }
+    # the alias: the last identifier before ';'
+    let aliasName = ""
+    let lastIdent = ""
+    while !pAtEnd() {
+        if pCheck(T_SEMICOLON) or pCheck(T_NEWLINE) {
+            aliasName = lastIdent
+            pConsume()
+            break
+        }
+        if pCheck(T_IDENTIFIER) {
+            lastIdent = pValue()
+        }
+        pConsume()
+    }
+    if len(enumerators) > 0 or aliasName != "" {
+        let stmts = []
+        let k = 0
+        while k < len(enumerators) {
+            stmts.push(nVarDecl(false, enumerators[k][0], nNumber(enumerators[k][1], ln), "", ln))
+            k = k + 1
+        }
+        if aliasName != "" {
+            stmts.push(nClass(aliasName, ln))
+        }
+        return nBlock(stmts, ln)
+    }
+    return nBlock([], ln)
+}
+
+# ClassName varName; / ClassName varName(args); / struct T a, b; / Ret* f(T x)
+fn parseClassTypeDeclaration(ln) {
+    let hasStructKeyword = pValue() == "struct" or pValue() == "union" or pValue() == "enum"
+    let la = P_POS
+    if hasStructKeyword {
+        la = la + 1
+    }
+    let laName = la + 1
+    if laName < P_N and P_TOKS[laName][0] == T_LT {
+        laName = pLookPastTemplate(laName, false)
+    }
+    while laName < P_N and (P_TOKS[laName][0] == T_STAR or P_TOKS[laName][0] == T_BIT_AND or P_TOKS[laName][0] == T_CONST) {
+        laName = laName + 1
+    }
+    if !(la < P_N and P_TOKS[la][0] == T_IDENTIFIER and laName < P_N and P_TOKS[laName][0] == T_IDENTIFIER) {
+        return nil
+    }
+    let la2 = laName + 1
+    if la2 < P_N and P_TOKS[la2][0] == T_LPAREN {
+        # typed parameters inside: a function declaration, not a constructor call
+        let innerPos = la2 + 1
+        let looksLikeFuncDecl = false
+        if innerPos < P_N {
+            let it = P_TOKS[innerPos][0]
+            if isCTypeKeyword(it) or it == T_CONST or it == T_RPAREN {
+                looksLikeFuncDecl = true
+            } else if it == T_IDENTIFIER {
+                let i2 = innerPos + 1
+                if i2 < P_N {
+                    let t2 = P_TOKS[i2][0]
+                    looksLikeFuncDecl = t2 == T_STAR or t2 == T_BIT_AND or t2 == T_IDENTIFIER or t2 == T_CONST
+                }
+            }
+        }
+        if looksLikeFuncDecl {
+            if hasStructKeyword {
+                pConsume()
+            }
+            let retType = pConsume()[1]
+            if pCheck(T_LT) {
+                let tdepth = 0
+                while !pAtEnd() {
+                    if pCheck(T_LT) {
+                        tdepth = tdepth + 1
+                    } else if pCheck(T_GT) {
+                        tdepth = tdepth - 1
+                    } else if pCheck(T_RSHIFT) {
+                        tdepth = tdepth - 2
+                    }
+                    pConsume()
+                    if tdepth <= 0 {
+                        break
+                    }
+                }
+            }
+            while pCheck(T_STAR) or pCheck(T_BIT_AND) or pCheck(T_CONST) {
+                if pCheck(T_STAR) {
+                    retType = retType + "*"
+                }
+                pConsume()
+            }
+            P_NEXTCPP = true
+            P_NEXTRET = retType
+            return parseFunctionDecl()
+        }
+    }
+    if !(la2 < P_N) {
+        return nil
+    }
+    let t2 = P_TOKS[la2][0]
+    if !(t2 == T_SEMICOLON or t2 == T_NEWLINE or t2 == T_ASSIGN or t2 == T_LPAREN or t2 == T_COMMA or t2 == T_LBRACKET) {
+        return nil
+    }
+    if hasStructKeyword {
+        pConsume()
+    }
+    let typeName = pConsume()[1]
+    if pCheck(T_LT) {
+        pSkipTemplateArgs()
+    }
+    let firstDecl = parseOneClassTypedVar(typeName, ln)
+    if !pCheck(T_COMMA) {
+        pSkipTerms()
+        return firstDecl
+    }
+    let stmts = [firstDecl]
+    while pCheck(T_COMMA) {
+        pConsume()
+        stmts.push(parseOneClassTypedVar(typeName, ln))
+    }
+    pSkipTerms()
+    return nBlock(stmts, ln)
+}
+
+# one variable of a class type: name, optional [dims], initializer
+fn parseOneClassTypedVar(typeName, ln) {
+    let isPtr = false
+    while pCheck(T_STAR) or pCheck(T_CONST) or pCheck(T_BIT_AND) {
+        if pCheck(T_STAR) {
+            isPtr = true
+        }
+        pConsume()
+    }
+    let varName = pExpect(T_IDENTIFIER, "Expected variable name")[1]
+    let dims = []
+    while pCheck(T_LBRACKET) {
+        pConsume()
+        if !pCheck(T_RBRACKET) {
+            try {
+                dims.push(parseExpr())
+            } catch (e) {
+                dims = dims
+            }
+        }
+        let depth = 1
+        while !pAtEnd() and depth > 0 {
+            if pCheck(T_LBRACKET) {
+                depth = depth + 1
+            } else if pCheck(T_RBRACKET) {
+                depth = depth - 1
+            }
+            pConsume()
+        }
+    }
+    let init = nil
+    if len(dims) > 0 and !pCheck(T_ASSIGN) {
+        # Type name[N]; — a zero-filled array
+        init = nCall(nIdent("__c_array__", ln), dims, ln)
+    } else if pCheck(T_LPAREN) {
+        # ClassName varName(args): the constructor call
+        let args = []
+        pConsume()
+        P_BRACEINIT = P_BRACEINIT + 1
+        while !pCheck(T_RPAREN) and !pAtEnd() {
+            args.push(parseExpr())
+            if !pMatch(T_COMMA) {
+                break
+            }
+        }
+        P_BRACEINIT = P_BRACEINIT - 1
+        if pCheck(T_RPAREN) {
+            pConsume()
+        }
+        init = nCall(nIdent(typeName, ln), args, ln)
+    } else if pMatch(T_ASSIGN) {
+        pSkipNewlines()
+        P_BRACEINIT = P_BRACEINIT + 1
+        init = parseExpr()
+        P_BRACEINIT = P_BRACEINIT - 1
+    } else {
+        # ClassName varName; — the default constructor
+        init = nCall(nIdent(typeName, ln), [], ln)
+    }
+    let decl = nVarDecl(false, varName, init, typeName, ln)
+    decl["isPointer"] = isPtr
+    return decl
+}
+
+fn parseBlockTerminator() {
+    let t = pType()
+    return t == T_EXCEPT or t == T_FINALLY or t == T_ELSE or t == T_ELIF
+}
+
+fn parseBlock() {
+    if pCheck(T_LBRACE) {
+        let ln = pLine()
+        pExpect(T_LBRACE, "Expected '{'")
+        pSkipNewlines()
+        let stmts = []
+        while !pCheck(T_RBRACE) and !pAtEnd() {
+            stmts.push(parseStatement())
+            pSkipNewlines()
+        }
+        pExpect(T_RBRACE, "Expected '}'")
+        return nBlock(stmts, ln)
+    }
+    if pCheck(T_INDENT) {
+        let ln = pLine()
+        pConsume()
+        pSkipNewlines()
+        let stmts = []
+        while !pCheck(T_DEDENT) and !pAtEnd() and !parseBlockTerminator() {
+            stmts.push(parseStatement())
+            pSkipNewlines()
+        }
+        if pCheck(T_DEDENT) {
+            pConsume()
+        }
+        return nBlock(stmts, ln)
+    }
+    parseError("Expected '{' or indented block", pLine())
+}
+
+# { block }, INDENT block, a single statement, or a bare ';' (empty body)
+fn parseBodyOrStatement() {
+    if pCheck(T_SEMICOLON) {
+        let ln = pLine()
+        pConsume()
+        return nBlock([], ln)
+    }
+    if pCheck(T_LBRACE) or pCheck(T_INDENT) {
+        return parseBlock()
+    }
+    let ln = pLine()
+    return nBlock([parseStatement()], ln)
+}
+
+# JS destructuring: let [a, , b = 1, ...rest] = e  /  const {x, y: alias, z = 0} = e
+fn parseDestructuringDecl(isConst) {
+    let ln = pLine()
+    let isArray = pCheck(T_LBRACKET)
+    let closer = T_RBRACE
+    if isArray {
+        closer = T_RBRACKET
+    }
+    pConsume()
+    let targets = []
+    let index = 0
+    let prevInCall = P_INCALL
+    P_INCALL = true
+    while !pCheck(closer) and !pAtEnd() {
+        pSkipNewlines()
+        if isArray and pCheck(T_COMMA) {
+            pConsume()
+            index = index + 1
+            continue
+        }
+        let tg = {"name": "", "key": "", "index": 0, "rest": false, "def": nil}
+        if pIsIdent("...") {
+            pConsume()
+            tg["rest"] = true
+        }
+        let first = pConsume()[1]
+        if !isArray and pCheck(T_COLON) {
+            pConsume()
+            tg["key"] = first
+            tg["name"] = pConsume()[1]
+        } else {
+            tg["name"] = first
+            tg["key"] = first
+        }
+        if pMatch(T_ASSIGN) {
+            tg["def"] = parseExpr()
+        }
+        tg["index"] = index
+        index = index + 1
+        targets.push(tg)
+        pSkipNewlines()
+        if !pMatch(T_COMMA) {
+            break
+        }
+    }
+    P_INCALL = prevInCall
+    pSkipNewlines()
+    if isArray {
+        pExpect(closer, "Expected ']' in destructuring pattern")
+    } else {
+        pExpect(closer, "Expected '}' in destructuring pattern")
+    }
+    pExpect(T_ASSIGN, "Expected '=' after destructuring pattern")
+    let init = parseExpr()
+    let tmp = "__destruct_" + str(P_DESTRUCT_N)
+    P_DESTRUCT_N = P_DESTRUCT_N + 1
+    let stmts = [nVarDecl(false, tmp, init, "", ln)]
+    let i = 0
+    while i < len(targets) {
+        let tg = targets[i]
+        let args = [nIdent(tmp, ln)]
+        if isArray {
+            args.push(nNumber(tg["index"], ln))
+        } else {
+            args.push(nString(tg["key"], ln))
+        }
+        args.push(nBool(tg["rest"], ln))
+        if tg["rest"] and !isArray {
+            let taken = []
+            let j = 0
+            while j < len(targets) {
+                if !targets[j]["rest"] {
+                    taken.push(nString(targets[j]["key"], ln))
+                }
+                j = j + 1
+            }
+            args.push(nArray(taken, ln))
+        }
+        let value = nCall(nIdent("__destructure__", ln), args, ln)
+        if tg["def"] != nil {
+            value = nBinary("??", value, tg["def"], ln)
+        }
+        stmts.push(nVarDecl(isConst, tg["name"], value, "", ln))
+        i = i + 1
+    }
+    pSkipTerms()
+    return nBlock(stmts, ln)
+}
+
+fn parseVarDecl(isConst) {
+    let ln = pLine()
+    if pCheck(T_LBRACKET) or pCheck(T_LBRACE) {
+        return parseDestructuringDecl(isConst)
+    }
+    let name = ""
+    if pCheck(T_IDENTIFIER) or isCTypeKeyword(pType()) {
+        name = pConsume()[1]
+    } else {
+        parseError("Expected variable name (got '" + pValue() + "')", pLine())
+    }
+    let typeHint = ""
+    if pCheck(T_COLON) {
+        pConsume()
+        if pCheck(T_IDENTIFIER) or isCTypeKeyword(pType()) {
+            typeHint = pConsume()[1]
+        }
+    }
+    let init = nil
+    if pMatch(T_ASSIGN) {
+        pSkipNewlines()
+        init = parseExpr()
+    }
+    # const W = 60, H = 24  /  let x = 1, y = 2
+    if pCheck(T_COMMA) {
+        let stmts = [nVarDecl(isConst, name, init, typeHint, ln)]
+        while pMatch(T_COMMA) {
+            pSkipNewlines()
+            if pAtEnd() or pCheck(T_NEWLINE) or pCheck(T_SEMICOLON) {
+                break
+            }
+            let n2 = ""
+            if pCheck(T_IDENTIFIER) {
+                n2 = pConsume()[1]
+            } else if isCTypeKeyword(pType()) {
+                n2 = pConsume()[1]
+            } else {
+                break
+            }
+            let h2 = ""
+            if pCheck(T_COLON) {
+                pConsume()
+                if pCheck(T_IDENTIFIER) or isCTypeKeyword(pType()) {
+                    h2 = pConsume()[1]
+                }
+            }
+            let init2 = nil
+            if pMatch(T_ASSIGN) {
+                pSkipNewlines()
+                init2 = parseExpr()
+            }
+            stmts.push(nVarDecl(isConst, n2, init2, h2, ln))
+        }
+        pSkipTerms()
+        return nBlock(stmts, ln)
+    }
+    pSkipTerms()
+    return nVarDecl(isConst, name, init, typeHint, ln)
+}
+
+fn parseFunctionDecl() {
+    let ln = pLine()
+    let isCpp = P_NEXTCPP
+    P_NEXTCPP = false
+    let isPython = P_NEXTPY
+    P_NEXTPY = false
+    let cReturnType = ""
+    if isCpp {
+        cReturnType = P_NEXTRET
+    }
+    P_NEXTRET = ""
+    let nameToken = nil
+    if pCheck(T_IDENTIFIER) or pCheck(T_INPUT) or pCheck(T_PRINT) {
+        nameToken = pConsume()
+    } else {
+        nameToken = pExpect(T_IDENTIFIER, "Expected function name")
+    }
+    let pl = parseParamList(true)
+    let returnType = ""
+    if pCheck(T_ARROW) or pCheck(T_FAT_ARROW) {
+        pConsume()
+        if pCheck(T_IDENTIFIER) or isCTypeKeyword(pType()) {
+            returnType = pConsume()[1]
+        } else {
+            while !pAtEnd() and !pCheck(T_COLON) and !pCheck(T_LBRACE) and !pCheck(T_NEWLINE) and !pCheck(T_INDENT) {
+                pConsume()
+            }
+        }
+    }
+    pMatch(T_COLON)
+    # a C++ constructor initializer list before the body: skipped
+    if pCheck(T_IDENTIFIER) {
+        let la = P_POS + 1
+        while la < P_N and P_TOKS[la][0] == T_NEWLINE {
+            la = la + 1
+        }
+        if la < P_N and (P_TOKS[la][0] == T_LPAREN or P_TOKS[la][0] == T_LBRACE) {
+            while !pAtEnd() and !pCheck(T_LBRACE) and !pCheck(T_INDENT) {
+                if pCheck(T_NEWLINE) {
+                    let la2 = P_POS + 1
+                    while la2 < P_N and P_TOKS[la2][0] == T_NEWLINE {
+                        la2 = la2 + 1
+                    }
+                    if la2 >= P_N or P_TOKS[la2][0] == T_LBRACE or P_TOKS[la2][0] == T_INDENT {
+                        break
+                    }
+                }
+                pConsume()
+            }
+        }
+    }
+    pSkipNewlines()
+    let fd = nFunctionDecl(nameToken[1], ln)
+    fd["params"] = pl["params"]
+    fd["paramTypes"] = pl["types"]
+    fd["paramIsRef"] = pl["isRef"]
+    fd["defaultArgs"] = pl["defaults"]
+    fd["returnType"] = returnType
+    fd["cReturnType"] = cReturnType
+    fd["cppParamTypes"] = pl["cppTypes"]
+    # a C++ prototype / forward declaration
+    if pCheck(T_SEMICOLON) or pCheck(T_NEWLINE) or pAtEnd() {
+        pSkipTerms()
+        fd["body"] = nBlock([], ln)
+        return fd
+    }
+    P_FNISCPP.push(isCpp)
+    if isPython {
+        P_PYDEPTH = P_PYDEPTH + 1
+    }
+    let body = nil
+    try {
+        body = parseBlock()
+    } catch (e) {
+        P_FNISCPP.pop()
+        if isPython {
+            P_PYDEPTH = P_PYDEPTH - 1
+        }
+        raise e
+    }
+    P_FNISCPP.pop()
+    if isPython {
+        P_PYDEPTH = P_PYDEPTH - 1
+    }
+    fd["pythonScope"] = isPython
+    fd["body"] = body
+    return fd
+}
+
+fn parseIfStmt() {
+    let ln = pLine()
+    # C++17: if (auto name = expr) { ... }
+    if pCheck(T_LPAREN) and P_POS + 2 < P_N and P_TOKS[P_POS + 1][0] == T_IDENTIFIER and P_TOKS[P_POS + 1][1] == "auto" and P_TOKS[P_POS + 2][0] == T_IDENTIFIER {
+        if P_POS + 3 < P_N and P_TOKS[P_POS + 3][0] == T_ASSIGN {
+            pConsume()
+            pConsume()
+            let varName = pConsume()[1]
+            pConsume()
+            let initExpr = parseExpr()
+            pExpect(T_RPAREN, "Expected ')'")
+            pMatch(T_COLON)
+            pSkipNewlines()
+            let thenB = parseBodyOrStatement()
+            pSkipNewlines()
+            let elseB = nil
+            if pCheck(T_ELSE) {
+                pConsume()
+                pSkipNewlines()
+                if pCheck(T_IF) {
+                    pConsume()
+                    elseB = parseIfStmt()
+                } else {
+                    pMatch(T_COLON)
+                    pSkipNewlines()
+                    elseB = parseBodyOrStatement()
+                }
+            }
+            let varDecl = nVarDecl(false, varName, initExpr, "auto", ln)
+            let ifNode = nIf(nIdent(varName, ln), thenB, elseB, ln)
+            return nBlock([varDecl, ifNode], ln)
+        }
+    }
+    let cond = parseCondition()
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let thenB = parseBodyOrStatement()
+    pSkipNewlines()
+    let elseB = nil
+    if pCheck(T_ELIF) {
+        pConsume()
+        elseB = parseIfStmt()
+    } else if pCheck(T_ELSE) {
+        pConsume()
+        pSkipNewlines()
+        if pCheck(T_IF) {
+            pConsume()
+            elseB = parseIfStmt()
+        } else {
+            pMatch(T_COLON)
+            pSkipNewlines()
+            elseB = parseBodyOrStatement()
+        }
+    }
+    return nIf(cond, thenB, elseB, ln)
+}
+
+# `if (found) ++count;`: a parenthesized condition followed by ++ / -- ends at ')'
+fn parseCondition() {
+    if pCheck(T_LPAREN) {
+        let depth = 0
+        let j = P_POS
+        while j < P_N {
+            if P_TOKS[j][0] == T_LPAREN {
+                depth = depth + 1
+            } else if P_TOKS[j][0] == T_RPAREN {
+                depth = depth - 1
+                if depth == 0 {
+                    break
+                }
+            }
+            j = j + 1
+        }
+        if j + 1 < P_N and (P_TOKS[j + 1][0] == T_PLUS_PLUS or P_TOKS[j + 1][0] == T_MINUS_MINUS) {
+            pConsume()
+            let cond = parseExpr()
+            pExpect(T_RPAREN, "Expected ')'")
+            return cond
+        }
+    }
+    return parseExpr()
+}
+
+fn parseWhileStmt() {
+    let ln = pLine()
+    let cond = parseCondition()
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let body = parseBodyOrStatement()
+    return nWhile(cond, body, nil, ln)
+}
+
+# switch (x) { case a: ... default: ... } → a fall-through if-chain in a one-pass loop
+fn parseSwitchStmt() {
+    let ln = pLine()
+    pConsume()
+    pExpect(T_LPAREN, "Expected '(' after switch")
+    let subject = parseExpr()
+    pExpect(T_RPAREN, "Expected ')' after switch expression")
+    pSkipNewlines()
+    pExpect(T_LBRACE, "Expected '{' to open switch body")
+    pSkipNewlines()
+    let valName = "__sw_val_" + str(P_SW_N)
+    let hitName = "__sw_hit_" + str(P_SW_N)
+    P_SW_N = P_SW_N + 1
+    let outer = [nVarDecl(false, valName, subject, "", ln), nVarDecl(false, hitName, nBool(false, ln), "", ln)]
+    let loopBody = []
+    while !pAtEnd() and !pCheck(T_RBRACE) {
+        pSkipNewlines()
+        if pCheck(T_RBRACE) or pAtEnd() {
+            break
+        }
+        if pIsIdent("case") {
+            let cln = pLine()
+            pConsume()
+            let caseVal = parseExpr()
+            pExpect(T_COLON, "Expected ':' after case value")
+            pSkipNewlines()
+            let caseBody = [nExprStmt(nAssign("=", nIdent(hitName, cln), nBool(true, cln), cln), cln)]
+            while !pAtEnd() and !pCheck(T_RBRACE) and !pIsIdent("case") and !pIsIdent("default") {
+                caseBody.push(parseStatement())
+                pSkipNewlines()
+            }
+            let eq = nBinary("==", nIdent(valName, cln), caseVal, cln)
+            let cond = nBinary("or", nIdent(hitName, cln), eq, cln)
+            loopBody.push(nIf(cond, nBlock(caseBody, cln), nil, cln))
+        } else if pIsIdent("default") {
+            pConsume()
+            pExpect(T_COLON, "Expected ':' after default")
+            pSkipNewlines()
+            while !pAtEnd() and !pCheck(T_RBRACE) and !pIsIdent("case") and !pIsIdent("default") {
+                loopBody.push(parseStatement())
+                pSkipNewlines()
+            }
+        } else {
+            pConsume()
+        }
+    }
+    pExpect(T_RBRACE, "Expected '}' to close switch")
+    loopBody.push(nBreak(ln))
+    outer.push(nWhile(nBool(true, ln), nBlock(loopBody, ln), nil, ln))
+    return nBlock(outer, ln)
+}

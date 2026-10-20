@@ -11,8 +11,8 @@
 // anything imported — no separate "import" concept exists at compile time
 // at all, which is why nothing further needs to change in Compiler*.cpp.
 //
-// `sourcePath` is the path of the file being resolved (used to find
-// qpm_modules/ next to it, and to resolve relative imports). Throws
+// `sourcePath` is the path of the file being resolved (used to find the
+// quantum_qubits/ folder qpm installs packages into, and to resolve relative imports). Throws
 // ParseError on: module not found, circular imports, or `from X import Y`
 // where Y isn't an exported member of X.
 void resolveImports(ASTNode &root, const std::string &sourcePath);
@@ -25,9 +25,9 @@ void resolveImports(ASTNode &root, const std::string &sourcePath);
 // warning.
 //
 //   # @use ./helpers.sa        relative to the using file
-//   # @use quantum-strings     <root>/node_modules/<name>, then each of the
-//                              root package.json's "quantum.paths" dirs;
-//                              the package's "main", else index.sa
+//   # @use quantum-strings     <root>/quantum_qubits/<name>, <root>/node_modules/<name>,
+//                              then each of the root package.json's "quantum.paths"
+//                              dirs; the package's "main", else index.sa
 //   # @use quantum-strings/x.sa  a file inside that package
 //
 // <root> is the nearest directory at or above `sourcePath` holding a

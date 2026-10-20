@@ -1,7 +1,9 @@
 #include "QpmResolver.h"
+#include "QpmColor.h"
 #include "QpmJson.h"
 #include "QpmManifest.h"
 #include "QpmHttp.h"
+#include "QpmPaths.h"
 #include "QpmRegistry.h"
 #include "QpmSemver.h"
 #include "QpmGzip.h"
@@ -171,12 +173,16 @@ namespace qpm
         // while the calling thread blocks on a network call. stop() always
         // joins the thread before returning, so by the time the caller does
         // its own console output (e.g. an error to stderr), the spinner
-        // thread is guaranteed dead — no concurrent-stdout hazard.
+        // thread is guaranteed dead — no concurrent-stdout hazard. Through a
+        // pipe or into a file it doesn't animate (that would only leave
+        // frames behind) and just prints the final line.
         class Spinner
         {
         public:
             explicit Spinner(std::string label) : label_(std::move(label))
             {
+                if (!stdoutIsConsole())
+                    return;
                 running_.store(true);
                 thread_ = std::thread([this]
                 {
@@ -193,17 +199,18 @@ namespace qpm
 
             // Stops the spinner and overwrites its line with `finalLine` (or
             // just clears it, cursor back at column 0, if `finalLine` is empty).
+            // `finalLine` may carry color codes.
             void stop(const std::string &finalLine)
             {
-                if (!running_.exchange(false))
+                if (stopped_)
                     return;
-                if (thread_.joinable())
-                    thread_.join();
-                size_t width = label_.size() + 4;
-                std::string padded = finalLine;
-                if (padded.size() < width)
-                    padded.append(width - padded.size(), ' ');
-                std::cout << '\r' << padded << '\r';
+                stopped_ = true;
+                if (running_.exchange(false))
+                {
+                    if (thread_.joinable())
+                        thread_.join();
+                    std::cout << '\r' << std::string(label_.size() + 4, ' ') << '\r';
+                }
                 if (!finalLine.empty())
                     std::cout << finalLine << '\n';
                 std::cout.flush();
@@ -214,15 +221,24 @@ namespace qpm
         private:
             std::string label_;
             std::atomic<bool> running_{false};
+            bool stopped_ = false;
             std::thread thread_;
+        };
+
+        // A registry document, and whether a QPM registry served it (a Quantum
+        // package, installed into quantum_qubits) or the npm upstream did (an npm
+        // package, installed into node_modules).
+        struct PackageMeta
+        {
+            JsonValue doc;
+            bool quantum = false;
         };
 
         struct ResolveState
         {
             fs::path projectDir;
-            fs::path rootNodeModules;
             std::map<std::string, std::string> rootChosen;      // name -> version
-            std::map<std::string, JsonValue> metaCache;          // name -> registry doc
+            std::map<std::string, PackageMeta> metaCache;        // name -> registry doc
             std::map<std::string, std::string> tarballCache;     // "name@version" -> inflated tar bytes
             std::set<std::string> expandedDeps;                  // "name@version" already had children enqueued
             std::map<std::string, JsonValue> previousLock;       // lock key -> entry, from a prior qpm-lock.json
@@ -230,22 +246,28 @@ namespace qpm
             int installedCount = 0;
             int upToDateCount = 0;
             int failedCount = 0;
+            int movedCount = 0;                                  // Quantum packages moved out of node_modules
+            bool usedQubits = false;                             // anything is in a quantum_qubits folder
             std::set<std::string> platformSkipped;               // lock keys of optional deps built for another os/cpu
         };
 
-        const JsonValue *fetchMeta(ResolveState &st, const std::string &name, std::string &error)
+        const PackageMeta *fetchMeta(ResolveState &st, const std::string &name, std::string &error)
         {
             auto it = st.metaCache.find(name);
             if (it != st.metaCache.end())
                 return &it->second;
 
             const char *accept = "application/vnd.npm.install-v1+json";
-            HttpResponse resp = httpGet(registryBaseUrl() + urlEncodeComponent(name), accept);
+            std::string registry = registryBaseUrl();
+            HttpResponse resp = httpGet(registry + urlEncodeComponent(name), accept);
             // The QPM registry hosts Quantum packages; a package it has never
             // heard of (react, vite, ...) comes from the upstream npm registry.
             std::string upstream = upstreamRegistryUrl();
-            if (resp.error.empty() && resp.status == 404 && !upstream.empty() && upstream != registryBaseUrl())
-                resp = httpGet(upstream + urlEncodeComponent(name), accept);
+            if (resp.error.empty() && resp.status == 404 && !upstream.empty() && upstream != registry)
+            {
+                registry = upstream;
+                resp = httpGet(registry + urlEncodeComponent(name), accept);
+            }
             if (!resp.ok())
             {
                 error = "failed to fetch metadata for " + name + " (" +
@@ -254,8 +276,10 @@ namespace qpm
             }
             try
             {
-                JsonValue doc = JsonValue::parse(resp.body);
-                auto [ins, ok] = st.metaCache.emplace(name, std::move(doc));
+                PackageMeta meta;
+                meta.doc = JsonValue::parse(resp.body);
+                meta.quantum = isQpmRegistry(registry);
+                auto [ins, ok] = st.metaCache.emplace(name, std::move(meta));
                 return &ins->second;
             }
             catch (const std::exception &e)
@@ -368,8 +392,41 @@ namespace qpm
 
         void installDependencies(ResolveState &st, const JsonValue &pkg, const fs::path &pkgDir);
 
+        // Removes the copy of a Quantum package an older qpm left at
+        // node_modules/<name>, the .bin shims that pointed into it, and the
+        // node_modules folder itself if nothing else is in it. True if removed.
+        bool removeOldInstall(const fs::path &oldDir)
+        {
+            std::error_code ec;
+            if (fs::remove_all(oldDir, ec) == 0 || ec)
+                return false;
+
+            fs::path modulesDir = oldDir.parent_path();
+            fs::path binDir = modulesDir / ".bin";
+            std::string target = "\\..\\" + oldDir.filename().string() + "\\"; // see writeBinShim
+            for (const auto &entry : fs::directory_iterator(binDir, ec))
+                if (entry.path().extension() == ".cmd" && readFile(entry.path()).find(target) != std::string::npos)
+                    fs::remove(entry.path(), ec);
+            if (fs::is_directory(binDir, ec) && fs::is_empty(binDir, ec))
+                fs::remove(binDir, ec);
+            if (fs::is_empty(modulesDir, ec) && !ec)
+                fs::remove(modulesDir, ec);
+            return true;
+        }
+
+        // True if the last install recorded the package at `lockKey` as downloaded
+        // from a QPM registry, whose tarball URLs live under .../api/registry/.
+        bool lockedAsQuantum(const ResolveState &st, const std::string &lockKey)
+        {
+            auto prev = st.previousLock.find(lockKey);
+            return prev != st.previousLock.end() &&
+                   prev->second.get("resolved").asString().find("/api/registry/") != std::string::npos;
+        }
+
         // Places `name` satisfying `range` either by reusing an already-chosen
         // root version, claiming the root slot, or nesting under parentPkgDir.
+        // A Quantum package (from the QPM registry) goes into a quantum_qubits
+        // folder, an npm package into node_modules, where Node.js looks for it.
         // An `optional` dependency that is built for another os/cpu is skipped,
         // and one that fails to install is a warning instead of a failure (npm).
         bool placeAndExpand(ResolveState &st, const std::string &name, const std::string &range,
@@ -385,8 +442,13 @@ namespace qpm
             }
 
             bool useRoot = isRootLevel || rootIt == st.rootChosen.end();
-            fs::path destDir = useRoot ? (st.rootNodeModules / name) : (parentPkgDir / "node_modules" / name);
-            std::string lockKey = toPosix(fs::relative(destDir, st.projectDir));
+            fs::path base = useRoot ? st.projectDir : parentPkgDir;
+            fs::path qubitsDir = base / kQubitsDir / name;
+            fs::path npmDir = base / kNodeModulesDir / name;
+            auto keyOf = [&](const fs::path &dir) { return toPosix(fs::relative(dir, st.projectDir)); };
+            const std::string npmKey = keyOf(npmDir);
+            fs::path destDir;    // which of the two, once known
+            std::string lockKey; // destDir relative to the project
 
             auto recordLock = [&](const std::string &version, const std::string &resolvedUrl)
             {
@@ -407,13 +469,22 @@ namespace qpm
             };
 
             // Fast path: already correctly installed on disk from a previous
-            // run — skip metadata fetch + download entirely.
+            // run — skip metadata fetch + download entirely. Before quantum_qubits
+            // existed, qpm put Quantum packages in node_modules too; one the
+            // lockfile says came from the QPM registry is reinstalled below,
+            // which moves it.
             std::string diskVersion;
-            if (trySatisfyFromDisk(range, destDir, diskVersion))
+            if (trySatisfyFromDisk(range, qubitsDir, diskVersion))
+                destDir = qubitsDir;
+            else if (!lockedAsQuantum(st, npmKey) && trySatisfyFromDisk(range, npmDir, diskVersion))
+                destDir = npmDir;
+            if (!destDir.empty())
             {
+                lockKey = keyOf(destDir);
                 if (useRoot)
                     st.rootChosen[name] = diskVersion;
                 ++st.upToDateCount;
+                st.usedQubits = st.usedQubits || destDir == qubitsDir;
 
                 JsonValue diskPkg;
                 try
@@ -430,18 +501,19 @@ namespace qpm
             }
 
             // An optional dependency the last install already found to be for
-            // another os/cpu: skip it without asking the registry again.
+            // another os/cpu (always an npm package): skip it without asking the
+            // registry again.
             if (optional)
             {
-                auto prev = st.previousLock.find(lockKey);
+                auto prev = st.previousLock.find(npmKey);
                 SemVer prevVersion;
                 if (prev != st.previousLock.end() && prev->second.get("optional").asBool() &&
                     !platformAllows(prev->second) &&
                     SemVer::tryParse(prev->second.get("version").asString(), prevVersion) &&
                     SemVerRange(range).satisfies(prevVersion))
                 {
-                    st.lockPackages.set(lockKey, prev->second);
-                    st.platformSkipped.insert(lockKey);
+                    st.lockPackages.set(npmKey, prev->second);
+                    st.platformSkipped.insert(npmKey);
                     return false;
                 }
             }
@@ -462,14 +534,16 @@ namespace qpm
                 return false;
             };
 
-            const JsonValue *meta = fetchMeta(st, name, opError);
+            const PackageMeta *meta = fetchMeta(st, name, opError);
             if (!meta)
                 return fail(opError);
-            std::string version = resolveVersion(*meta, range);
+            destDir = meta->quantum ? qubitsDir : npmDir;
+            lockKey = keyOf(destDir);
+            std::string version = resolveVersion(meta->doc, range);
             if (version.empty())
                 return fail("no version of " + name + " satisfies \"" + range + "\"");
 
-            const JsonValue *verMeta = meta->find("versions");
+            const JsonValue *verMeta = meta->doc.find("versions");
             verMeta = verMeta ? verMeta->find(version) : nullptr;
             if (optional && verMeta && !platformAllows(*verMeta))
             {
@@ -498,12 +572,18 @@ namespace qpm
             if (!downloadAndExtract(st, name, version, tarballUrl, destDir, opError))
                 return fail(opError);
 
+            // The copy an older qpm put in node_modules is replaced by this one.
+            bool moved = meta->quantum && lockedAsQuantum(st, npmKey) && removeOldInstall(npmDir);
+            st.movedCount += moved ? 1 : 0;
+
             if (useRoot)
                 st.rootChosen[name] = version;
 
             ++st.installedCount;
-            std::string resultLine = "  + " + name + "@" + version +
-                                      (useRoot ? "" : "  (nested under " + parentPkgDir.filename().string() + ")");
+            st.usedQubits = st.usedQubits || meta->quantum;
+            std::string resultLine = "  " + paint("+", "1;32") + " " + paint(name, "1") + paint("@" + version, "90") +
+                                      "  " + paint(lockKey, meta->quantum ? "38;5;208" : "36") +
+                                      (moved ? paint("  (moved from node_modules)", "90") : "");
             spinner.stop(resultLine);
 
             recordLock(version, tarballUrl);
@@ -571,12 +651,8 @@ namespace qpm
 
         bool pkgJsonDirty = !existed;
 
-        fs::path nodeModules = projectDir / "node_modules";
-        fs::create_directories(nodeModules);
-
         ResolveState st;
         st.projectDir = projectDir;
-        st.rootNodeModules = nodeModules;
 
         fs::path lockPath = projectDir / "qpm-lock.json";
         if (fs::exists(lockPath))
@@ -603,10 +679,10 @@ namespace qpm
             if (recordedRange.empty())
             {
                 std::string ignoredError;
-                const JsonValue *meta = fetchMeta(st, name, ignoredError);
+                const PackageMeta *meta = fetchMeta(st, name, ignoredError);
                 if (meta)
                 {
-                    std::string latest = resolveVersion(*meta, "latest");
+                    std::string latest = resolveVersion(meta->doc, "latest");
                     if (!latest.empty())
                         recordedRange = "^" + latest;
                 }
@@ -650,11 +726,16 @@ namespace qpm
 
         std::cout << "\n[qpm] " << st.installedCount << " package(s) installed, "
                   << st.upToDateCount << " already up to date";
+        if (st.movedCount > 0)
+            std::cout << ", " << st.movedCount << " moved from node_modules to " << kQubitsDir;
         if (!st.platformSkipped.empty())
             std::cout << ", " << st.platformSkipped.size() << " optional skipped (other platforms)";
         if (st.failedCount > 0)
             std::cout << ", " << st.failedCount << " failed to resolve";
         std::cout << "\n";
+        if (st.usedQubits)
+            std::cout << "[qpm] Quantum packages are in " << paint((projectDir / kQubitsDir).string(), "38;5;208")
+                      << "; `import <name>` or `# @use <name>` finds them\n";
 
         return st.failedCount > 0 ? 1 : 0;
     }

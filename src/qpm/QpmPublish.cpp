@@ -47,7 +47,7 @@ namespace qpm
         // Never packed, at any depth: VCS dirs, installed deps, lockfiles,
         // credentials and ignore files (npm's built-in list, plus qpm's own files).
         const std::set<std::string> kAlwaysIgnored = {
-            ".git", ".svn", ".hg", "CVS", "node_modules", ".DS_Store", "npm-debug.log",
+            ".git", ".svn", ".hg", "CVS", "node_modules", "quantum_qubits", ".DS_Store", "npm-debug.log",
             ".npmrc", ".qpmrc", ".npmignore", ".qpmignore", ".gitignore",
             "package-lock.json", "qpm-lock.json", "yarn.lock", "pnpm-lock.yaml"};
 

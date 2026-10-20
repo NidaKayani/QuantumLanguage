@@ -15,6 +15,19 @@ void printBanner();
 void printAura();
 void printHelp(const char *prog);
 
+// ─── Global flags ─────────────────────────────────────────────────────────
+// --stage-marker: once the program has compiled, write kStageMarker to stderr
+// before it starts running, so a caller capturing the output (the execution
+// API) can tell a compile error from a runtime one. Diagnostics printed before
+// the marker are compile output; everything after it comes from the program.
+extern bool g_stageMarker;
+inline const char *kStageMarker = "\x1e[quantum:compiled]\x1e\n";
+
+// Removes the global flags (--strict, --stage-marker) that precede the
+// command or file in argv, setting g_strictMode / g_stageMarker. Arguments
+// after the source file belong to the program and are left alone.
+std::vector<char *> takeGlobalFlags(int argc, char *argv[]);
+
 // ─── Running a single file ────────────────────────────────────────────────
 // Interpret in place (no .exe produced). Exits non-zero on error.
 void runFile(const std::string &path, bool debug = false);
@@ -42,6 +55,14 @@ int runTestExamples(const std::string &dir);
 // child, never the whole suite. On a handled error it prints a structured
 // marker line to stdout and returns 2; a clean run returns 0.
 int runSingleFileForTest(const std::string &path);
+
+// ─── Self-hosting support (selfhost/) ─────────────────────────────────────
+// --dump-tokens: the C++ lexer's tokens, one per line (type, line, col, value).
+int dumpTokens(const std::string &path);
+// --emit-qbc: compiles a program and writes its serialized bytecode.
+int emitBytecodeFile(const std::string &path, const std::string &outPath);
+// --exec: runs a serialized bytecode file (args after it go to sys.argv).
+int execBytecodeFile(const std::string &path);
 
 // ─── Standalone .exe bundling ─────────────────────────────────────────────
 // Path of the currently running executable.

@@ -124,6 +124,9 @@ private:
     void compileAddressOf(AddressOfExpr &e, int line);
     void compileDeref(DerefExpr &e, int line);
     void compileArrow(ArrowExpr &e, int line);
+    // Java front-end intrinsics: calls to __jx_*__ names compiled to the
+    // J_* opcodes (src/java/ emits them). False when `e` is not one.
+    bool compileJavaIntrinsic(CallExpr &e, int line);
 
     // Helper: compile a function body into a new Chunk
     std::shared_ptr<Chunk> compileFunction(

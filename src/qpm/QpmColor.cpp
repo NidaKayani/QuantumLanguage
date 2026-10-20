@@ -55,6 +55,16 @@ namespace qpm
         g_color = 0;
     }
 
+    bool stdoutIsConsole()
+    {
+#ifdef _WIN32
+        DWORD mode = 0;
+        return GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode) != 0;
+#else
+        return isatty(1);
+#endif
+    }
+
     std::string paint(const std::string &text, const char *sgr)
     {
         return colorEnabled() ? std::string("\x1b[") + sgr + "m" + text + "\x1b[0m" : text;

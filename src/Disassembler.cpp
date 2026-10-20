@@ -163,6 +163,24 @@ static const char *opName(Op op)
         return "PRINT";
     case Op::KW_NAMES:
         return "KW_NAMES";
+    case Op::J_BIN:
+        return "J_BIN";
+    case Op::J_UN:
+        return "J_UN";
+    case Op::J_INVOKE:
+        return "J_INVOKE";
+    case Op::J_GETF:
+        return "J_GETF";
+    case Op::J_PUTF:
+        return "J_PUTF";
+    case Op::J_ALOAD:
+        return "J_ALOAD";
+    case Op::J_ASTORE:
+        return "J_ASTORE";
+    case Op::J_INSTOF:
+        return "J_INSTOF";
+    case Op::J_CAST:
+        return "J_CAST";
     default:
         return "??";
     }

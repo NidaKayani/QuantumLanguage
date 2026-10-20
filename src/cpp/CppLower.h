@@ -75,6 +75,7 @@ TP tBool();
 TP tChar();
 TP tStr();
 TP tCStr();
+TP tBuf(long n); // char buf[N]: a C char buffer (a Str held in a slot)
 TP tVoid();
 TP tDyn();
 
@@ -82,6 +83,8 @@ bool isIntegral(const TP &t); // char, ints, bool, enums
 bool isArith(const TP &t);
 bool isFloat(const TP &t);
 bool isStringy(const TP &t); // Str or CStr
+bool isCBuf(const TP &t);    // a C char array
+bool isI64(const TP &t);     // long long / unsigned long long: exact int64 at run time
 bool isObjectRep(const TP &t); // a mutable runtime object (class, containers, streams)
 bool needsCopy(const TP &t);
 bool sameType(const TP &a, const TP &b);
@@ -112,6 +115,7 @@ struct FuncInfo
     std::string vkey;            // virtual dispatch key
     bool lowered = false;
     int tu = 0;
+    std::string access = "public"; // members
 };
 
 struct FieldInfo
@@ -124,6 +128,8 @@ struct FieldInfo
     bool isStatic = false;
     std::string global; // static members
     DeclP decl;
+    bool isConst = false;
+    std::string access = "public";
 };
 
 struct ClassInfo
@@ -139,6 +145,7 @@ struct ClassInfo
     bool polymorphic = false;
     bool hasUserCtor = false;
     bool aggregate = true;
+    bool isUnion = false;       // members share one slot
     bool builtin = false;       // std::exception family
     bool resolved = false, resolving = false;
     bool isTemplate = false;
@@ -147,6 +154,9 @@ struct ClassInfo
     Scope *outer = nullptr;
     bool lowered = false;
     std::vector<ClassInfo *> inheritCtorsFrom;
+    std::set<std::string> friends; // functions and classes declared friend
+    FuncInfo *dtor = nullptr;      // user-declared destructor
+    std::string dtorFn() const { return qname + "#dtor"; }
     std::string aggFn() const { return qname + "#agg"; }
     std::string defaultCtorFn() const { return qname + "#ctor"; }
     std::string desc() const { return qname + "#desc"; }
@@ -179,6 +189,7 @@ struct Symbol
     long long value = 0; // Enumerator
     DeclP aliasDecl;     // unresolved alias
     Scope *aliasScope = nullptr;
+    bool isConst = false; // Var: a read-only global
 };
 
 struct Scope
@@ -213,7 +224,16 @@ struct XV
     bool isFuncName = false;
     std::vector<FuncInfo *> overloads; // an unresolved function name
     ExprP self;                         // member function name: the object expression
-    bool constLv = false;
+    bool constLv = false;   // a read-only lvalue: assigning it is an error
+    std::string constName;  // "variable 'x'" / "member 'C::x'" (for that error)
+    // malloc / calloc / realloc: what to allocate is known once the result
+    // converts to a pointer type (`int *a = malloc(n * sizeof(int))`)
+    struct Alloc
+    {
+        std::shared_ptr<ASTNodePtr> bytes; // byte count
+        std::shared_ptr<ASTNodePtr> old;   // realloc: the block resized
+    };
+    std::shared_ptr<Alloc> alloc;
 };
 
 // ─── Lowerer ───────────────────────────────────────────────────────────────
@@ -226,12 +246,15 @@ struct Local
     bool refSlot = false; // holds a Ref [container, key] (non-const T& of a scalar)
     bool alias = false;   // a reference bound to an lvalue
     std::shared_ptr<XV> aliasOf;
+    std::string name;     // as declared
+    bool isConst = false; // const T x / const T& x: read-only
 };
 
 struct LoopCtx
 {
     bool isSwitch = false;
     std::string contFlag; // switch inside a loop: `continue` sets this, then breaks
+    size_t scopeDepth = 0; // scopes open outside the loop body (break / continue leave the rest)
 };
 
 struct FnCtx
@@ -244,6 +267,7 @@ struct FnCtx
     bool isLambda = false;
     TP deducedRet; // lambdas without a declared return type
     std::vector<std::map<std::string, Local>> scopes;
+    std::vector<std::vector<Local>> owned; // per scope: objects destroyed when it ends
     std::set<std::string> boxed;   // Quantum local names stored boxed
     std::set<std::string> wantBox; // discovered this pass
     std::map<std::string, int> nameCount;
@@ -285,6 +309,10 @@ public:
     std::string tempName();
     TP elemType(const TP &t);
     TP deref(const TP &t);
+    // sizeof / alignof as gcc on x86-64 Windows lays types out (LLP64)
+    long sizeOfType(const TP &t);
+    long alignOfType(const TP &t);
+    XV materializeAlloc(XV &x, const TP &elem, int line);
     int line_ = 0;
     FnCtx *fn_ = nullptr;
     std::vector<ASTNodePtr> *pre_ = nullptr; // hoisted temps of the current statement
@@ -359,6 +387,20 @@ private:
                     bool &handled);
     XV incdec(XV x, bool inc, bool postfix, int line);
     XV addressOf(XV x, int line);
+    ASTNodePtr charPtr(XV &x, int line); // a char buffer / char* argument as a char*
+    long bufInitSize(const std::vector<ExprP> &args, bool braced);
+    long arrayInitSize(const TP &t, const std::vector<ExprP> &args, bool braced);
+    long initSlots(const TP &t); // the scalars a member takes under brace elision
+    // strictness: what g++ / gcc reject
+    bool stdVisible(const std::string &name, Scope *sc); // `using namespace std` / `using std::name`
+    void checkAccess(ClassInfo *owner, const std::string &access, const std::string &what, int line);
+    std::string diagType(const TP &t);
+    bool explicitConv_ = false; // converting for an explicit cast
+    FuncInfo *curFn_ = nullptr; // the function being lowered
+    // gcc evaluates a call's arguments right to left: with more than one
+    // argument having side effects, those are lowered first, last to first
+    void preEvalArgs(const std::vector<ExprP> &args, std::vector<XV> &out, size_t from,
+                     const std::function<TP(size_t)> &target);
     XV derefXV(XV x, int line);
     XV fieldOf(XV obj, ClassInfo *c, const std::string &name, int line, bool &found);
     XV memberFuncRef(XV obj, ClassInfo *c, const std::string &name, int line, bool &found);
@@ -382,6 +424,36 @@ public:
     XV libName(const std::vector<std::string> &name, int line, bool &found);
     ASTNodePtr peekRead(const XV &x);
     XV localXV(Local *l);
+    XV localXVRaw(Local *l);
+    XV lowerLambdaBody(const ExprP &e);
+    // function templates: an instance per template-argument binding
+    void deduce(const TypeNameP &p, const TP &a, const std::vector<std::string> &tps, std::map<std::string, TP> &bind);
+    FuncInfo *instantiate(FuncInfo *f, const std::vector<XV> &vals, const std::vector<TArg> &targs, int line);
+    std::map<std::string, FuncInfo *> instances_;
+    // object lifetimes: destructors at scope exit / delete, smart pointers
+    bool needsDtor(ClassInfo *c);
+    bool ownsResource(const TP &t);
+    ASTNodePtr destroyValue(const TP &t, ASTNodePtr v, int line);
+    void emitDestroy(size_t fromDepth, std::vector<ASTNodePtr> &out, const std::string &except = "");
+    bool anyOwned(size_t fromDepth);
+    LoopCtx loopCtx();
+    FuncInfo *userCopyCtor(ClassInfo *c);
+    std::map<ClassInfo *, int> dtorMemo_;
+    // class templates: an instance per argument list (phase_: how far run() is)
+    TP instantiateClass(ClassInfo *tc, const std::vector<TArg> &targs, Scope *sc);
+    void copyTemplateDefs(ClassInfo *c);
+    void mangleMethods(ClassInfo *c);
+    std::map<std::string, ClassInfo *> classInstances_;
+    std::map<ClassInfo *, ClassInfo *> instanceOf_;
+    int phase_ = 0;
+    // temporaries of classes with destructors: destroyed when their full
+    // expression ends (-1: not inside one that destroys them)
+    int tempsTracked_ = -1;
+    std::string tempsMark_; // the statement's mark (returns end their temporaries before returning)
+    ASTNodePtr lowerStmtInner(const StmtP &s);
+    ASTNodePtr trackTemp(ASTNodePtr v, const TP &t, int line);
+    void untrackTemp(XV &x);
+    ASTNodePtr endTemps(ASTNodePtr stmt, const std::string &mark, int line);
     XV callArgs(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int line, bool virt,
                 std::vector<XV> *lowered = nullptr);
     TP probeType(const ExprP &e);

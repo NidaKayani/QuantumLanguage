@@ -52,6 +52,7 @@ struct ParseFail
     std::string msg;
     int line;
     int file = 0;
+    int col = 0;
 };
 
 const std::set<std::string> &builtinWords()
@@ -73,8 +74,19 @@ const std::set<std::string> &specifierWords()
 class Parser
 {
 public:
-    explicit Parser(const Preprocessed &pp) : t_(pp.tokens), files_(pp.files)
+    explicit Parser(const Preprocessed &pp) : t_(pp.tokens), files_(pp.files), cMode_(pp.cMode)
     {
+        if (cMode_)
+        {
+            // C: only the typedef names its standard headers declare.
+            static const char *c_types[] = {
+                "size_t", "ptrdiff_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+                "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t", "FILE", "time_t",
+                "clock_t", "ssize_t", "wchar_t", "va_list", "nullptr_t"};
+            for (const char *n : c_types)
+                types_.insert(n);
+            return;
+        }
         static const char *std_types[] = {
             "string", "wstring", "string_view", "vector", "map", "unordered_map", "set", "unordered_set",
             "multimap", "multiset", "pair", "tuple", "optional", "variant", "monostate", "unique_ptr",
@@ -108,6 +120,7 @@ public:
     {
         Program prog;
         prog.files = files_;
+        prog.cMode = cMode_;
         while (!at(TK::End))
         {
             auto ds = parseDecl(false, "");
@@ -119,6 +132,8 @@ public:
 private:
     std::vector<Token> t_;
     const std::vector<std::string> &files_;
+    bool cMode_ = false; // parsing C, not C++ (Preprocessed::cMode)
+    std::set<std::string> cTags_; // C struct/union tags: types only after their keyword
     size_t p_ = 0;
     std::set<std::string> types_;     // last name component of every known type
     std::set<std::string> templates_; // names that take <template arguments>
@@ -147,7 +162,31 @@ private:
         }
         return false;
     }
-    [[noreturn]] void fail(const std::string &msg) const { throw ParseFail{msg, cur().line, cur().file}; }
+    // The parser backtracks (declaration first, then expression), so the
+    // failure that propagates is often a later, shallower attempt. The one
+    // that got furthest into the tokens is the parse the author meant: it is
+    // what a syntax error is reported as (see parse()).
+    [[noreturn]] void fail(const std::string &msg) const
+    {
+        ParseFail f{msg, cur().line, cur().file, cur().col};
+        if (!haveFurthest_ || p_ > furthestPos_)
+        {
+            furthest_ = f;
+            furthestPos_ = p_;
+            haveFurthest_ = true;
+        }
+        throw f;
+    }
+
+public:
+    const ParseFail &furthestFailure(const ParseFail &last) const { return haveFurthest_ ? furthest_ : last; }
+
+private:
+    mutable ParseFail furthest_{"", 0};
+    mutable size_t furthestPos_ = 0;
+    mutable bool haveFurthest_ = false;
+
+public:
     void expect(const char *s)
     {
         if (!accept(s))
@@ -388,7 +427,10 @@ private:
         else
         {
             if (is("struct") || is("class") || is("union") || is("enum") || is("typename"))
+            {
+                ty->elaborated = !is("typename");
                 ++p_;
+            }
             if (is("decltype"))
             {
                 ++p_;
@@ -490,6 +532,8 @@ private:
                 ty.constPtr.push_back(c);
                 continue;
             }
+            if (cMode_ && (is("&") || is("&&")))
+                fail("expected ';', ',' or ')' near '" + cur().text + "'"); // C has no references
             if (accept("&"))
             {
                 ty.ref = true;
@@ -593,18 +637,27 @@ private:
                 accept("...");
                 if (at(TK::Ident) && !isKeyword(cur().text))
                     prm.name = ident();
+                bool decayed = false;
                 while (is("["))
                 {
                     ++p_;
-                    if (!is("]"))
-                        parseExpr();
+                    ExprP dim = is("]") ? nullptr : parseExpr();
                     expect("]");
-                    ++ty->pointers; // arrays decay
-                    ty->constPtr.push_back(false);
+                    if (!decayed)
+                    {
+                        // the array decays to a pointer to its first element
+                        ++ty->pointers;
+                        ty->constPtr.push_back(false);
+                        decayed = true;
+                    }
+                    else
+                        ty->pointeeDims.push_back(dim);
                 }
             }
             skipAttributes();
             prm.type = ty;
+            if (cMode_ && is("="))
+                fail("expected ';', ',' or ')' near '='"); // C has no default arguments
             if (accept("="))
                 prm.def = parseAssignExpr();
             ps.push_back(prm);
@@ -791,6 +844,16 @@ private:
                 (isAt(1, "{") || (peekTok().kind == TK::Ident && isAt(2, "{"))))
             {
                 auto inner = parseClassOrEnum(inClass, mk);
+                // typedef struct { ... } Name;  the anonymous struct takes the typedef's name
+                bool anon = inner->name.empty() || inner->name.back().empty();
+                if (anon)
+                {
+                    size_t k = 0;
+                    while (peekTok(k).kind == TK::Punct && peekTok(k).text == "*")
+                        ++k;
+                    inner->name.clear();
+                    inner->name.push_back(peekTok(k).text);
+                }
                 std::vector<DeclP> out = {inner};
                 do
                 {
@@ -798,10 +861,13 @@ private:
                     ty->name.push_back(inner->name.back());
                     ty->targs.emplace_back();
                     parsePtrOps(*ty);
+                    std::string aliasName = ident();
+                    types_.insert(aliasName);
+                    if (aliasName == inner->name.back() && ty->pointers == 0)
+                        continue; // the struct itself (typedef struct Node {...} Node;)
                     auto a = mk(DK::Alias);
-                    a->name.push_back(ident());
+                    a->name.push_back(aliasName);
                     a->aliased = ty;
-                    types_.insert(a->name[0]);
                     out.push_back(a);
                 } while (accept(","));
                 expect(";");
@@ -924,6 +990,13 @@ private:
             expect("*");
             auto d = mk(DK::Var);
             std::string n = ident();
+            std::vector<ExprP> dims; // R (*name[N])(Args): an array of them
+            while (is("["))
+            {
+                ++p_;
+                dims.push_back(is("]") ? nullptr : parseExpr());
+                expect("]");
+            }
             expect(")");
             auto fn = std::make_shared<TypeName>();
             fn->isFunction = true;
@@ -932,6 +1005,7 @@ private:
             for (auto &x : parseParams(v))
                 fn->params.push_back(x.type);
             fn->pointers = 1;
+            fn->arrayDims = dims;
             d->name.push_back(n);
             d->var.name = n;
             d->var.type = fn;
@@ -1265,7 +1339,7 @@ private:
                 d->name.push_back(ident());
             else
                 d->name.push_back("");
-            if (!d->name.back().empty())
+            if (!d->name.back().empty() && !cMode_) // a C enum tag is not a type name
                 types_.insert(d->name.back());
             if (accept(":"))
             {
@@ -1302,8 +1376,10 @@ private:
             d->name.push_back(ident());
         else
             d->name.push_back("");
-        if (!d->name.back().empty())
+        if (!d->name.back().empty() && !cMode_) // C: `struct X` names a type only with its keyword
             types_.insert(d->name.back());
+        if (!d->name.back().empty() && cMode_)
+            cTags_.insert(d->name.back());
         accept("final");
         if (is(";"))
         {
@@ -1321,11 +1397,30 @@ private:
         }
         expect("{");
         classStack_.push_back(d->name.back());
+        std::string access = d->isStruct || d->isUnion ? "public" : "private";
         while (!is("}") && !at(TK::End))
         {
+            if ((is("public") || is("private") || is("protected")) && isAt(1, ":"))
+            {
+                access = cur().text;
+                p_ += 2;
+                continue;
+            }
+            if (is("friend") && (isAt(1, "class") || isAt(1, "struct")) && peekTok(2).kind == TK::Ident)
+            {
+                // friend class X;
+                d->friendNames.push_back(peekTok(2).text);
+                while (!is(";") && !at(TK::End))
+                    ++p_;
+                accept(";");
+                continue;
+            }
             auto ms = parseDecl(true, d->name.back());
             for (auto &m : ms)
             {
+                m->access = access;
+                if (m->isFriend && !m->name.empty())
+                    d->friendNames.push_back(m->name.back());
                 if (m->k == DK::Func && m->isFriend && !m->body)
                     continue; // friend declaration only
                 d->members.push_back(m);
@@ -1430,7 +1525,7 @@ private:
             expect("(");
             // range-for: for (decl : expr)
             size_t save = p_;
-            if (startsType())
+            if (startsType() && !cMode_)
             {
                 try
                 {
@@ -1601,6 +1696,10 @@ private:
     // Declaration or expression statement (also a for-init), with ';'.
     StmtP parseSimpleStmt()
     {
+        // C: `Point p;` for a `struct Point` (no typedef) — gcc's own advice.
+        if (cMode_ && at(TK::Ident) && cTags_.count(cur().text) && !types_.count(cur().text) &&
+            (peekTok().kind == TK::Ident || (peekTok().kind == TK::Punct && peekTok().text == "*")))
+            fail("unknown type name '" + cur().text + "'; use 'struct' keyword to refer to the type");
         if (startsType())
         {
             size_t save = p_;
@@ -1648,6 +1747,13 @@ private:
                 expect("(");
                 expect("*");
                 v.name = ident();
+                std::vector<ExprP> dims; // R (*name[N])(Args): an array of them
+                while (is("["))
+                {
+                    ++p_;
+                    dims.push_back(is("]") ? nullptr : parseExpr());
+                    expect("]");
+                }
                 expect(")");
                 auto fn = std::make_shared<TypeName>();
                 fn->isFunction = true;
@@ -1656,6 +1762,7 @@ private:
                 for (auto &x : parseParams(vv))
                     fn->params.push_back(x.type);
                 fn->pointers = 1;
+                fn->arrayDims = dims;
                 v.type = fn;
                 parseInitializer(v);
                 s->decls.push_back(v);
@@ -1756,15 +1863,46 @@ private:
         return v;
     }
 
+    // `[i] = e` in a brace list (not a lambda's `[captures](...)`)
+    bool designatorAhead()
+    {
+        int depth = 0;
+        for (size_t k = 0; p_ + k < t_.size(); ++k)
+        {
+            const auto &t = t_[p_ + k];
+            if (t.kind == TK::Punct && (t.text == "[" || t.text == "(" || t.text == "{"))
+                ++depth;
+            else if (t.kind == TK::Punct && (t.text == "]" || t.text == ")" || t.text == "}"))
+            {
+                if (--depth == 0)
+                    return isAt(k + 1, "=");
+            }
+            else if (t.kind == TK::End)
+                return false;
+        }
+        return false;
+    }
+
     std::vector<ExprP> parseBraceList()
     {
         expect("{");
         std::vector<ExprP> v;
         while (!is("}"))
         {
+            // designated initializers: .x = 1, [2] = 3
+            std::string field;
+            ExprP index;
             if (is(".") && peekTok().kind == TK::Ident && isAt(2, "="))
             {
-                p_ += 3; // designated initializer: .x = 1 (taken positionally)
+                field = peekTok().text;
+                p_ += 3;
+            }
+            else if (is("[") && designatorAhead())
+            {
+                ++p_;
+                index = parseAssignExpr();
+                expect("]");
+                expect("=");
             }
             if (is("{"))
             {
@@ -1774,6 +1912,8 @@ private:
             }
             else
                 v.push_back(parseAssignExpr());
+            v.back()->designator = field;
+            v.back()->designIndex = index;
             if (!accept(","))
                 break;
         }
@@ -2033,6 +2173,23 @@ private:
         while (true)
         {
             int line = cur().line;
+            if (is("(") && e->k == EK::Name && e->name.size() == 1 && e->name[0] == "va_arg")
+            {
+                // va_arg(ap, T): the type is carried by a sizeof node
+                ++p_;
+                auto c = mk(EK::Call, line);
+                c->kids.push_back(e);
+                c->kids.push_back(parseAssignExpr());
+                expect(",");
+                auto t = mk(EK::SizeofT, line);
+                Specs s;
+                t->type = parseBaseType(s);
+                parsePtrOps(*t->type);
+                c->kids.push_back(t);
+                expect(")");
+                e = c;
+                continue;
+            }
             if (is("("))
             {
                 ++p_;
@@ -2255,6 +2412,8 @@ private:
         {
             auto e = mk(tk.kind == TK::Int ? EK::Int : EK::Float, line);
             e->num = parseNumber(tk.text, e->isUnsigned, e->isLong, e->isFloatSuffix, tk.kind == TK::Float);
+            if (tk.kind == TK::Int)
+                e->str = tk.text; // the exact digits (64-bit literals)
             ++p_;
             return e;
         }
@@ -2291,6 +2450,8 @@ private:
             }
             if (tk.text == "[")
             {
+                if (cMode_)
+                    fail("expected expression near '['"); // C has no lambdas
                 auto e = mk(EK::Lambda, line);
                 e->lambda = parseLambda();
                 return e;
@@ -2459,11 +2620,17 @@ Program parse(const Preprocessed &pp)
     Parser p(pp);
     try
     {
-        return p.run();
+        Program prog = p.run();
+        prog.systemHeaders = pp.systemHeaders;
+        return prog;
     }
-    catch (ParseFail &f)
+    catch (ParseFail &last)
     {
-        throw Unsupported("parse: " + f.msg, f.file < (int)pp.files.size() ? pp.files[f.file] : "", f.line);
+        const ParseFail &f = p.furthestFailure(last);
+        Unsupported u("parse: " + f.msg, f.file < (int)pp.files.size() ? pp.files[f.file] : "", f.line);
+        u.col = f.col;
+        u.syntax = true;
+        throw u;
     }
 }
 

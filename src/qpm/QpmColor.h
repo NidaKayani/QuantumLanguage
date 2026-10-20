@@ -11,6 +11,9 @@ namespace qpm
     bool colorEnabled();
     void disableColor();
 
+    // True when stdout is a console window rather than a pipe or a file.
+    bool stdoutIsConsole();
+
     // `text` wrapped in the SGR code `sgr` ("1;32", "90", "38;5;208", ...), or as is without color.
     std::string paint(const std::string &text, const char *sgr);
 

@@ -1,0 +1,1519 @@
+# Quantum parser, part 2 (port of src/parser/ParserStatements.cpp, second
+# half): classes, `for`, `return`, print / input, cout / cin, imports and
+# expression statements.
+# @use "./parser.sa"
+
+let P_CONTAINERS = {"vector": true, "list": true, "deque": true, "array": true, "set": true,
+                    "unordered_set": true, "multiset": true, "stack": true, "queue": true}
+let P_STD_EXCEPTIONS = {"exception": true, "runtime_error": true, "logic_error": true,
+                        "invalid_argument": true, "out_of_range": true, "domain_error": true,
+                        "length_error": true, "overflow_error": true, "underflow_error": true,
+                        "range_error": true}
+let P_NOT_CONSTRUCTED = {"size_t": true, "ssize_t": true, "ptrdiff_t": true, "wchar_t": true,
+                         "char16_t": true, "char32_t": true, "int8_t": true, "int16_t": true,
+                         "int32_t": true, "int64_t": true, "uint8_t": true, "uint16_t": true,
+                         "uint32_t": true, "uint64_t": true, "time_t": true, "clock_t": true,
+                         "nullptr_t": true, "byte": true, "ifstream": true, "ofstream": true,
+                         "fstream": true, "auto": true, "var": true, "let": true}
+
+# ── classes ──────────────────────────────────────────────────────────────────
+
+# Each constructor's initialiser list becomes statements at the top of its
+# body: the base constructor first (Base(args) → super(args)), then members.
+fn lowerCtorInitializers(cd, pending, stdExceptionBase) {
+    let pi = 0
+    while pi < len(pending) {
+        let pc = pending[pi]
+        let ln = pc["line"]
+        let baseCalls = []
+        let memberInits = []
+        let items = pc["items"]
+        let ii = 0
+        while ii < len(items) {
+            let item = items[ii]
+            ii = ii + 1
+            if stdExceptionBase != "" and item["name"] == stdExceptionBase {
+                let target = nMember(nIdent("self", ln), "__what__", ln)
+                let msg = nil
+                if len(item["args"]) == 0 {
+                    msg = nString("", ln)
+                } else {
+                    msg = item["args"][0]
+                }
+                baseCalls.push(nExprStmt(nAssign("=", target, msg, ln), ln))
+                continue
+            }
+            if cd["base"] != "" and item["name"] == cd["base"] {
+                baseCalls.push(nExprStmt(nCall(nSuper("", ln), item["args"], ln), ln))
+                continue
+            }
+            if item["name"] == cd["name"] {
+                continue
+            }
+            let field = nil
+            let fi = 0
+            while fi < len(cd["fields"]) {
+                let f = cd["fields"][fi]
+                if f != nil and f["k"] == "VarDecl" and f["name"] == item["name"] {
+                    field = f
+                }
+                fi = fi + 1
+            }
+            let type = ""
+            if field != nil and !field["isPointer"] {
+                type = field["typeHint"]
+            }
+            let value = nil
+            if item["braced"] and P_CONTAINERS.has(type) {
+                value = nArray(item["args"], ln)
+            } else if type != "" and (len(item["args"]) > 1 or (len(item["args"]) == 0 and field["perInstance"])) {
+                let noArgs = len(item["args"]) == 0
+                value = nCall(nIdent(type, ln), item["args"], ln)
+                if noArgs {
+                    let check = nCall(nIdent("__constructible__", ln), [nIdent(type, ln)], ln)
+                    value = nTernary(check, value, nNil(ln), ln)
+                }
+            } else if len(item["args"]) > 0 {
+                value = item["args"][0]
+            } else {
+                continue
+            }
+            let target = nMember(nIdent("self", ln), item["name"], ln)
+            memberInits.push(nExprStmt(nAssign("=", target, value, ln), ln))
+        }
+        let stmts = pc["body"]["statements"]
+        let merged = []
+        let k = 0
+        while k < len(baseCalls) {
+            merged.push(baseCalls[k])
+            k = k + 1
+        }
+        k = 0
+        while k < len(memberInits) {
+            merged.push(memberInits[k])
+            k = k + 1
+        }
+        k = 0
+        while k < len(stmts) {
+            merged.push(stmts[k])
+            k = k + 1
+        }
+        pc["body"]["statements"] = merged
+        pi = pi + 1
+    }
+}
+
+# A class derived from a <stdexcept> type: what() returns the base's message
+fn addStdExceptionMembers(cd, ln) {
+    let hasWhat = false
+    let hasInit = false
+    let i = 0
+    while i < len(cd["methods"]) {
+        let m = cd["methods"][i]
+        if m != nil and m["k"] == "FunctionDecl" {
+            if m["name"] == "what" {
+                hasWhat = true
+            }
+            if m["name"] == "init" {
+                hasInit = true
+            }
+        }
+        i = i + 1
+    }
+    if !hasWhat {
+        let what = nFunctionDecl("what", ln)
+        what["body"] = nBlock([nReturn(nMember(nIdent("self", ln), "__what__", ln), ln)], ln)
+        cd["methods"].push(what)
+    }
+    if !hasInit {
+        let init = nFunctionDecl("init", ln)
+        init["params"] = ["message"]
+        init["paramIsRef"] = [false]
+        init["defaultArgs"] = [nString("", ln)]
+        let assign = nAssign("=", nMember(nIdent("self", ln), "__what__", ln), nIdent("message", ln), ln)
+        init["body"] = nBlock([nExprStmt(assign, ln)], ln)
+        cd["methods"].push(init)
+    }
+}
+
+fn pIsMethodNameType(t) {
+    return t >= T_IDENTIFIER and t <= T_TYPE_UNSIGNED
+}
+
+fn pSkipDecorators() {
+    while pCheck(T_DECORATOR) {
+        pConsume()
+        if pCheck(T_IDENTIFIER) {
+            pConsume()
+            if pCheck(T_LPAREN) {
+                pSkipParens()
+            }
+        }
+        pSkipNewlines()
+    }
+}
+
+fn parseClassDecl() {
+    let ln = pLine()
+    let name = pExpect(T_IDENTIFIER, "Expected class name")[1]
+    let base = ""
+    if pCheck(T_LPAREN) {
+        # Python: class Foo(Bar, ABC):
+        pConsume()
+        if pCheck(T_IDENTIFIER) {
+            base = pConsume()[1]
+        } else if isCTypeKeyword(pType()) {
+            base = pConsume()[1]
+        }
+        while pCheck(T_COMMA) {
+            pConsume()
+            if pCheck(T_IDENTIFIER) or isCTypeKeyword(pType()) {
+                pConsume()
+            }
+        }
+        pExpect(T_RPAREN, "Expected ')' after base class list")
+    } else if pCheck(T_EXTENDS) {
+        pConsume()
+        base = pExpect(T_IDENTIFIER, "Expected base class name")[1]
+    } else if pCheck(T_COLON) and P_POS + 1 < P_N and P_TOKS[P_POS + 1][0] == T_IDENTIFIER {
+        # C++: class Dog : public Animal {
+        let la = P_POS + 1
+        let v = P_TOKS[la][1]
+        if v == "public" or v == "private" or v == "protected" {
+            la = la + 1
+        }
+        let la2 = la + 1
+        while la2 < P_N and P_TOKS[la2][0] == T_NEWLINE {
+            la2 = la2 + 1
+        }
+        if la < P_N and P_TOKS[la][0] == T_IDENTIFIER and la2 < P_N and (P_TOKS[la2][0] == T_LBRACE or P_TOKS[la2][0] == T_COMMA) {
+            pConsume()
+            let cv = pValue()
+            if cv == "public" or cv == "private" or cv == "protected" {
+                pConsume()
+            }
+            base = pConsume()[1]
+            while pCheck(T_COMMA) {
+                pConsume()
+                if pCheck(T_IDENTIFIER) {
+                    let av = pValue()
+                    if av == "public" or av == "private" or av == "protected" {
+                        pConsume()
+                    }
+                }
+                if pCheck(T_IDENTIFIER) {
+                    pConsume()
+                }
+            }
+        }
+    }
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let cd = nClass(name, ln)
+    let stdExceptionBase = ""
+    if P_STD_EXCEPTIONS.has(base) {
+        stdExceptionBase = base
+    }
+    if stdExceptionBase == "" {
+        cd["base"] = base
+    }
+    let pending = []
+    if pCheck(T_LBRACE) {
+        pConsume()
+        parseClassBody(cd, pending, ln)
+        lowerCtorInitializers(cd, pending, stdExceptionBase)
+        if stdExceptionBase != "" {
+            addStdExceptionMembers(cd, ln)
+        }
+        pExpect(T_RBRACE, "Expected '}'")
+        while pCheck(T_SEMICOLON) {
+            pConsume()
+        }
+        buildOverloadDispatchers(cd, ln)
+    } else if pCheck(T_INDENT) {
+        pConsume()
+        parseClassBody(cd, pending, ln)
+        lowerCtorInitializers(cd, pending, stdExceptionBase)
+        if stdExceptionBase != "" {
+            addStdExceptionMembers(cd, ln)
+        }
+        if pCheck(T_DEDENT) {
+            pConsume()
+        }
+    } else if pIsIdent("pass") {
+        pConsume()
+    } else if pCheck(T_NEWLINE) or pAtEnd() {
+        pSkipNewlines()
+    } else {
+        parseError("Expected '{' or indented class body", pLine())
+    }
+    return cd
+}
+
+fn parseClassBody(cd, pending, ln) {
+    pSkipNewlines()
+    if pIsIdent("pass") {
+        pConsume()
+        pSkipNewlines()
+        return nil
+    }
+    while !pCheck(T_RBRACE) and !pCheck(T_DEDENT) and !pAtEnd() {
+        pSkipNewlines()
+        if pCheck(T_RBRACE) or pCheck(T_DEDENT) {
+            break
+        }
+        pSkipDecorators()
+        let isStatic = false
+        let methodHasReturnType = false
+        let methodReturnType = ""
+        while pCheck(T_IDENTIFIER) {
+            let v = pValue()
+            if v != "public" and v != "private" and v != "protected" and v != "static" and v != "async" and v != "virtual" and v != "inline" and v != "explicit" and v != "override" and v != "final" {
+                break
+            }
+            if v == "static" {
+                isStatic = true
+            }
+            pConsume()
+        }
+        if pCheck(T_CONST) {
+            pConsume()
+        }
+        let methodIsPython = pCheck(T_DEF)
+        if pCheck(T_FN) or pCheck(T_DEF) or pCheck(T_FUNCTION) {
+            pConsume()
+        }
+        # ~ClassName(): the destructor
+        if pCheck(T_BIT_NOT) {
+            pConsume()
+            if pCheck(T_IDENTIFIER) {
+                pConsume()
+            }
+            let pl = parseParamList(true)
+            if pCheck(T_ARROW) {
+                pConsume()
+                while !pAtEnd() and !pCheck(T_COLON) and !pCheck(T_LBRACE) and !pCheck(T_NEWLINE) and !pCheck(T_INDENT) {
+                    pConsume()
+                }
+            }
+            pMatch(T_COLON)
+            pSkipNewlines()
+            let body = parseBlock()
+            let delFd = nFunctionDecl("__del__", ln)
+            delFd["params"] = pl["params"]
+            delFd["body"] = body
+            cd["methods"].push(delFd)
+            pSkipNewlines()
+            continue
+        }
+        if pCheck(T_CLASS) {
+            pConsume()
+            cd["fields"].push(parseClassDecl())
+            pSkipNewlines()
+            continue
+        }
+        if pCheck(T_IDENTIFIER) and (pValue() == "struct" or pValue() == "union") and pTypeAt(P_POS + 1) == T_IDENTIFIER {
+            let laS = P_POS + 2
+            while laS < P_N and P_TOKS[laS][0] == T_NEWLINE {
+                laS = laS + 1
+            }
+            if laS < P_N and P_TOKS[laS][0] == T_LBRACE {
+                pConsume()
+                cd["fields"].push(parseClassDecl())
+                pSkipNewlines()
+                continue
+            }
+        }
+        if !pIsMethodNameType(pType()) {
+            pSkipNewlines()
+            if pIsIdent("pass") {
+                pConsume()
+                pSkipNewlines()
+            } else if !pCheck(T_RBRACE) and !pCheck(T_DEDENT) {
+                pConsume()
+            }
+            continue
+        }
+        # member variables: `int x;` / `string name;` / `vector<int> v;`
+        let isMemberVar = false
+        let typeToken = ""
+        let objectType = false
+        let typeIsPtr = false
+        if isCTypeKeyword(pType()) {
+            let la = P_POS + 1
+            while la < P_N and isCTypeKeyword(P_TOKS[la][0]) {
+                la = la + 1
+            }
+            while la < P_N and (P_TOKS[la][0] == T_BIT_AND or P_TOKS[la][0] == T_STAR) {
+                la = la + 1
+            }
+            if la < P_N and P_TOKS[la][0] == T_IDENTIFIER {
+                let la2 = la + 1
+                while la2 < P_N and P_TOKS[la2][0] == T_NEWLINE {
+                    la2 = la2 + 1
+                }
+                if (la2 < P_N and P_TOKS[la2][0] == T_LPAREN) or P_TOKS[la][1] == "operator" {
+                    # `int getEnergy()`: the method's return type
+                    methodReturnType = pConsume()[1]
+                    while isCTypeKeyword(pType()) {
+                        methodReturnType = methodReturnType + " " + pConsume()[1]
+                    }
+                    while pCheck(T_BIT_AND) or pCheck(T_STAR) {
+                        if pCheck(T_STAR) {
+                            methodReturnType = methodReturnType + "*"
+                        }
+                        pConsume()
+                    }
+                    methodHasReturnType = true
+                } else {
+                    typeToken = pConsume()[1]
+                    while isCTypeKeyword(pType()) {
+                        typeToken = typeToken + " " + pConsume()[1]
+                    }
+                    while pCheck(T_BIT_AND) or pCheck(T_STAR) {
+                        pConsume()
+                    }
+                    isMemberVar = true
+                }
+            } else {
+                pConsume()
+            }
+        } else if pCheck(T_IDENTIFIER) {
+            let la = P_POS + 1
+            if la < P_N and P_TOKS[la][0] == T_LT {
+                la = pLookPastTemplate(la, true)
+            }
+            while la < P_N and P_TOKS[la][0] == T_BIT_AND {
+                la = la + 1
+            }
+            while la < P_N and P_TOKS[la][0] == T_STAR {
+                la = la + 1
+            }
+            if la < P_N and P_TOKS[la][0] == T_IDENTIFIER and P_TOKS[la][1] != cd["name"] {
+                let la2 = la + 1
+                while la2 < P_N and P_TOKS[la2][0] == T_NEWLINE {
+                    la2 = la2 + 1
+                }
+                if (la2 < P_N and P_TOKS[la2][0] == T_LPAREN) or P_TOKS[la][1] == "operator" {
+                    methodReturnType = pConsume()[1]
+                    if pCheck(T_LT) {
+                        pSkipTemplateArgs()
+                    }
+                    while pCheck(T_BIT_AND) or pCheck(T_STAR) {
+                        pConsume()
+                    }
+                    methodHasReturnType = true
+                } else {
+                    typeToken = pConsume()[1]
+                    if pCheck(T_LT) {
+                        pSkipTemplateArgs()
+                    }
+                    while pCheck(T_BIT_AND) or pCheck(T_STAR) {
+                        pConsume()
+                        typeIsPtr = true
+                    }
+                    objectType = true
+                    isMemberVar = true
+                }
+            }
+        }
+        if isMemberVar {
+            if !pIsMethodNameType(pType()) {
+                while !pAtEnd() and !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) {
+                    pConsume()
+                }
+                pSkipTerms()
+                continue
+            }
+            let ctx = {"typeIsPtr": typeIsPtr, "objectType": objectType, "isStatic": isStatic, "typeToken": typeToken}
+            parseOneField(cd, ctx, ln)
+            while pCheck(T_COMMA) {
+                pConsume()
+                if !parseOneField(cd, ctx, ln) {
+                    break
+                }
+            }
+            while !pAtEnd() and !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) and !pCheck(T_RBRACE) and !pCheck(T_DEDENT) {
+                pConsume()
+            }
+            pSkipTerms()
+            continue
+        }
+        parseClassMethod(cd, pending, ln, isStatic, methodIsPython, methodHasReturnType, methodReturnType)
+    }
+}
+
+# one field: name, optional [dims], optional = init; supports `int a[N], top;`
+fn parseOneField(cd, ctx, ln) {
+    let fieldIsPtr = ctx["typeIsPtr"]
+    while pCheck(T_STAR) or pCheck(T_BIT_AND) {
+        pConsume()
+        fieldIsPtr = true
+    }
+    if !pIsMethodNameType(pType()) {
+        return false
+    }
+    let fieldName = pConsume()[1]
+    let init = nil
+    let dims = []
+    while pCheck(T_LBRACKET) {
+        pConsume()
+        if !pCheck(T_RBRACKET) {
+            try {
+                dims.push(parseExpr())
+            } catch (e) {
+                dims = dims
+            }
+        }
+        if pCheck(T_RBRACKET) {
+            pConsume()
+        }
+    }
+    if pMatch(T_ASSIGN) {
+        pSkipNewlines()
+        P_BRACEINIT = P_BRACEINIT + 1
+        init = parseExpr()
+        P_BRACEINIT = P_BRACEINIT - 1
+    } else if len(dims) > 0 {
+        init = nCall(nIdent("__c_array__", ln), dims, ln)
+    }
+    let typeToken = ctx["typeToken"]
+    # a member object / container is constructed for each instance
+    let perInstance = ctx["objectType"] and !fieldIsPtr and !ctx["isStatic"] and !P_NOT_CONSTRUCTED.has(typeToken)
+    if perInstance and init == nil {
+        let check = nCall(nIdent("__constructible__", ln), [nIdent(typeToken, ln)], ln)
+        let ctor = nCall(nIdent(typeToken, ln), [], ln)
+        init = nTernary(check, ctor, nNil(ln), ln)
+    }
+    let field = nVarDecl(false, fieldName, init, typeToken, ln)
+    field["isPointer"] = fieldIsPtr
+    field["perInstance"] = perInstance
+    field["isStatic"] = ctx["isStatic"]
+    cd["fields"].push(field)
+    return true
+}
+
+fn pOperatorMethodName(sym) {
+    if sym == "<" {
+        return "__lt__"
+    }
+    if sym == ">" {
+        return "__gt__"
+    }
+    if sym == "<=" {
+        return "__le__"
+    }
+    if sym == ">=" {
+        return "__ge__"
+    }
+    if sym == "==" {
+        return "__eq__"
+    }
+    if sym == "!=" {
+        return "__ne__"
+    }
+    if sym == "+" {
+        return "__add__"
+    }
+    if sym == "-" {
+        return "__sub__"
+    }
+    if sym == "*" {
+        return "__mul__"
+    }
+    if sym == "/" {
+        return "__div__"
+    }
+    if sym == "++" {
+        return "__inc__"
+    }
+    if sym == "--" {
+        return "__dec__"
+    }
+    if sym == "<<" {
+        return "__lshift__"
+    }
+    if sym == ">>" {
+        return "__rshift__"
+    }
+    return "operator" + sym
+}
+
+fn parseClassMethod(cd, pending, ln, isStatic, methodIsPython, methodHasReturnType, methodReturnType) {
+    let methodName = pValue()
+    pConsume()
+    # C++ operator overloading → the VM's magic-method names
+    if methodName == "operator" {
+        if pCheck(T_LBRACKET) and pTypeAt(P_POS + 1) == T_RBRACKET {
+            pConsume()
+            pConsume()
+            methodName = "__getitem__"
+        } else if pCheck(T_LPAREN) and pTypeAt(P_POS + 1) == T_RPAREN and pTypeAt(P_POS + 2) == T_LPAREN {
+            pConsume()
+            pConsume()
+            methodName = "__call__"
+        } else if !pCheck(T_LPAREN) {
+            let sym = ""
+            while !pAtEnd() and !pCheck(T_LPAREN) and !pCheck(T_NEWLINE) and !pCheck(T_LBRACE) {
+                sym = sym + pConsume()[1]
+            }
+            methodName = pOperatorMethodName(sym)
+        }
+    }
+    if methodName == "constructor" or methodName == "__init__" or methodName == cd["name"] {
+        methodName = "init"
+    }
+    if methodName == "destructor" {
+        methodName = "__del__"
+    }
+    if methodName == "toString" or methodName == "to_string" or methodName == "to_str" {
+        methodName = "__str__"
+    }
+    if !pCheck(T_LPAREN) {
+        # a class-level attribute: name = value / name: type = value
+        if pCheck(T_ASSIGN) or pCheck(T_COLON) {
+            if pCheck(T_COLON) {
+                pConsume()
+            }
+            if pCheck(T_ASSIGN) {
+                pConsume()
+            }
+            pSkipNewlines()
+            let init = nil
+            try {
+                init = parseExpr()
+            } catch (e) {
+                init = nil
+            }
+            cd["fields"].push(nVarDecl(false, methodName, init, "", ln))
+            pSkipTerms()
+            pSkipNewlines()
+            return nil
+        }
+        while !pAtEnd() and !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) and !pCheck(T_RBRACE) {
+            pConsume()
+        }
+        pSkipTerms()
+        pSkipNewlines()
+        return nil
+    }
+    let pl = parseParamList(true)
+    if pCheck(T_CONST) {
+        pConsume()
+    }
+    if pIsIdent("const") {
+        pConsume()
+    }
+    while pCheck(T_IDENTIFIER) and (pValue() == "noexcept" or pValue() == "override" or pValue() == "final") {
+        pConsume()
+    }
+    if pCheck(T_ARROW) {
+        pConsume()
+        while !pAtEnd() and !pCheck(T_COLON) and !pCheck(T_LBRACE) and !pCheck(T_NEWLINE) and !pCheck(T_INDENT) {
+            pConsume()
+        }
+    }
+    # an initializer list starting on the next line
+    if pCheck(T_NEWLINE) {
+        let laN = P_POS
+        while laN < P_N and P_TOKS[laN][0] == T_NEWLINE {
+            laN = laN + 1
+        }
+        if laN + 2 < P_N and P_TOKS[laN][0] == T_COLON and P_TOKS[laN + 1][0] == T_IDENTIFIER and (P_TOKS[laN + 2][0] == T_LPAREN or P_TOKS[laN + 2][0] == T_LBRACE) {
+            while pCheck(T_NEWLINE) {
+                pConsume()
+            }
+        }
+    }
+    # ':' is a Python body colon unless an initializer list follows
+    let isInitList = false
+    if pCheck(T_COLON) {
+        let la = P_POS + 1
+        while la < P_N and P_TOKS[la][0] == T_NEWLINE {
+            la = la + 1
+        }
+        if la < P_N and P_TOKS[la][0] == T_IDENTIFIER {
+            let la2 = la + 1
+            if la2 < P_N and (P_TOKS[la2][0] == T_LPAREN or P_TOKS[la2][0] == T_LBRACE) {
+                isInitList = true
+            }
+        }
+    }
+    if !isInitList {
+        pMatch(T_COLON)
+    }
+    # ClassName() : Base(args), member(val), items{1, 2} { ... }
+    let ctorItems = []
+    if pCheck(T_COLON) {
+        pConsume()
+        while !pAtEnd() and !pCheck(T_LBRACE) and !pCheck(T_INDENT) and !pCheck(T_NEWLINE) {
+            if pCheck(T_IDENTIFIER) {
+                let item = {"name": pConsume()[1], "args": [], "braced": false}
+                if pCheck(T_LPAREN) or pCheck(T_LBRACE) {
+                    item["braced"] = pCheck(T_LBRACE)
+                    pConsume()
+                    pSkipNewlines()
+                    while !pCheck(T_RPAREN) and !pCheck(T_RBRACE) and !pAtEnd() {
+                        try {
+                            item["args"].push(parseExpr())
+                        } catch (e) {
+                            item = item
+                        }
+                        pSkipNewlines()
+                        if !pMatch(T_COMMA) {
+                            break
+                        }
+                        pSkipNewlines()
+                    }
+                    let depth = 0
+                    while !pAtEnd() {
+                        if pCheck(T_LPAREN) or pCheck(T_LBRACE) {
+                            depth = depth + 1
+                        } else if pCheck(T_RPAREN) or pCheck(T_RBRACE) {
+                            if depth == 0 {
+                                break
+                            }
+                            depth = depth - 1
+                        }
+                        pConsume()
+                    }
+                    if pCheck(T_RPAREN) or pCheck(T_RBRACE) {
+                        pConsume()
+                    }
+                    ctorItems.push(item)
+                }
+            } else {
+                pConsume()
+            }
+            if pCheck(T_COMMA) {
+                pConsume()
+            }
+        }
+    }
+    pSkipNewlines()
+    P_FNISCPP.push(methodHasReturnType)
+    if methodIsPython {
+        P_PYDEPTH = P_PYDEPTH + 1
+    }
+    let body = nil
+    try {
+        body = parseBlock()
+    } catch (e) {
+        P_FNISCPP.pop()
+        if methodIsPython {
+            P_PYDEPTH = P_PYDEPTH - 1
+        }
+        raise e
+    }
+    P_FNISCPP.pop()
+    if methodIsPython {
+        P_PYDEPTH = P_PYDEPTH - 1
+    }
+    if len(ctorItems) > 0 and body["k"] == "Block" {
+        pending.push({"body": body, "line": ln, "items": ctorItems})
+    }
+    let fd = nFunctionDecl(methodName, ln)
+    fd["params"] = pl["params"]
+    fd["paramIsRef"] = pl["isRef"]
+    fd["defaultArgs"] = pl["defaults"]
+    fd["cppParamTypes"] = pl["cppTypes"]
+    fd["cReturnType"] = methodReturnType
+    fd["pythonScope"] = methodIsPython
+    fd["body"] = body
+    if isStatic {
+        cd["staticMethods"].push(fd)
+    } else {
+        cd["methods"].push(fd)
+    }
+    pSkipNewlines()
+}
+
+fn pSameStrings(a, b) {
+    if len(a) != len(b) {
+        return false
+    }
+    let i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# C++ overloads share a name, a class maps a name to one method: each
+# overload becomes name__ovl<k>, and a dispatcher picks one by the arguments.
+fn buildOverloadDispatchers(cd, ln) {
+    let methods = cd["methods"]
+    let order = []
+    let groups = {}
+    let i = 0
+    while i < len(methods) {
+        let m = methods[i]
+        if m != nil and m["k"] == "FunctionDecl" {
+            let name = m["name"]
+            if !groups.has(name) {
+                order.push(name)
+                groups[name] = []
+            }
+            groups[name].push(i)
+        }
+        i = i + 1
+    }
+    let drop = []
+    i = 0
+    while i < len(methods) {
+        drop.push(false)
+        i = i + 1
+    }
+    let dispatchers = []
+    let oi = 0
+    while oi < len(order) {
+        let name = order[oi]
+        oi = oi + 1
+        let idxs = groups[name]
+        if len(idxs) < 2 {
+            continue
+        }
+        let typed = false
+        let gi = 0
+        while gi < len(idxs) {
+            let types = methods[idxs[gi]]["cppParamTypes"]
+            let ti = 0
+            while ti < len(types) {
+                if types[ti] != "" {
+                    typed = true
+                }
+                ti = ti + 1
+            }
+            gi = gi + 1
+        }
+        if !typed {
+            continue
+        }
+        let sigs = []
+        gi = 0
+        while gi < len(idxs) {
+            let fd = methods[idxs[gi]]
+            let s = {"idx": idxs[gi], "minArgs": 0, "maxArgs": 0, "types": []}
+            let params = fd["params"]
+            let p = 0
+            while p < len(params) {
+                if p == 0 and (params[0] == "self" or params[0] == "this") {
+                    p = p + 1
+                    continue
+                }
+                s["maxArgs"] = s["maxArgs"] + 1
+                if !(p < len(fd["defaultArgs"]) and fd["defaultArgs"][p] != nil) {
+                    s["minArgs"] = s["maxArgs"]
+                }
+                if p < len(fd["cppParamTypes"]) {
+                    s["types"].push(fd["cppParamTypes"][p])
+                } else {
+                    s["types"].push("")
+                }
+                p = p + 1
+            }
+            # an identical signature (a const / non-const pair) replaces the earlier
+            let same = -1
+            let si = 0
+            while si < len(sigs) {
+                let o = sigs[si]
+                if o["minArgs"] == s["minArgs"] and o["maxArgs"] == s["maxArgs"] and pSameStrings(o["types"], s["types"]) {
+                    same = si
+                    break
+                }
+                si = si + 1
+            }
+            if same >= 0 {
+                drop[sigs[same]["idx"]] = true
+                sigs[same] = s
+            } else {
+                sigs.push(s)
+            }
+            gi = gi + 1
+        }
+        if len(sigs) < 2 {
+            continue
+        }
+        let spec = []
+        let body = []
+        let k = 0
+        while k < len(sigs) {
+            let s = sigs[k]
+            let target = name + "__ovl" + str(k)
+            methods[s["idx"]]["name"] = target
+            let types = []
+            let ti = 0
+            while ti < len(s["types"]) {
+                types.push(nString(s["types"][ti], ln))
+                ti = ti + 1
+            }
+            spec.push(nArray([nNumber(s["minArgs"], ln), nNumber(s["maxArgs"], ln), nArray(types, ln)], ln))
+            let n = s["minArgs"]
+            while n <= s["maxArgs"] {
+                let args = []
+                let a = 0
+                while a < n {
+                    args.push(nIndex(nIdent("__ovl_args", ln), nNumber(a, ln), ln))
+                    a = a + 1
+                }
+                let call = nCall(nMember(nIdent("self", ln), target, ln), args, ln)
+                let cond = nBinary("==", nIdent("__ovl_k", ln), nNumber(k * 64 + n, ln), ln)
+                body.push(nIf(cond, nBlock([nReturn(call, ln)], ln), nil, ln))
+                n = n + 1
+            }
+            k = k + 1
+        }
+        let pick = nCall(nIdent("__ovl_pick__", ln), [nIdent("__ovl_args", ln), nArray(spec, ln)], ln)
+        let full = [nVarDecl(false, "__ovl_k", pick, "", ln)]
+        k = 0
+        while k < len(body) {
+            full.push(body[k])
+            k = k + 1
+        }
+        let disp = nFunctionDecl(name, ln)
+        disp["params"] = ["*__ovl_args"]
+        disp["body"] = nBlock(full, ln)
+        dispatchers.push(disp)
+    }
+    let kept = []
+    i = 0
+    while i < len(methods) {
+        if !drop[i] {
+            kept.push(methods[i])
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(dispatchers) {
+        kept.push(dispatchers[i])
+        i = i + 1
+    }
+    cd["methods"] = kept
+}
+
+# ── for ──────────────────────────────────────────────────────────────────────
+
+# a loop target: a name, or a "[a,b]" pattern from (a, b) / [a, b]
+fn parseReadLoopVar() {
+    if pCheck(T_LPAREN) or pCheck(T_LBRACKET) {
+        let closer = T_RBRACKET
+        if pCheck(T_LPAREN) {
+            closer = T_RPAREN
+        }
+        pConsume()
+        let pat = "["
+        let firstEl = true
+        while !pCheck(closer) and !pAtEnd() {
+            if !firstEl {
+                pat = pat + ","
+            }
+            pat = pat + parseReadLoopVar()
+            firstEl = false
+            if !pMatch(T_COMMA) {
+                break
+            }
+        }
+        pExpect(closer, "Expected closing bracket in for-loop target")
+        return pat + "]"
+    }
+    if pCheck(T_IDENTIFIER) {
+        return pConsume()[1]
+    }
+    if isCTypeKeyword(pType()) {
+        return pConsume()[1]
+    }
+    parseError("Expected variable in for loop (got '" + pValue() + "')", pLine())
+}
+
+fn parseForBody(var1, var2, iterable, ln) {
+    pExpect(T_RPAREN, "Expected ')'")
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let body = parseBodyOrStatement()
+    return nFor(var1, var2, iterable, body, ln)
+}
+
+fn parseForStmt() {
+    let ln = pLine()
+    # Python `for (a, b) in pairs:` — a parenthesized target, not a C header
+    let parenTupleTarget = false
+    if pCheck(T_LPAREN) {
+        let p = P_POS + 1
+        let depth = 1
+        while p < P_N and depth > 0 {
+            if P_TOKS[p][0] == T_LPAREN {
+                depth = depth + 1
+            } else if P_TOKS[p][0] == T_RPAREN {
+                depth = depth - 1
+            }
+            p = p + 1
+        }
+        parenTupleTarget = depth == 0 and p < P_N and (P_TOKS[p][0] == T_IN or P_TOKS[p][0] == T_COMMA)
+    }
+    if pCheck(T_LPAREN) and !parenTupleTarget {
+        return parseCFor(ln)
+    }
+    let loopVars = [parseReadLoopVar()]
+    while pMatch(T_COMMA) {
+        loopVars.push(parseReadLoopVar())
+    }
+    let var1 = loopVars[0]
+    let var2 = ""
+    if len(loopVars) == 2 {
+        var2 = loopVars[1]
+    } else if len(loopVars) > 2 {
+        var1 = "[" + loopVars.join(",") + "]"
+    }
+    if !pMatch(T_IN) and !pMatch(T_OF) {
+        parseError("Expected 'in' or 'of' in for loop", pLine())
+    }
+    let iterable = parseExpr()
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let body = parseBodyOrStatement()
+    return nFor(var1, var2, iterable, body, ln)
+}
+
+# for (init; condition; post) body, and the C++ / JS range forms
+fn parseCFor(ln) {
+    pConsume()
+    let initNode = nil
+    if !pCheck(T_SEMICOLON) {
+        # C++ range-based for: for ([const] Type[&*] name : xs)
+        let la = P_POS
+        if la < P_N and P_TOKS[la][0] == T_CONST {
+            la = la + 1
+        }
+        let hasType = false
+        if la < P_N and isCTypeKeyword(P_TOKS[la][0]) {
+            while la < P_N and isCTypeKeyword(P_TOKS[la][0]) {
+                la = la + 1
+            }
+            hasType = true
+        } else if la < P_N and P_TOKS[la][0] == T_IDENTIFIER {
+            la = la + 1
+            hasType = true
+            if la < P_N and P_TOKS[la][0] == T_LT {
+                let tdepth = 1
+                la = la + 1
+                while la < P_N and tdepth > 0 {
+                    let t = P_TOKS[la][0]
+                    if t == T_LT {
+                        tdepth = tdepth + 1
+                    } else if t == T_GT {
+                        tdepth = tdepth - 1
+                    } else if t == T_RSHIFT {
+                        tdepth = tdepth - 2
+                    }
+                    la = la + 1
+                }
+            }
+        }
+        while la < P_N and (P_TOKS[la][0] == T_STAR or P_TOKS[la][0] == T_BIT_AND or P_TOKS[la][0] == T_CONST) {
+            la = la + 1
+        }
+        if hasType and la + 1 < P_N and P_TOKS[la][0] == T_IDENTIFIER and P_TOKS[la + 1][0] == T_COLON and (la + 2 >= P_N or P_TOKS[la + 2][0] != T_COLON) {
+            while P_POS < la {
+                pConsume()
+            }
+            let rangeVar = pConsume()[1]
+            pConsume()
+            let iterable = parseExpr()
+            return parseForBody(rangeVar, "", iterable, ln)
+        }
+        if pCheck(T_LET) or pCheck(T_CONST) {
+            let isConst = pType() == T_CONST
+            pConsume()
+            let la2 = P_POS
+            let isDestruct = false
+            if la2 < P_N and P_TOKS[la2][0] == T_LBRACKET {
+                isDestruct = true
+                let depth = 1
+                la2 = la2 + 1
+                while la2 < P_N and depth > 0 {
+                    if P_TOKS[la2][0] == T_LBRACKET {
+                        depth = depth + 1
+                    } else if P_TOKS[la2][0] == T_RBRACKET {
+                        depth = depth - 1
+                    }
+                    la2 = la2 + 1
+                }
+            }
+            if (la2 < P_N and (P_TOKS[la2][0] == T_IDENTIFIER or isCTypeKeyword(P_TOKS[la2][0]))) or isDestruct {
+                let la3 = la2 + 1
+                if isDestruct {
+                    la3 = la2
+                }
+                if la3 < P_N and (P_TOKS[la3][0] == T_IN or P_TOKS[la3][0] == T_OF) {
+                    # for (let x of xs) / for (const [k, v] of m)
+                    let forOfVar = ""
+                    if isDestruct {
+                        let varStr = pConsume()[1]
+                        while !pCheck(T_RBRACKET) and !pAtEnd() {
+                            varStr = varStr + pConsume()[1]
+                        }
+                        varStr = varStr + pConsume()[1]
+                        forOfVar = varStr
+                    } else {
+                        forOfVar = pConsume()[1]
+                    }
+                    pConsume()
+                    let iterable = parseExpr()
+                    return parseForBody(forOfVar, "", iterable, ln)
+                }
+            }
+            initNode = parseVarDecl(isConst)
+        } else if isCTypeKeyword(pType()) {
+            let la2 = P_POS + 1
+            while la2 < P_N and isCTypeKeyword(P_TOKS[la2][0]) {
+                la2 = la2 + 1
+            }
+            if la2 < P_N and P_TOKS[la2][0] == T_IDENTIFIER {
+                # for (int v : container)
+                let la3 = la2 + 1
+                while la2 < P_N and (P_TOKS[la2][0] == T_STAR or P_TOKS[la2][0] == T_BIT_AND or P_TOKS[la2][0] == T_CONST) {
+                    la2 = la2 + 1
+                }
+                if la2 < P_N and P_TOKS[la2][0] == T_IDENTIFIER {
+                    la3 = la2 + 1
+                }
+                let isRangeFor = la3 < P_N and P_TOKS[la3][0] == T_COLON and (la3 + 1 >= P_N or P_TOKS[la3 + 1][0] != T_COLON)
+                if isRangeFor {
+                    while isCTypeKeyword(pType()) {
+                        pConsume()
+                    }
+                    while pCheck(T_STAR) or pCheck(T_BIT_AND) or pCheck(T_CONST) {
+                        pConsume()
+                    }
+                    let rangeVar = pConsume()[1]
+                    pConsume()
+                    let iterable = parseExpr()
+                    return parseForBody(rangeVar, "", iterable, ln)
+                }
+                # for (int i = 0; ...)
+                let hint = pConsume()[1]
+                while isCTypeKeyword(pType()) {
+                    hint = hint + " " + pConsume()[1]
+                }
+                let firstDecl = parseCTypeVarDecl(hint)
+                if pCheck(T_COMMA) {
+                    let stmts = [firstDecl]
+                    while pMatch(T_COMMA) {
+                        let nextHint = hint
+                        if isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                            nextHint = pConsume()[1]
+                            while isCTypeKeyword(pType()) or pCheck(T_CONST) {
+                                nextHint = nextHint + " " + pConsume()[1]
+                            }
+                        }
+                        stmts.push(parseCTypeVarDecl(nextHint))
+                    }
+                    initNode = nBlock(stmts, ln)
+                } else {
+                    initNode = firstDecl
+                }
+            } else {
+                initNode = nExprStmt(parseExpr(), ln)
+            }
+        } else if pCheck(T_IDENTIFIER) {
+            # for (size_t i = 0; ...) / for (Node* cur = head; ...)
+            let la2 = P_POS + 1
+            if la2 < P_N and P_TOKS[la2][0] == T_LT {
+                let tdepth = 1
+                la2 = la2 + 1
+                while la2 < P_N and tdepth > 0 {
+                    let t = P_TOKS[la2][0]
+                    if t == T_LT {
+                        tdepth = tdepth + 1
+                    } else if t == T_GT {
+                        tdepth = tdepth - 1
+                    } else if t == T_RSHIFT {
+                        tdepth = tdepth - 2
+                    }
+                    la2 = la2 + 1
+                }
+            }
+            while la2 < P_N and (P_TOKS[la2][0] == T_STAR or P_TOKS[la2][0] == T_BIT_AND or P_TOKS[la2][0] == T_CONST) {
+                la2 = la2 + 1
+            }
+            let isTypedInit = la2 + 1 < P_N and P_TOKS[la2][0] == T_IDENTIFIER and P_TOKS[la2 + 1][0] == T_ASSIGN
+            if isTypedInit {
+                let hint = pConsume()[1]
+                while P_POS < la2 {
+                    pConsume()
+                }
+                initNode = parseCTypeVarDecl(hint)
+            } else {
+                initNode = nExprStmt(parseExpr(), ln)
+            }
+        } else {
+            initNode = nExprStmt(parseExpr(), ln)
+        }
+    }
+    pMatch(T_SEMICOLON)
+    let condition = nil
+    if !pCheck(T_SEMICOLON) {
+        condition = parseExpr()
+    } else {
+        condition = nBool(true, ln)
+    }
+    pMatch(T_SEMICOLON)
+    let postNode = nil
+    if !pCheck(T_RPAREN) {
+        let firstExpr = parseExpr()
+        if pCheck(T_COMMA) {
+            let stmts = [nExprStmt(firstExpr, ln)]
+            while pMatch(T_COMMA) {
+                stmts.push(nExprStmt(parseExpr(), ln))
+            }
+            postNode = nBlock(stmts, ln)
+        } else {
+            postNode = nExprStmt(firstExpr, ln)
+        }
+    }
+    pExpect(T_RPAREN, "Expected ')'")
+    pMatch(T_COLON)
+    pSkipNewlines()
+    let loopBody = parseBodyOrStatement()
+    let whileNode = nWhile(condition, loopBody, postNode, ln)
+    let outer = []
+    if initNode != nil {
+        outer.push(initNode)
+    }
+    outer.push(whileNode)
+    return nBlock(outer, ln)
+}
+
+# ── return / print / input ───────────────────────────────────────────────────
+
+fn parseReturnStmt() {
+    let ln = pLine()
+    let val = nil
+    if !pCheck(T_NEWLINE) and !pCheck(T_SEMICOLON) and !pCheck(T_RBRACE) and !pAtEnd() {
+        # `return {a, b};` in a C++ function is a brace-init
+        let braceInit = 0
+        if len(P_FNISCPP) > 0 and P_FNISCPP[len(P_FNISCPP) - 1] {
+            braceInit = 1
+        }
+        P_BRACEINIT = P_BRACEINIT + braceInit
+        try {
+            val = parseExpr()
+        } catch (e) {
+            P_BRACEINIT = P_BRACEINIT - braceInit
+            raise e
+        }
+        P_BRACEINIT = P_BRACEINIT - braceInit
+        # return a, b → a tuple
+        if pCheck(T_COMMA) {
+            let elements = [val]
+            while pMatch(T_COMMA) {
+                if pCheck(T_NEWLINE) or pCheck(T_SEMICOLON) or pAtEnd() {
+                    break
+                }
+                elements.push(parseExpr())
+            }
+            val = nTuple(elements, ln)
+        }
+    }
+    pSkipTerms()
+    return nReturn(val, ln)
+}
+
+fn parsePrintStmt() {
+    let ln = pLine()
+    let newline = true
+    let sep = " "
+    let endStr = "\n"
+    let args = []
+    if pCheck(T_LPAREN) {
+        pConsume()
+        pSkipNewlines()
+        while !pCheck(T_RPAREN) and !pAtEnd() {
+            let v = pValue()
+            if pCheck(T_IDENTIFIER) and (v == "sep" or v == "end" or v == "file" or v == "flush") and pTypeAt(P_POS + 1) == T_ASSIGN {
+                let kw = pConsume()[1]
+                pConsume()
+                if kw == "sep" {
+                    if pCheck(T_STRING) {
+                        sep = pConsume()[1]
+                    } else {
+                        parseExpr()
+                    }
+                } else if kw == "end" {
+                    if pCheck(T_STRING) {
+                        endStr = pConsume()[1]
+                        newline = false
+                    } else {
+                        parseExpr()
+                    }
+                } else {
+                    parseExpr()
+                }
+            } else {
+                args.push(parseExpr())
+            }
+            pSkipNewlines()
+            if !pMatch(T_COMMA) {
+                break
+            }
+            pSkipNewlines()
+        }
+        pExpect(T_RPAREN, "Expected ')'")
+    } else {
+        args.push(parseExpr())
+        while pMatch(T_COMMA) {
+            args.push(parseExpr())
+        }
+    }
+    pSkipTerms()
+    let ps = nPrint(args, newline, ln)
+    ps["sep"] = sep
+    ps["end"] = endStr
+    return ps
+}
+
+# scanf("%d", &var) / input("prompt", var) / input(var)
+fn parseInputStmt() {
+    let ln = pLine()
+    let target = ""
+    let prompt = nil
+    if pCheck(T_LPAREN) {
+        pConsume()
+        if pCheck(T_STRING) {
+            let fmtTok = pCur()
+            pConsume()
+            if pMatch(T_COMMA) {
+                prompt = nString(fmtTok[1], ln)
+                if pCheck(T_BIT_AND) {
+                    pConsume()
+                }
+                target = pExpect(T_IDENTIFIER, "Expected variable name after ','")[1]
+            } else {
+                prompt = nString(fmtTok[1], ln)
+                target = ""
+            }
+        } else {
+            if pCheck(T_BIT_AND) {
+                pConsume()
+            }
+            target = pExpect(T_IDENTIFIER, "Expected variable name")[1]
+        }
+        pExpect(T_RPAREN, "Expected ')'")
+    }
+    pSkipTerms()
+    return nInput(target, prompt, ln)
+}
+
+# ── cout / cin ───────────────────────────────────────────────────────────────
+
+# the `<< a << b << endl` chain: __cout__(value[, "name"]) / __cout_manip__(...)
+fn parseStreamInsertions() {
+    let ln = pLine()
+    let args = []
+    while true {
+        pSkipNewlines()
+        if !pCheck(T_LSHIFT) {
+            break
+        }
+        pConsume()
+        pSkipNewlines()
+        if pIsIdent("endl") {
+            pConsume()
+            args.push(nString("\n", ln))
+            continue
+        }
+        let seg = parseAddSub()
+        if seg["k"] == "Call" and seg["callee"]["k"] == "Ident" {
+            let fname = seg["callee"]["name"]
+            if fname == "setw" or fname == "setprecision" or fname == "setfill" {
+                let margs = [nString(fname, ln)]
+                let a = 0
+                while a < len(seg["args"]) {
+                    margs.push(seg["args"][a])
+                    a = a + 1
+                }
+                args.push(nCall(nIdent("__cout_manip__", ln), margs, ln))
+                continue
+            }
+        }
+        let name = ""
+        if seg["k"] == "Ident" {
+            name = seg["name"]
+        }
+        let wargs = [seg]
+        if name != "" {
+            wargs.push(nString(name, ln))
+        }
+        args.push(nCall(nIdent("__cout__", ln), wargs, ln))
+    }
+    pSkipTerms()
+    return args
+}
+
+fn parseCoutStmt() {
+    let ln = pLine()
+    let ps = nPrint(parseStreamInsertions(), false, ln)
+    ps["sep"] = ""
+    ps["end"] = ""
+    return ps
+}
+
+fn parseCinStmt() {
+    let ln = pLine()
+    let expr = parseCinExpr(ln)
+    pSkipTerms()
+    return nExprStmt(expr, ln)
+}
+
+# one extraction target: var, arr[i], obj.field, p->field, *ptr, *(expr)
+fn parseCinTarget(ln) {
+    if pCheck(T_BIT_AND) {
+        pConsume()
+    }
+    if pCheck(T_STAR) {
+        pConsume()
+        let operand = nil
+        if pCheck(T_LPAREN) {
+            pConsume()
+            operand = parseExpr()
+            pExpect(T_RPAREN, "Expected ')' after dereferenced expression")
+        } else {
+            operand = parsePrimary()
+        }
+        return nDeref(operand, ln)
+    }
+    let lval = parsePrimary()
+    while true {
+        if pCheck(T_LBRACKET) {
+            pConsume()
+            let idx = parseExpr()
+            pExpect(T_RBRACKET, "Expected ']'")
+            lval = nIndex(lval, idx, ln)
+        } else if pCheck(T_DOT) {
+            pConsume()
+            let member = pExpect(T_IDENTIFIER, "Expected member name")[1]
+            lval = nMember(lval, member, ln)
+        } else if pCheck(T_ARROW) {
+            pConsume()
+            let member = pExpect(T_IDENTIFIER, "Expected member name")[1]
+            lval = nArrow(lval, member, ln)
+        } else {
+            break
+        }
+    }
+    return lval
+}
+
+# after `cin`: >> a >> b → __cin_good__([a = __cin__(a), ...]); .m(...) → __cin_method__
+fn parseCinExpr(ln) {
+    if pCheck(T_DOT) {
+        pConsume()
+        let method = ""
+        if pCheck(T_IDENTIFIER) {
+            method = pConsume()[1]
+        }
+        let hasArgs = false
+        if pCheck(T_LPAREN) {
+            pConsume()
+            hasArgs = !pCheck(T_RPAREN)
+            let depth = 1
+            while !pAtEnd() and depth > 0 {
+                if pCheck(T_LPAREN) {
+                    depth = depth + 1
+                } else if pCheck(T_RPAREN) {
+                    depth = depth - 1
+                }
+                pConsume()
+            }
+        }
+        return nCall(nIdent("__cin_method__", ln), [nString(method, ln), nBool(hasArgs, ln)], ln)
+    }
+    let reads = []
+    while true {
+        let before = P_POS
+        pSkipNewlines()
+        if !pCheck(T_RSHIFT) {
+            P_POS = before
+            break
+        }
+        pConsume()
+        # the target is read from and assigned to: its tokens are parsed twice
+        let targetStart = P_POS
+        let readFrom = parseCinTarget(ln)
+        P_POS = targetStart
+        let target = parseCinTarget(ln)
+        reads.push(nAssign("=", target, nCall(nIdent("__cin__", ln), [readFrom], ln), ln))
+    }
+    return nCall(nIdent("__cin_good__", ln), [nArray(reads, ln)], ln)
+}
+
+# ── import / expression statements ───────────────────────────────────────────
+
+fn parseImportStmt(isFrom) {
+    let ln = pLine()
+    let stmt = nImport("", ln)
+    if isFrom {
+        if isCTypeKeyword(pType()) {
+            stmt["module"] = pConsume()[1]
+        } else {
+            stmt["module"] = pExpect(T_IDENTIFIER, "Expected module name after 'from'")[1]
+        }
+        pExpect(T_IMPORT, "Expected 'import' after module name in 'from' statement")
+        while true {
+            let item = {"name": pExpect(T_IDENTIFIER, "Expected item name to import")[1], "alias": ""}
+            if pMatch(T_AS) {
+                item["alias"] = pExpect(T_IDENTIFIER, "Expected alias after 'as'")[1]
+            }
+            stmt["imports"].push(item)
+            if !pMatch(T_COMMA) {
+                break
+            }
+        }
+    } else {
+        while true {
+            let item = {"name": "", "alias": ""}
+            if isCTypeKeyword(pType()) {
+                item["name"] = pConsume()[1]
+            } else {
+                item["name"] = pExpect(T_IDENTIFIER, "Expected module name to import")[1]
+            }
+            if pMatch(T_AS) {
+                item["alias"] = pExpect(T_IDENTIFIER, "Expected alias after 'as'")[1]
+            }
+            stmt["imports"].push(item)
+            if !pMatch(T_COMMA) {
+                break
+            }
+        }
+    }
+    pSkipTerms()
+    return stmt
+}
+
+fn parseExprStmt() {
+    let ln = pLine()
+    let expr = parseExpr()
+    # C comma expression: "a += 3, b = a" — statements, left to right
+    if pCheck(T_COMMA) {
+        let stmts = [nExprStmt(expr, ln)]
+        while pMatch(T_COMMA) {
+            pSkipNewlines()
+            if pCheck(T_NEWLINE) or pCheck(T_SEMICOLON) or pAtEnd() {
+                break
+            }
+            let eln = pLine()
+            stmts.push(nExprStmt(parseExpr(), eln))
+        }
+        pSkipTerms()
+        return nBlock(stmts, ln)
+    }
+    pSkipTerms()
+    return nExprStmt(expr, ln)
+}
+
+fn parseExpr() {
+    return parseAssignment()
+}

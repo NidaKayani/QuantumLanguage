@@ -444,7 +444,7 @@ namespace qpm
         bool isSkippedDir(const std::string &name)
         {
             static const std::set<std::string> skip = {
-                "build", "out", "bin", "obj", "dist", "node_modules", "debug", "release", "x64", "x86"};
+                "build", "out", "bin", "obj", "dist", "node_modules", "quantum_qubits", "debug", "release", "x64", "x86"};
             std::string n = lower(name);
             return n.empty() || n[0] == '.' || skip.count(n) || n.rfind("cmake-build", 0) == 0;
         }

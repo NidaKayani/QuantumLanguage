@@ -18,6 +18,8 @@
 #include <iostream>
 #include <sstream>
 
+extern bool g_strictMode; // src/Pipeline.cpp
+
 namespace cpp
 {
 
@@ -75,6 +77,12 @@ TP tCStr()
     static TP t = mkT(T::CStr, "const char*");
     return t;
 }
+TP tBuf(long n)
+{
+    TP t = mkT(T::Str, "char[]");
+    t->n = n;
+    return t;
+}
 TP tVoid()
 {
     static TP t = mkT(T::Void, "void");
@@ -130,6 +138,8 @@ bool isIntegral(const TP &t) { return t && (t->k == T::Int || t->k == T::Char ||
 bool isFloat(const TP &t) { return t && t->k == T::Float; }
 bool isArith(const TP &t) { return isIntegral(t) || isFloat(t); }
 bool isStringy(const TP &t) { return t && (t->k == T::Str || t->k == T::CStr); }
+bool isCBuf(const TP &t) { return t && t->k == T::Str && t->name == "char[]"; }
+bool isI64(const TP &t) { return t && t->k == T::Int && (t->name == "long long" || t->name == "unsigned long long"); }
 bool isObjectRep(const TP &t)
 {
     if (!t)
@@ -228,10 +238,14 @@ ASTNodePtr var(const std::string &n, ASTNodePtr init, int ln)
 ASTNodePtr ret(ASTNodePtr e, int ln) { return std::make_unique<ASTNode>(ReturnStmt{std::move(e)}, ln); }
 ASTNodePtr ifs(ASTNodePtr c, ASTNodePtr t, ASTNodePtr e, int ln)
 {
+    if (!t)
+        t = block({}, ln); // if (x) ;
     return std::make_unique<ASTNode>(IfStmt{std::move(c), std::move(t), std::move(e)}, ln);
 }
 ASTNodePtr whiles(ASTNodePtr c, ASTNodePtr body, ASTNodePtr post, int ln)
 {
+    if (!body)
+        body = block({}, ln); // while (x) ;
     return std::make_unique<ASTNode>(WhileStmt{std::move(c), std::move(body), std::move(post)}, ln);
 }
 ASTNodePtr brk(int ln) { return std::make_unique<ASTNode>(BreakStmt{}, ln); }
@@ -479,6 +493,9 @@ void Lowerer::collect(const std::vector<DeclP> &decls, Scope *sc)
             Symbol s;
             s.kind = Symbol::Var;
             s.global = mangle(sc, d->var.name);
+            if (const auto &vt = d->var.type)
+                s.isConst = (vt->isConst && vt->pointers == 0) || (!vt->constPtr.empty() && vt->constPtr.back()) ||
+                            d->isConstexpr;
             sc->syms[d->var.name] = s; // type resolved in emitGlobals (aliases may come later)
             globalsInOrder_.push_back({d, sc});
             break;
@@ -535,6 +552,12 @@ void Lowerer::collectClass(const DeclP &d, Scope *sc, const std::string &forcedN
     }
     if (d->forwardOnly)
         return;
+    if (prog_.cMode)
+        for (const DeclP &m : d->members)
+            if (m->k == DK::Func)
+                unsupported("field '" + (m->name.empty() ? std::string("?") : m->name.back()) +
+                                "' declared as a function",
+                            m->line);
     c->decl = d;
     c->isTemplate = d->isTemplate;
     if (d->isTemplate)
@@ -737,6 +760,8 @@ TP Lowerer::builtinType(const TypeName &tn, Scope *sc, bool &ok)
         t->isUnsigned = u;
         return t;
     };
+    if (w == "va_list" || w == "__builtin_va_list")
+        return mkT(T::Dyn, "va_list");
     // built-in arithmetic
     if (w == "void") return tVoid();
     if (w == "bool") return tBool();
@@ -785,6 +810,11 @@ TP Lowerer::builtinType(const TypeName &tn, Scope *sc, bool &ok)
     if (userShadow)
     {
         ok = false;
+        return nullptr;
+    }
+    if (!isStdQual && !prog_.cMode && w != "FILE" && w != "nullptr_t" && !stdVisible(w, sc ? sc : global_))
+    {
+        ok = false; // std's, but no `using namespace std` / `using std::...` here
         return nullptr;
     }
     if (w == "string" || w == "wstring" || w == "string_view")
@@ -911,10 +941,11 @@ TP Lowerer::resolveType(const TypeNameP &tn, Scope *sc)
         base = f;
         // function pointers are just functions here
         TP t = base;
-        for (size_t i = 0; i < tn->arrayDims.size(); ++i)
+        for (size_t i = tn->arrayDims.size(); i-- > 0;)
         {
             auto a = mkT(T::Array, "carray");
             a->a.push_back(t);
+            a->n = tn->arrayDims[i] ? (long)evalConst(tn->arrayDims[i], sc) : -1;
             t = a;
         }
         return t;
@@ -930,7 +961,11 @@ TP Lowerer::resolveType(const TypeNameP &tn, Scope *sc)
     if (base)
         ;
     else if (s && s->kind == Symbol::Type && s->type)
+    {
         base = s->type;
+        if (base->k == T::Class && base->cls && base->cls->isTemplate && !tn->targs.empty() && !tn->targs.back().empty())
+            base = instantiateClass(base->cls, tn->targs.back(), sc); // Matrix<int>
+    }
     else
     {
         base = builtinType(*tn, sc, ok);
@@ -938,11 +973,50 @@ TP Lowerer::resolveType(const TypeNameP &tn, Scope *sc)
         {
             if (s && s->kind == Symbol::Type && !s->type)
                 base = tDyn();
+            else if (g_strictMode && !s)
+            {
+                // A type C/C++ has never heard of (`let x = 1;`) is a compile
+                // error; a real library type outside the subset is reported
+                // as such rather than run with guessed semantics.
+                static const std::set<std::string> knownStd = {
+                    "regex", "smatch", "cmatch", "thread", "mutex", "lock_guard", "unique_lock",
+                    "condition_variable", "atomic", "future", "promise", "complex", "chrono",
+                    "duration", "time_point", "steady_clock", "system_clock", "high_resolution_clock",
+                    "filesystem", "path", "span", "ranges", "locale", "wostream", "wistream",
+                    "basic_string", "allocator", "ratio", "type_info", "type_index", "jthread",
+                    "barrier", "latch", "semaphore", "counting_semaphore", "binary_semaphore",
+                    "default_random_engine", "minstd_rand", "normal_distribution",
+                    "bernoulli_distribution", "discrete_distribution", "seed_seq", "va_list",
+                    "jmp_buf", "fpos_t", "div_t", "ldiv_t", "tm", "wint_t", "mbstate_t"};
+                std::string last = tn->name.empty() ? "" : tn->name.back();
+                std::string full;
+                for (const auto &part : tn->name)
+                    full += (full.empty() ? "" : "::") + part;
+                if (knownStd.count(last))
+                    unsupported("unsupported: '" + full + "' is not supported by Quantum's C/C++ front-end", line_);
+                if (tn->name.size() >= 2 && tn->name[0] == "std")
+                    unsupported("unknown std member '" + last + "'", line_);
+                unsupported("unknown type '" + full + "'", line_);
+            }
             else
                 base = tDyn(); // unknown type: dynamic semantics
         }
     }
     TP t = base;
+    // a decayed array parameter's rows: T (*x)[M]
+    for (size_t i = tn->pointeeDims.size(); i-- > 0;)
+    {
+        long n = tn->pointeeDims[i] ? (long)evalConst(tn->pointeeDims[i], sc) : -1;
+        if (t->k == T::Char && i + 1 == tn->pointeeDims.size())
+        {
+            t = tBuf(n); // char rows are char buffers
+            continue;
+        }
+        auto a = mkT(T::Array, "carray");
+        a->a.push_back(t);
+        a->n = n;
+        t = a;
+    }
     for (int i = 0; i < tn->pointers; ++i)
     {
         if (t->k == T::Char && i == 0)
@@ -954,17 +1028,20 @@ TP Lowerer::resolveType(const TypeNameP &tn, Scope *sc)
         p->a.push_back(t);
         t = p;
     }
-    // arrays: T x[N][M] → array<array<T,M>,N>
+    // arrays: T x[N][M] → array<array<T,M>,N>; char x[N][M]: N char buffers
     for (size_t i = tn->arrayDims.size(); i-- > 0;)
     {
+        long n = tn->arrayDims[i] ? (long)evalConst(tn->arrayDims[i], sc) : -1;
+        if (t->k == T::Char && i + 1 == tn->arrayDims.size())
+        {
+            t = tBuf(n);
+            continue;
+        }
         auto a = mkT(T::Array, "carray");
         a->a.push_back(t);
-        a->n = tn->arrayDims[i] ? (long)evalConst(tn->arrayDims[i], sc) : -1;
+        a->n = n;
         t = a;
     }
-    // char buf[N] → a string buffer
-    if (t->k == T::Array && t->a[0]->k == T::Char && tn->arrayDims.size() == 1)
-        return tStr();
     return t;
 }
 
@@ -1061,6 +1138,10 @@ void Lowerer::resolveClass(ClassInfo *c)
         }
     }
     int slot = 1;
+    c->isUnion = d->isUnion;
+    for (const auto &fr : d->friendNames)
+        c->friends.insert(fr);
+    int unionSlot = -1;
     if (!c->bases.empty())
     {
         slot = c->bases[0]->nslots;
@@ -1080,6 +1161,8 @@ void Lowerer::resolveClass(ClassInfo *c)
             f.init = m->var;
             f.hasInit = m->var.init != VarDeclarator::None;
             f.decl = m;
+            f.access = m->access;
+            f.isConst = m->var.type && m->var.type->isConst && m->var.type->pointers == 0 && !m->var.type->ref;
             if (m->isStatic)
             {
                 f.isStatic = true;
@@ -1089,6 +1172,13 @@ void Lowerer::resolveClass(ClassInfo *c)
                 s.type = f.type;
                 s.global = f.global;
                 c->scope->syms[f.name] = s;
+            }
+            else if (c->isUnion)
+            {
+                // a union's members are one value, read as any of them
+                if (unionSlot < 0)
+                    unionSlot = slot++;
+                f.slot = unionSlot;
             }
             else
                 f.slot = slot++;
@@ -1108,7 +1198,10 @@ void Lowerer::resolveClass(ClassInfo *c)
             f->isConst = m->isConst;
             f->isCtor = m->isCtor;
             f->isDtor = m->isDtor;
+            if (f->isDtor)
+                c->dtor = f;
             f->isPure = m->isPure;
+            f->access = m->access;
             f->isTemplate = m->isTemplate;
             f->scope = c->scope;
             f->tu = m->tu;
@@ -1190,17 +1283,182 @@ static std::string sigKey(const FuncInfo *f)
     return k + (f->isConst ? ")c" : ")");
 }
 
+// A class template used with its arguments (Matrix<int>): a class of its own,
+// collected again from the template's declaration with the parameters bound
+// (and `Matrix` inside it naming this instance). Each phase run() has already
+// passed is applied to it here; the later ones reach it in run()'s loops.
+TP Lowerer::instantiateClass(ClassInfo *tc, const std::vector<TArg> &targs, Scope *sc)
+{
+    auto asType = [](ClassInfo *c)
+    {
+        auto t = mkT(T::Class);
+        t->cls = c;
+        return t;
+    };
+    const DeclP &d = tc->decl;
+    if (!d || d->templateParams.size() != targs.size())
+        return asType(tc); // default arguments: the dynamic version
+    std::vector<Symbol> binds;
+    std::string key = tc->qname + "<";
+    for (size_t i = 0; i < targs.size(); ++i)
+    {
+        Symbol s;
+        if (targs[i].type)
+        {
+            TP t = resolveType(targs[i].type, sc);
+            if (!t || t->k == T::Dyn || (t->k == T::Class && t->cls && t->cls->isTemplate))
+                return asType(tc);
+            s.kind = Symbol::Type;
+            s.type = t;
+            key += (i ? "," : "") + t->str();
+        }
+        else if (targs[i].expr)
+        {
+            s.kind = Symbol::Enumerator;
+            s.type = tInt();
+            s.value = evalConst(targs[i].expr, sc);
+            key += (i ? "," : "") + std::to_string(s.value);
+        }
+        else
+            return asType(tc);
+        binds.push_back(s);
+    }
+    key += ">";
+    auto known = classInstances_.find(key);
+    if (known != classInstances_.end())
+        return asType(known->second);
+    std::string uniq = tc->name + key.substr(tc->qname.size());
+    Scope *outer = tc->outer ? tc->outer : global_;
+    size_t friendsBefore = funcDecls_.size();
+    collectClass(d, outer, uniq);
+    funcDecls_.resize(friendsBefore); // its friends are made below, for this instance
+    Symbol *sym = lookupIn(outer, uniq, true);
+    if (!sym || !sym->type || !sym->type->cls)
+        return asType(tc);
+    ClassInfo *c = sym->type->cls;
+    classInstances_[key] = c;
+    instanceOf_[c] = tc;
+    c->name = tc->name; // its constructors carry the template's name
+    c->isTemplate = false;
+    for (size_t i = 0; i < binds.size(); ++i)
+        c->scope->syms[d->templateParams[i]] = binds[i];
+    Symbol self;
+    self.kind = Symbol::Type;
+    self.type = asType(c);
+    c->scope->syms[tc->name] = self;
+    int savedLine = line_;
+    if (phase_ >= 1)
+        resolveClass(c);
+    // friend functions defined in the class: free functions of this instance
+    for (const auto &m : d->members)
+        if (m->k == DK::Func && m->isFriend && m->body && !m->name.empty())
+        {
+            funcs_.push_back(std::make_unique<FuncInfo>());
+            FuncInfo *f = funcs_.back().get();
+            f->name = m->name.back();
+            f->decl = m;
+            f->def = m;
+            f->scope = c->scope;
+            f->tu = m->tu;
+            resolveFunc(f);
+            Symbol &fs = outer->syms[f->name];
+            if (fs.kind != Symbol::None && fs.kind != Symbol::Funcs)
+                continue;
+            fs.kind = Symbol::Funcs;
+            f->mangled = mangle(outer, f->name) + "@" + uniq;
+            fs.funcs.push_back(f);
+            allFuncs_.push_back(f);
+        }
+    if (phase_ >= 2)
+    {
+        for (FuncInfo *f : c->methods)
+            resolveFunc(f);
+        for (FuncInfo *f : c->ctors)
+            resolveFunc(f);
+        if (c->dtor)
+            resolveFunc(c->dtor);
+    }
+    if (phase_ >= 3)
+        copyTemplateDefs(c);
+    if (phase_ >= 4)
+        mangleMethods(c);
+    if (phase_ >= 5)
+    {
+        FnCtx *savedFn = fn_;
+        auto savedPre = pre_;
+        bool savedHoist = canHoist_;
+        lowerClass(c);
+        fn_ = savedFn;
+        pre_ = savedPre;
+        canHoist_ = savedHoist;
+    }
+    line_ = savedLine;
+    return asType(c);
+}
+
+void Lowerer::copyTemplateDefs(ClassInfo *c)
+{
+    // members the template defines outside its class (template<class T> void S<T>::f() {...})
+    auto it = instanceOf_.find(c);
+    if (it == instanceOf_.end())
+        return;
+    ClassInfo *tc = it->second;
+    for (FuncInfo *f : c->methods)
+        if (!f->def)
+            for (FuncInfo *g : tc->methods)
+                if (g->decl == f->decl && g->def)
+                    f->def = g->def;
+    for (FuncInfo *f : c->ctors)
+        if (!f->def)
+            for (FuncInfo *g : tc->ctors)
+                if (g->decl == f->decl && g->def)
+                    f->def = g->def;
+    if (c->dtor && !c->dtor->def && tc->dtor)
+        c->dtor->def = tc->dtor->def;
+}
+
+void Lowerer::mangleMethods(ClassInfo *c)
+{
+    std::map<std::string, int> count;
+    for (FuncInfo *f : c->methods)
+    {
+        int n = ++count[f->name];
+        f->mangled = c->qname + "::" + f->name + (n > 1 ? "#" + std::to_string(n) : "");
+        f->vkey = f->name + "/" + std::to_string(f->params.size());
+        // methods overriding a base virtual are virtual too
+        for (ClassInfo *b = c->bases.empty() ? nullptr : c->bases[0]; b && !f->isVirtual;
+             b = b->bases.empty() ? nullptr : b->bases[0])
+            for (FuncInfo *bm : b->methods)
+                if (bm->isVirtual && bm->vkey == f->vkey)
+                    f->isVirtual = true;
+        if (f->isVirtual)
+            c->polymorphic = true;
+        Symbol &s = c->scope->syms[f->name];
+        s.kind = Symbol::Funcs;
+        s.funcs.push_back(f);
+    }
+    int n = 0;
+    for (FuncInfo *f : c->ctors)
+        f->mangled = c->qname + "::" + c->name + (++n > 1 ? "#" + std::to_string(n) : "");
+}
+
 ASTNodePtr Lowerer::run()
 {
     collect(prog_.decls, global_);
+    phase_ = 1;
     for (size_t i = 0; i < classOrder_.size(); ++i)
         resolveClass(classOrder_[i]);
-    for (ClassInfo *c : classOrder_)
-        for (FuncInfo *f : c->methods)
+    for (size_t i = 0; i < classOrder_.size(); ++i)
+        for (FuncInfo *f : std::vector<FuncInfo *>(classOrder_[i]->methods))
             resolveFunc(f);
-    for (ClassInfo *c : classOrder_)
-        for (FuncInfo *f : c->ctors)
+    for (size_t i = 0; i < classOrder_.size(); ++i)
+    {
+        for (FuncInfo *f : std::vector<FuncInfo *>(classOrder_[i]->ctors))
             resolveFunc(f);
+        if (classOrder_[i]->dtor)
+            resolveFunc(classOrder_[i]->dtor);
+    }
+    phase_ = 2;
 
     // free functions and out-of-class member definitions
     for (auto &fd : funcDecls_)
@@ -1238,7 +1496,15 @@ ASTNodePtr Lowerer::run()
                         if (m->name == probe.name && m->params.size() == probe.params.size() && !m->def)
                             match = m;
                 if (!match && d->isDtor)
+                {
+                    // Cls::~Cls() { ... } defined outside the class
+                    if (c->dtor)
+                    {
+                        c->dtor->def = dp;
+                        c->dtor->tu = d->tu;
+                    }
                     continue;
+                }
                 if (!match)
                     unsupported("definition of " + c->qname + "::" + probe.name + " matches no declaration", d->line);
                 match->def = dp;
@@ -1270,6 +1536,8 @@ ASTNodePtr Lowerer::run()
         for (FuncInfo *g : sym.funcs)
             if (sigKey(g) == key)
                 existing = g;
+        if (!existing && prog_.cMode && !sym.funcs.empty())
+            unsupported("conflicting types for '" + f->name + "'", d->line); // C has no overloading
         if (existing)
         {
             if (d->body)
@@ -1291,31 +1559,15 @@ ASTNodePtr Lowerer::run()
         allFuncs_.push_back(f);
     }
 
+    // class template instances made so far get the template's out-of-class members
+    phase_ = 3;
+    for (auto &inst : classInstances_)
+        copyTemplateDefs(inst.second);
+
     // method names: Cls::m, overloads numbered
-    for (ClassInfo *c : classOrder_)
-    {
-        std::map<std::string, int> count;
-        for (FuncInfo *f : c->methods)
-        {
-            int n = ++count[f->name];
-            f->mangled = c->qname + "::" + f->name + (n > 1 ? "#" + std::to_string(n) : "");
-            f->vkey = f->name + "/" + std::to_string(f->params.size());
-            // methods overriding a base virtual are virtual too
-            for (ClassInfo *b = c->bases.empty() ? nullptr : c->bases[0]; b && !f->isVirtual;
-                 b = b->bases.empty() ? nullptr : b->bases[0])
-                for (FuncInfo *bm : b->methods)
-                    if (bm->isVirtual && bm->vkey == f->vkey)
-                        f->isVirtual = true;
-            if (f->isVirtual)
-                c->polymorphic = true;
-            Symbol &s = c->scope->syms[f->name];
-            s.kind = Symbol::Funcs;
-            s.funcs.push_back(f);
-        }
-        int n = 0;
-        for (FuncInfo *f : c->ctors)
-            f->mangled = c->qname + "::" + c->name + (++n > 1 ? "#" + std::to_string(n) : "");
-    }
+    for (size_t i = 0; i < classOrder_.size(); ++i)
+        mangleMethods(classOrder_[i]);
+    phase_ = 4;
 
     // Global variables' types, before any function body refers to them.
     for (auto &g : globalsInOrder_)
@@ -1327,6 +1579,10 @@ ASTNodePtr Lowerer::run()
         line_ = d->line;
         Symbol &s = sc->syms[d->var.name];
         TP t = resolveType(d->var.type, sc);
+        if (isCBuf(t) && t->n < 0)
+            t->n = bufInitSize(d->var.args, d->var.init == VarDeclarator::Brace);
+        if (t->k == T::Array && t->n < 0 && !d->var.args.empty())
+            t->n = arrayInitSize(t, d->var.args, d->var.init == VarDeclarator::Brace);
         if (t->k == T::Dyn && d->var.type->isAuto() && !d->var.args.empty())
         {
             FnCtx ctx;
@@ -1348,13 +1604,65 @@ ASTNodePtr Lowerer::run()
 
     // Lower: classes (ctors, methods), free functions. Lowering can add
     // entries (classes declared inside function bodies): index loops.
+    phase_ = 5;
     for (size_t i = 0; i < classOrder_.size(); ++i)
-        lowerClass(classOrder_[i]); // class templates once, with dynamic parameters
+    {
+        ClassInfo *c = classOrder_[i];
+        if (!c->isTemplate)
+        {
+            lowerClass(c);
+            continue;
+        }
+        // a class template once, with dynamic parameters (for uses that can't be
+        // instantiated): what can't be lowered without its types is left out
+        FnCtx *savedFn = fn_;
+        auto savedPre = pre_;
+        bool savedHoist = canHoist_;
+        try
+        {
+            lowerClass(c);
+        }
+        catch (Unsupported &)
+        {
+            fn_ = savedFn;
+            pre_ = savedPre;
+            canHoist_ = savedHoist;
+        }
+    }
     for (size_t i = 0; i < allFuncs_.size(); ++i)
     {
         FuncInfo *f = allFuncs_[i];
         if (!f->cls && f->def && !f->lowered)
-            lowerFunction(f);
+        {
+            if (!f->isTemplate)
+            {
+                lowerFunction(f);
+                continue;
+            }
+            // a function template's dynamic version (for calls that can't be
+            // instantiated): if it can't be lowered without its types, a stub
+            auto savedPre = pre_;
+            bool savedHoist = canHoist_;
+            FnCtx *savedFn = fn_;
+            try
+            {
+                lowerFunction(f);
+            }
+            catch (Unsupported &u)
+            {
+                pre_ = savedPre;
+                canHoist_ = savedHoist;
+                fn_ = savedFn;
+                std::vector<std::string> ps;
+                for (size_t k = 0; k < f->def->params.size(); ++k)
+                    ps.push_back("__arg" + std::to_string(k));
+                std::vector<ASTNodePtr> body;
+                body.push_back(std::make_unique<ASTNode>(
+                    RaiseStmt{q::str("template " + f->name + " needs its template arguments: " + u.what(), f->def->line)},
+                    f->def->line));
+                topFns_.push_back(q::func(f->mangled, ps, q::block(std::move(body), f->def->line), f->def->line));
+            }
+        }
     }
 
     emitDescriptors();
@@ -1498,9 +1806,13 @@ ASTNodePtr Lowerer::planFor(const TP &t)
             (void)offset;
             for (ClassInfo *b : k->bases)
                 fill(b, 0);
+            bool first = true;
             for (auto &f : k->fields)
-                if (!f.isStatic && f.slot < (int)slots.size())
+                if (!f.isStatic && f.slot < (int)slots.size() && (first || !k->isUnion))
+                {
                     slots[f.slot] = sub(f.type);
+                    first = false;
+                }
         };
         fill(c, 0);
         std::vector<ASTNodePtr> args;
@@ -1600,13 +1912,121 @@ Local &Lowerer::declareLocal(const std::string &n, const TP &t)
     Local l;
     l.q = qn;
     l.t = t;
-    l.boxed = root->boxed.count(qn) > 0;
+    l.name = n;
+    l.boxed = root->boxed.count(qn) > 0 || isCBuf(t); // char buffers: in a cell a char* can point into
     fn_->scopes.back()[n] = l;
     return fn_->scopes.back()[n];
 }
 
-void Lowerer::pushScope() { fn_->scopes.emplace_back(); }
-void Lowerer::popScope() { fn_->scopes.pop_back(); }
+void Lowerer::pushScope()
+{
+    fn_->scopes.emplace_back();
+    fn_->owned.emplace_back();
+}
+void Lowerer::popScope()
+{
+    fn_->scopes.pop_back();
+    if (!fn_->owned.empty())
+        fn_->owned.pop_back();
+}
+
+// ─── Object lifetimes ──────────────────────────────────────────────────────
+// A class needs destruction when it (or a base / member) has a destructor
+// with a body, or owns smart pointers / containers of such objects. Locals
+// that own something are destroyed when their scope ends (also on return /
+// break / continue), in reverse order of declaration; `delete` dispatches on
+// the object's dynamic class (its descriptor's "#dtor").
+
+bool Lowerer::needsDtor(ClassInfo *c)
+{
+    if (!c || c->builtin)
+        return false;
+    auto it = dtorMemo_.find(c);
+    if (it != dtorMemo_.end())
+        return it->second > 0;
+    dtorMemo_[c] = 0; // a class holding vector<Self> is settled by its other members
+    bool need = c->dtor && c->dtor->def && c->dtor->def->body && !c->dtor->def->body->body.empty();
+    for (ClassInfo *b : c->bases)
+        need = need || needsDtor(b);
+    for (const auto &f : c->fields)
+        if (!f.isStatic && f.type)
+            need = need || ownsResource(f.type);
+    dtorMemo_[c] = need ? 1 : 0;
+    return need;
+}
+
+bool Lowerer::ownsResource(const TP &t)
+{
+    if (!t)
+        return false;
+    switch (t->k)
+    {
+    case T::Class:
+        return t->cls && needsDtor(t->cls);
+    case T::UPtr:
+        if (t->name == "shared_ptr")
+            return true;
+        return t->name == "unique_ptr" && !t->a.empty() && t->a[0] && (t->a[0]->k != T::Class || needsDtor(t->a[0]->cls));
+    case T::Vector:
+    case T::Array:
+        return !t->a.empty() && ownsResource(t->a[0]);
+    default:
+        return false;
+    }
+}
+
+ASTNodePtr Lowerer::destroyValue(const TP &t, ASTNodePtr v, int line)
+{
+    std::vector<ASTNodePtr> a;
+    a.push_back(std::move(v));
+    if (t->k == T::UPtr && t->name == "shared_ptr")
+        return q::call("__cpp_sp_release__", std::move(a), line);
+    if (t->k == T::Vector || t->k == T::Array)
+    {
+        // elements: a vector's in order, an array's last first
+        a.push_back(q::boolean(t->k == T::Array, line));
+        return q::call("__cpp_destroy_each__", std::move(a), line);
+    }
+    return q::call("__cpp_delete__", std::move(a), line);
+}
+
+bool Lowerer::anyOwned(size_t fromDepth)
+{
+    for (size_t i = fromDepth; i < fn_->owned.size(); ++i)
+        if (!fn_->owned[i].empty())
+            return true;
+    return false;
+}
+
+void Lowerer::emitDestroy(size_t fromDepth, std::vector<ASTNodePtr> &out, const std::string &except)
+{
+    for (size_t i = fn_->owned.size(); i-- > fromDepth;)
+        for (size_t j = fn_->owned[i].size(); j-- > 0;)
+        {
+            Local &l = fn_->owned[i][j];
+            if (l.q == except)
+                continue;
+            XV x = localXV(&l);
+            x.constLv = false;
+            out.push_back(q::exprStmt(destroyValue(l.t, read(x), line_), line_));
+        }
+}
+
+LoopCtx Lowerer::loopCtx()
+{
+    LoopCtx l;
+    l.scopeDepth = fn_->scopes.size();
+    return l;
+}
+
+FuncInfo *Lowerer::userCopyCtor(ClassInfo *c)
+{
+    for (FuncInfo *f : c->ctors)
+        if (f->params.size() == 1 && f->params[0]->k == T::Class && f->params[0]->cls == c && f->def &&
+            !(f->def->params.size() == 1 && f->def->params[0].type && f->def->params[0].type->rref))
+            return f;
+    return nullptr;
+}
 
 void Lowerer::lowerFunction(FuncInfo *f)
 {
@@ -1620,6 +2040,12 @@ void Lowerer::lowerFunction(FuncInfo *f)
 
 ASTNodePtr Lowerer::lowerFunctionBody(FuncInfo *f, std::vector<std::string> &params)
 {
+    struct CurFn
+    {
+        FuncInfo *&slot, *saved;
+        CurFn(FuncInfo *&s, FuncInfo *f) : slot(s), saved(s) { slot = f; }
+        ~CurFn() { slot = saved; }
+    } curFn(curFn_, f);
     const DeclP &d = f->def;
     std::set<std::string> boxed;
     for (int attempt = 0; attempt < 4; ++attempt)
@@ -1644,6 +2070,11 @@ ASTNodePtr Lowerer::lowerFunctionBody(FuncInfo *f, std::vector<std::string> &par
             std::string n = d->params[i].name.empty() ? "__arg" + std::to_string(i) : d->params[i].name;
             TP pt = i < f->params.size() ? f->params[i] : tDyn();
             Local &l = declareLocal(n, pt);
+            if (const auto &ptn = d->params[i].type)
+                l.isConst = ptn->isConst && ptn->pointers == 0;
+            if (!(i < f->paramRef.size() && f->paramRef[i]) && !(i < f->paramConstRef.size() && f->paramConstRef[i]) &&
+                !(d->params[i].type && (d->params[i].type->ref || d->params[i].type->rref)) && ownsResource(pt))
+                fn_->owned.back().push_back(l);
             if (i < f->paramRef.size() && f->paramRef[i] && !isObjectRep(pt))
             {
                 l.refSlot = true;
@@ -1660,6 +2091,8 @@ ASTNodePtr Lowerer::lowerFunctionBody(FuncInfo *f, std::vector<std::string> &par
                                                       d->line),
                                             d->line));
         }
+        if (f->variadic && !f->isTemplate)
+            params.push_back("*__va"); // the extra arguments, for va_start
         if (f->isCtor)
         {
             // base / member initialization, then the body
@@ -1729,6 +2162,7 @@ ASTNodePtr Lowerer::lowerFunctionBody(FuncInfo *f, std::vector<std::string> &par
                     stmts.push_back(std::move(ls));
             }
         }
+        emitDestroy(0, stmts);
         if (f->isCtor)
             stmts.push_back(q::ret(q::id("__this", d->line), d->line));
         popScope();
@@ -1768,10 +2202,12 @@ void Lowerer::lowerClass(ClassInfo *c)
             std::vector<ExprP> none;
             stmts.push_back(q::exprStmt(ctorCall(b, none, false, ln, q::id("__this", ln)), ln));
         }
+        bool unionDone = false;
         for (const auto &fld : c->fields)
         {
-            if (fld.isStatic)
+            if (fld.isStatic || (c->isUnion && unionDone))
                 continue;
+            unionDone = true;
             std::vector<ASTNodePtr> pre;
             auto savedPre = pre_;
             pre_ = &pre;
@@ -1803,7 +2239,7 @@ void Lowerer::lowerClass(ClassInfo *c)
         int i = 0;
         for (const auto &fld : c->fields)
         {
-            if (fld.isStatic)
+            if (fld.isStatic || (c->isUnion && i > 0))
                 continue;
             std::string p = "__f" + std::to_string(i++);
             ps.push_back(p);
@@ -1837,6 +2273,34 @@ void Lowerer::lowerClass(ClassInfo *c)
     for (FuncInfo *f : c->methods)
         if (f->def && f->isTemplate)
             lowerFunction(f);
+    if (needsDtor(c))
+    {
+        std::vector<ASTNodePtr> st;
+        if (c->dtor && c->dtor->def)
+        {
+            c->dtor->mangled = c->qname + "::~" + c->name;
+            lowerFunction(c->dtor);
+            std::vector<ASTNodePtr> a;
+            a.push_back(q::id("__this", ln));
+            st.push_back(q::exprStmt(q::call(c->dtor->mangled, std::move(a), ln), ln));
+        }
+        for (size_t i = c->fields.size(); i-- > 0;)
+        {
+            const FieldInfo &f = c->fields[i];
+            if (!f.isStatic && f.type && ownsResource(f.type))
+                st.push_back(q::exprStmt(destroyValue(f.type, q::index(q::id("__this", ln), q::num(f.slot, ln), ln), ln), ln));
+            if (c->isUnion)
+                break;
+        }
+        for (size_t i = c->bases.size(); i-- > 0;)
+            if (needsDtor(c->bases[i]))
+            {
+                std::vector<ASTNodePtr> a;
+                a.push_back(q::id("__this", ln));
+                st.push_back(q::exprStmt(q::call(c->bases[i]->dtorFn(), std::move(a), ln), ln));
+            }
+        topFns_.push_back(q::func(c->dtorFn(), {"__this"}, q::block(std::move(st), ln), ln));
+    }
 }
 
 void Lowerer::emitDescriptors()
@@ -1859,6 +2323,14 @@ void Lowerer::emitDescriptors()
         args.push_back(q::arr(std::move(bases), ln));
         args.push_back(c->bases.empty() ? q::nil(ln) : q::id(c->bases[0]->desc(), ln));
         topInit_.push_back(q::var(c->desc(), q::call("__cpp_class__", std::move(args), ln), ln));
+        if (needsDtor(c))
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(q::id(c->desc(), ln));
+            a.push_back(q::str("#dtor", ln));
+            a.push_back(q::id(c->dtorFn(), ln));
+            topInit_.push_back(q::exprStmt(q::call("__cpp_vt_set__", std::move(a), ln), ln));
+        }
         // virtual table: own methods override the base's entries
         for (FuncInfo *f : c->methods)
             if (f->isVirtual && f->def && !f->isPure)
@@ -1923,6 +2395,12 @@ void Lowerer::emitGlobals()
         pre_ = savedPre;
         for (auto &p : pre)
             topInit_.push_back(std::move(p));
+        if (isCBuf(t))
+        {
+            std::vector<ASTNodePtr> cell;
+            cell.push_back(std::move(value));
+            value = q::arr(std::move(cell), d->line);
+        }
         topInit_.push_back(q::var(gname, std::move(value), d->line));
         popScope();
         fn_ = saved;
@@ -1957,6 +2435,12 @@ void Lowerer::emitGlobals()
             }
             else
                 value = defaultValue(f.type, 0);
+            if (isCBuf(f.type))
+            {
+                std::vector<ASTNodePtr> cell;
+                cell.push_back(std::move(value));
+                value = q::arr(std::move(cell), 0);
+            }
             pre_ = savedPre;
             for (auto &p : pre)
                 topInit_.push_back(std::move(p));
@@ -2007,14 +2491,37 @@ ASTNodePtr Lowerer::lowerBlock(const std::vector<StmtP> &body, bool newScope)
             out.push_back(std::move(ls));
     }
     if (newScope)
+    {
+        emitDestroy(fn_->scopes.size() - 1, out);
         popScope();
+    }
     return q::block(std::move(out), body.empty() ? line_ : body[0]->line);
 }
 
 void Lowerer::lowerDecl(const Stmt &s, std::vector<ASTNodePtr> &out)
 {
     for (const auto &v : s.decls)
-        lowerVar(v, s.isStatic, out);
+    {
+        int savedTemps = tempsTracked_;
+        tempsTracked_ = s.isStatic ? -1 : 0;
+        std::vector<ASTNodePtr> one;
+        lowerVar(v, s.isStatic, one);
+        if (tempsTracked_ > 0)
+        {
+            // the declaration's other temporaries end with it (the variables stay in scope)
+            std::string mark = tempName();
+            out.push_back(q::var(mark, q::call("__cpp_temps_mark__", {}, s.line), s.line));
+            for (auto &x : one)
+                out.push_back(std::move(x));
+            std::vector<ASTNodePtr> a;
+            a.push_back(q::id(mark, s.line));
+            out.push_back(q::exprStmt(q::call("__cpp_temps_end__", std::move(a), s.line), s.line));
+        }
+        else
+            for (auto &x : one)
+                out.push_back(std::move(x));
+        tempsTracked_ = savedTemps;
+    }
 }
 
 void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNodePtr> &out)
@@ -2028,6 +2535,17 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
     TypeNameP tn = v.type;
     TP t = resolveType(tn, fn_->scope);
     std::vector<ExprP> args = v.args;
+    if (tn->isAuto() && tn->pointers > 0 && !args.empty())
+        t = tDyn(); // auto *p = e: e's (pointer) type
+    if (isCBuf(t) && t->n < 0)
+        t->n = bufInitSize(args, v.init == VarDeclarator::Brace);
+    if (t->k == T::Array && t->n < 0 && !args.empty())
+        t->n = arrayInitSize(t, args, v.init == VarDeclarator::Brace);
+    if (!v.name.empty() && !fn_->scopes.empty() && fn_->scopes.back().count(v.name))
+        unsupported(prog_.cMode ? "redefinition of '" + v.name + "'"
+                                : "redeclaration of '" + diagType(t) + " " + v.name + "'",
+                    ln);
+    const bool constVar = (tn->isConst && tn->pointers == 0) || (!tn->constPtr.empty() && tn->constPtr.back());
 
     // structured binding: auto [a, b] = e;  auto& [k, v] = e;
     if (!v.bindings.empty())
@@ -2103,6 +2621,12 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
         std::vector<ASTNodePtr> thenStmts;
         for (auto &p : pre)
             thenStmts.push_back(std::move(p));
+        if (isCBuf(t))
+        {
+            std::vector<ASTNodePtr> cell;
+            cell.push_back(std::move(value));
+            value = q::arr(std::move(cell), ln);
+        }
         thenStmts.push_back(q::exprStmt(q::assign(q::id(g, ln), std::move(value), ln), ln));
         thenStmts.push_back(q::exprStmt(q::assign(q::id(guard, ln), q::boolean(true, ln), ln), ln));
         pre_ = savedPre;
@@ -2111,11 +2635,18 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
         topInit_.insert(topInit_.begin(), q::var(g, q::nil(ln), ln));
         out.push_back(q::ifs(q::un("!", q::id(guard, ln), ln), q::block(std::move(thenStmts), ln), nullptr, ln));
         Local &l = declareLocal(v.name, t);
+        l.isConst = constVar;
         l.alias = true;
         auto a = std::make_shared<XV>();
         a->t = t;
         a->lk = XV::Var;
         a->var = g;
+        if (isCBuf(t))
+        {
+            a->lk = XV::Idx;
+            a->obj = q::id(g, ln);
+            a->key = q::num(0, ln);
+        }
         l.aliasOf = a;
         return;
     }
@@ -2136,6 +2667,7 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
             for (auto &p : pre)
                 out.push_back(std::move(p));
             Local &l = declareLocal(v.name, t);
+            l.isConst = constVar;
             if (l.boxed)
             {
                 std::vector<ASTNodePtr> e;
@@ -2164,17 +2696,43 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
         for (auto &p : pre)
             out.push_back(std::move(p));
         Local &l = declareLocal(v.name, t);
+        l.isConst = constVar;
         l.alias = true;
         l.aliasOf = a;
         return;
     }
 
+    if (t->k == T::Func && !tn->isAuto() && v.init != VarDeclarator::None)
+    {
+        // std::function<...> f = [&](...) { ... f(...) ... }: the name is in
+        // scope in its own initializer, so a recursive lambda can call it
+        for (auto &p : pre)
+            out.push_back(std::move(p));
+        pre.clear();
+        {
+            Local &l = declareLocal(v.name, t);
+            l.isConst = constVar;
+            std::vector<ASTNodePtr> cell;
+            cell.push_back(q::nil(ln));
+            out.push_back(q::var(l.q, l.boxed ? q::arr(std::move(cell), ln) : q::nil(ln), ln));
+        }
+        XV x = makeObjectFrom(t, args, v.init == VarDeclarator::Brace, ln);
+        ASTNodePtr value = copyOf(std::move(x), ln);
+        pre_ = savedPre;
+        for (auto &p : pre)
+            out.push_back(std::move(p));
+        XV target = localXV(findLocal(v.name));
+        target.constLv = false;
+        out.push_back(q::exprStmt(store(target, std::move(value), ln), ln));
+        return;
+    }
     ASTNodePtr value;
     if (v.init == VarDeclarator::None)
         value = defaultValue(t, ln);
     else
     {
         XV x = makeObjectFrom(t, args, v.init == VarDeclarator::Brace, ln);
+        untrackTemp(x);
         if (t->k == T::Dyn)
             t = x.t;
         value = copyOf(std::move(x), ln);
@@ -2183,6 +2741,7 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
     for (auto &p : pre)
         out.push_back(std::move(p));
     Local &l = declareLocal(v.name, t);
+    l.isConst = constVar;
     if (l.boxed)
     {
         std::vector<ASTNodePtr> e;
@@ -2190,9 +2749,37 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
         value = q::arr(std::move(e), ln);
     }
     out.push_back(q::var(l.q, std::move(value), ln));
+    if (!fn_->owned.empty() && ownsResource(t))
+        fn_->owned.back().push_back(l); // destroyed when the scope ends
 }
 
 ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
+{
+    int savedTemps = tempsTracked_;
+    std::string savedMark = tempsMark_;
+    bool tracks = s->k == SK::Expr || s->k == SK::Return;
+    tempsTracked_ = tracks ? 0 : -1;
+    tempsMark_ = tracks ? tempName() : std::string();
+    ASTNodePtr r = lowerStmtInner(s);
+    if (tracks && tempsTracked_ > 0)
+    {
+        if (s->k == SK::Return)
+        {
+            // the return ends them itself, before returning
+            std::vector<ASTNodePtr> st;
+            st.push_back(q::var(tempsMark_, q::call("__cpp_temps_mark__", {}, s->line), s->line));
+            st.push_back(std::move(r));
+            r = q::block(std::move(st), s->line);
+        }
+        else
+            r = endTemps(std::move(r), tempsMark_, s->line);
+    }
+    tempsTracked_ = savedTemps;
+    tempsMark_ = savedMark;
+    return r;
+}
+
+ASTNodePtr Lowerer::lowerStmtInner(const StmtP &s)
 {
     line_ = s->line;
     int ln = s->line;
@@ -2219,6 +2806,7 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
             else
             {
                 XV x = lowerExpr(e->kids[0]);
+                untrackTemp(x);
                 ASTNodePtr val;
                 if (x.t->k == T::Class)
                     val = copyOf(std::move(x), ln);
@@ -2262,7 +2850,7 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
     {
         pre_ = savedPre;
         pushScope();
-        fn_->loops.push_back({});
+        fn_->loops.push_back(loopCtx());
         std::vector<ASTNodePtr> outer;
         ASTNodePtr loop;
         if (s->condDecl)
@@ -2304,7 +2892,7 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
     case SK::Do:
     {
         pre_ = savedPre;
-        fn_->loops.push_back({});
+        fn_->loops.push_back(loopCtx());
         ASTNodePtr body = lowerStmt(s->then);
         std::vector<ASTNodePtr> cpre;
         pre_ = &cpre;
@@ -2326,6 +2914,14 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
         pre_ = savedPre;
         return lowerSwitch(*s);
     case SK::Break:
+        if (!fn_->loops.empty() && anyOwned(fn_->loops.back().scopeDepth))
+        {
+            std::vector<ASTNodePtr> st;
+            emitDestroy(fn_->loops.back().scopeDepth, st);
+            st.push_back(q::brk(ln));
+            out = q::block(std::move(st), ln);
+            break;
+        }
         out = q::brk(ln);
         break;
     case SK::Continue:
@@ -2344,6 +2940,13 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
             st.push_back(q::brk(ln));
             out = q::block(std::move(st), ln);
         }
+        else if (!fn_->loops.empty() && anyOwned(fn_->loops.back().scopeDepth))
+        {
+            std::vector<ASTNodePtr> st;
+            emitDestroy(fn_->loops.back().scopeDepth, st);
+            st.push_back(q::cont(ln));
+            out = q::block(std::move(st), ln);
+        }
         else
             out = q::cont(ln);
         break;
@@ -2352,6 +2955,19 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
     {
         if (!s->expr)
         {
+            if (!fn_->isLambda && fn_->ret && fn_->ret->k != T::Void && fn_->ret->k != T::Dyn)
+                unsupported(prog_.cMode ? std::string("'return' with no value, in function returning non-void")
+                                        : "return-statement with no value, in function returning '" + diagType(fn_->ret) +
+                                              "' [-fpermissive]",
+                            ln);
+            if (anyOwned(0))
+            {
+                std::vector<ASTNodePtr> st;
+                emitDestroy(0, st);
+                st.push_back(q::ret(nullptr, ln));
+                out = q::block(std::move(st), ln);
+                break;
+            }
             out = q::ret(nullptr, ln);
             break;
         }
@@ -2364,8 +2980,13 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
         }
         else
             x = lowerExpr(s->expr);
+        untrackTemp(x);
         if (fn_->isLambda && !fn_->deducedRet)
             fn_->deducedRet = x.t;
+        if (!fn_->isLambda && fn_->ret && fn_->ret->k == T::Void && x.t->k != T::Void && x.t->k != T::Dyn)
+            unsupported(prog_.cMode ? std::string("'return' with a value, in function returning void")
+                                    : std::string("return-statement with a value, in function returning 'void' [-fpermissive]"),
+                        ln);
         if (fn_->retRef)
         {
             // returns T& of a scalar: a Ref to the lvalue
@@ -2382,7 +3003,24 @@ ASTNodePtr Lowerer::lowerStmt(const StmtP &s)
                 for (auto &kv : sc)
                     if (kv.second.q == x.var && !kv.second.alias)
                         local = true;
+        std::string returnedLocal = local ? x.var : std::string();
         ASTNodePtr val = (local || fn_->retIsRef) ? read(x) : copyOf(std::move(x), ln);
+        if (anyOwned(0) || tempsTracked_ > 0)
+        {
+            std::string tmp = tempName();
+            std::vector<ASTNodePtr> st;
+            st.push_back(q::var(tmp, std::move(val), ln));
+            if (tempsTracked_ > 0)
+            {
+                std::vector<ASTNodePtr> a;
+                a.push_back(q::id(tempsMark_, ln));
+                st.push_back(q::exprStmt(q::call("__cpp_temps_end__", std::move(a), ln), ln));
+            }
+            emitDestroy(0, st, returnedLocal);
+            st.push_back(q::ret(q::id(tmp, ln), ln));
+            out = q::block(std::move(st), ln);
+            break;
+        }
         out = q::ret(std::move(val), ln);
         break;
     }
@@ -2474,10 +3112,11 @@ ASTNodePtr Lowerer::lowerFor(const Stmt &s)
         step = q::exprStmt(read(x), ln);
     }
     pre_ = savedPre;
-    fn_->loops.push_back({});
+    fn_->loops.push_back(loopCtx());
     ASTNodePtr body = lowerStmt(s.then);
     fn_->loops.pop_back();
     outer.push_back(q::whiles(std::move(cond), body ? std::move(body) : q::block({}, ln), std::move(step), ln));
+    emitDestroy(fn_->scopes.size() - 1, outer);
     popScope();
     return q::block(std::move(outer), ln);
 }
@@ -2647,7 +3286,7 @@ ASTNodePtr Lowerer::lowerRangeFor(const Stmt &s)
     pre_ = savedPre;
     for (auto &p : bpre)
         body.insert(body.begin(), std::move(p));
-    fn_->loops.push_back({});
+    fn_->loops.push_back(loopCtx());
     if (ASTNodePtr b = lowerStmt(s.then))
         body.push_back(std::move(b));
     fn_->loops.pop_back();
@@ -2723,6 +3362,7 @@ ASTNodePtr Lowerer::lowerSwitch(const Stmt &s)
     outer.push_back(q::var(st, std::move(sel), ln));
     LoopCtx lc;
     lc.isSwitch = true;
+    lc.scopeDepth = fn_->scopes.size();
     fn_->loops.push_back(lc);
     std::vector<ASTNodePtr> body;
     pushScope(); // one scope for the whole switch body, as in C++
@@ -2771,11 +3411,61 @@ ASTNodePtr Lowerer::lowerSwitch(const Stmt &s)
     return q::block(std::move(outer), ln);
 }
 
+// The VM unwinds a caught exception's stack to its depth at the try, while
+// the compiler numbers the handler's locals after every local declared in
+// the try body: those are declared before the try instead (`var x = e`
+// inside becomes `x = e`), so the slots agree however far the body got.
+static void hoistTryLocals(ASTNode &n, std::vector<std::string> &names)
+{
+    if (auto *b = std::get_if<BlockStmt>(&n.node))
+    {
+        for (auto &st : b->statements)
+            if (st)
+                hoistTryLocals(*st, names);
+        return;
+    }
+    if (auto *v = std::get_if<VarDecl>(&n.node))
+    {
+        std::string name = v->name;
+        names.push_back(name);
+        ASTNodePtr init = v->initializer ? std::move(v->initializer) : q::nil(n.line);
+        n.node = ExprStmt{q::assign(q::id(name, n.line), std::move(init), n.line)};
+        return;
+    }
+    if (auto *i = std::get_if<IfStmt>(&n.node))
+    {
+        if (i->thenBranch)
+            hoistTryLocals(*i->thenBranch, names);
+        if (i->elseBranch)
+            hoistTryLocals(*i->elseBranch, names);
+        return;
+    }
+    if (auto *w = std::get_if<WhileStmt>(&n.node))
+    {
+        if (w->body)
+            hoistTryLocals(*w->body, names);
+        if (w->post)
+            hoistTryLocals(*w->post, names);
+        return;
+    }
+    if (auto *t = std::get_if<TryStmt>(&n.node))
+    {
+        if (t->body)
+            hoistTryLocals(*t->body, names);
+        for (auto &h : t->handlers)
+            if (h.body)
+                hoistTryLocals(*h.body, names);
+    }
+}
+
 ASTNodePtr Lowerer::lowerTry(const Stmt &s)
 {
     int ln = s.line;
     TryStmt ts;
     ts.body = std::shared_ptr<ASTNode>(lowerStmt(s.then).release());
+    std::vector<std::string> hoisted;
+    if (ts.body)
+        hoistTryLocals(*ts.body, hoisted);
     std::string ex = tempName();
     ExceptClause h;
     h.alias = ex;
@@ -2825,7 +3515,13 @@ ASTNodePtr Lowerer::lowerTry(const Stmt &s)
     hb.push_back(std::move(chain));
     h.body = std::shared_ptr<ASTNode>(q::block(std::move(hb), ln).release());
     ts.handlers.push_back(std::move(h));
-    return std::make_unique<ASTNode>(std::move(ts), ln);
+    if (hoisted.empty())
+        return std::make_unique<ASTNode>(std::move(ts), ln);
+    std::vector<ASTNodePtr> out;
+    for (const auto &n : hoisted)
+        out.push_back(q::var(n, q::nil(ln), ln));
+    out.push_back(std::make_unique<ASTNode>(std::move(ts), ln));
+    return q::block(std::move(out), ln);
 }
 
 void Lowerer::localClass(const DeclP &d)
