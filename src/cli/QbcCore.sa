@@ -1,0 +1,17 @@
+// quantum: cpp
+#include "QbcCore.h.sa"
+#include "Compiler.h.sa"
+#include "Lexer.h.sa"
+#include "Parser.h.sa"
+#include "Serializer.h.sa"
+
+std::vector<uint8_t> coreBytecode(const std::string &source, bool pythonSource)
+{
+    Lexer lexer(source);
+    Parser parser(lexer.tokenize());
+    parser.setPythonSource(pythonSource);
+    auto ast = parser.parse();
+    Compiler compiler;
+    auto chunk = compiler.compile(*ast);
+    return Serializer::serialize(chunk);
+}

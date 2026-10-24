@@ -1,0 +1,257 @@
+// quantum: cpp
+#include "Pe.h.sa"
+
+#include <cstdint>
+#include <map>
+
+namespace native
+{
+
+namespace
+{
+
+const uint64_t kImageBase = 0x140000000ULL;
+const int kSectionAlign = 0x1000;
+const int kFileAlign = 0x200;
+
+int alignUp(int v, int a) { return (v + a - 1) / a * a; }
+
+void put8(std::string &s, int v) { s.push_back((char)(v & 255)); }
+void put16(std::string &s, int v)
+{
+    put8(s, v);
+    put8(s, v >> 8);
+}
+void put32(std::string &s, uint32_t v)
+{
+    for (int i = 0; i < 4; ++i)
+        put8(s, (int)((v >> (8 * i)) & 255));
+}
+void put64(std::string &s, uint64_t v)
+{
+    for (int i = 0; i < 8; ++i)
+        put8(s, (int)((v >> (8 * i)) & 255));
+}
+void putName8(std::string &s, const std::string &name) // a section name, NUL-padded to 8
+{
+    for (int i = 0; i < 8; ++i)
+        put8(s, i < (int)name.size() ? (unsigned char)name[i] : 0);
+}
+void padTo(std::string &s, size_t n)
+{
+    while (s.size() < n)
+        s.push_back('\0');
+}
+void set32(std::string &s, int pos, uint32_t v)
+{
+    for (int i = 0; i < 4; ++i)
+        s[pos + i] = (char)((v >> (8 * i)) & 255);
+}
+
+} // namespace
+
+std::string writePe(const Asm &code, int entry, const std::vector<Import> &imports, const std::string &dataIn)
+{
+    // ── Layout ──────────────────────────────────────────────────────────
+    const int textRva = kSectionAlign;
+    const int textSize = code.size();
+    std::string data = dataIn;
+    if (data.empty())
+        data.push_back('\0'); // a section is never empty
+    const int dataRva = textRva + alignUp(textSize, kSectionAlign);
+    const int dataSize = (int)data.size();
+    const int idataRva = dataRva + alignUp(dataSize, kSectionAlign);
+
+    // imports grouped by DLL, in order of first use
+    std::vector<std::string> dlls;
+    std::map<std::string, std::vector<int>> byDll; // dll -> indices into `imports`
+    for (int i = 0; i < (int)imports.size(); ++i)
+    {
+        if (!byDll.count(imports[i].dll))
+            dlls.push_back(imports[i].dll);
+        byDll[imports[i].dll].push_back(i);
+    }
+    // .idata: directory table, lookup tables, address tables, names
+    int off = ((int)dlls.size() + 1) * 20;
+    std::map<std::string, int> iltOff, iatOff, dllNameOff;
+    for (const std::string &d : dlls)
+    {
+        iltOff[d] = off;
+        off += ((int)byDll[d].size() + 1) * 8;
+    }
+    const int iatStart = off;
+    for (const std::string &d : dlls)
+    {
+        iatOff[d] = off;
+        off += ((int)byDll[d].size() + 1) * 8;
+    }
+    const int iatSize = off - iatStart;
+    std::vector<int> hintOff(imports.size()), slotRva(imports.size());
+    for (const std::string &d : dlls)
+    {
+        dllNameOff[d] = off;
+        off += (int)d.size() + 1;
+    }
+    for (int i = 0; i < (int)imports.size(); ++i)
+    {
+        off = alignUp(off, 2);
+        hintOff[i] = off;
+        off += 2 + (int)imports[i].name.size() + 1;
+    }
+    const int idataSize = off;
+    for (const std::string &d : dlls)
+        for (int k = 0; k < (int)byDll[d].size(); ++k)
+            slotRva[byDll[d][k]] = idataRva + iatOff[d] + 8 * k;
+
+    // ── .text: the code, with each import call aimed at its IAT slot ────
+    std::string text = code.code;
+    for (const Asm::ImportRef &r : code.importRefs)
+        set32(text, r.pos, (uint32_t)(slotRva[r.import] - (textRva + r.pos + 4)));
+    for (const Asm::DataRef &r : code.dataRefs)
+        set32(text, r.pos, (uint32_t)(dataRva + r.dataOff - (textRva + r.pos + 4)));
+
+    // ── .idata ──────────────────────────────────────────────────────────
+    std::string idata;
+    for (const std::string &d : dlls)
+    {
+        put32(idata, idataRva + iltOff[d]); // OriginalFirstThunk
+        put32(idata, 0);                    // TimeDateStamp
+        put32(idata, 0);                    // ForwarderChain
+        put32(idata, idataRva + dllNameOff[d]);
+        put32(idata, idataRva + iatOff[d]); // FirstThunk
+    }
+    padTo(idata, idata.size() + 20); // terminator
+    for (int pass = 0; pass < 2; ++pass) // lookup tables, then (identical) address tables
+        for (const std::string &d : dlls)
+        {
+            for (int i : byDll[d])
+                put64(idata, (uint64_t)(idataRva + hintOff[i]));
+            put64(idata, 0);
+        }
+    for (const std::string &d : dlls)
+    {
+        idata += d;
+        put8(idata, 0);
+    }
+    for (int i = 0; i < (int)imports.size(); ++i)
+    {
+        padTo(idata, hintOff[i]);
+        put16(idata, 0); // hint
+        idata += imports[i].name;
+        put8(idata, 0);
+    }
+
+    // ── Headers ─────────────────────────────────────────────────────────
+    const int numSections = 3;
+    const int headersSize = alignUp(0x40 + 4 + 20 + 240 + 40 * numSections, kFileAlign);
+    const int textRaw = alignUp(textSize, kFileAlign);
+    const int dataRaw = alignUp(dataSize, kFileAlign);
+    const int idataRaw = alignUp(idataSize, kFileAlign);
+    const int imageSize = idataRva + alignUp(idataSize, kSectionAlign);
+
+    std::string pe;
+    // DOS header: "MZ", and where the PE header starts
+    put16(pe, 0x5A4D);
+    padTo(pe, 0x3C);
+    put32(pe, 0x40);
+    // PE signature and COFF header
+    pe += "PE";
+    put16(pe, 0);
+    put16(pe, 0x8664);      // Machine: x86-64
+    put16(pe, numSections);
+    put32(pe, 0);           // TimeDateStamp (0: the same bytes every build)
+    put32(pe, 0);           // PointerToSymbolTable
+    put32(pe, 0);           // NumberOfSymbols
+    put16(pe, 240);         // SizeOfOptionalHeader
+    put16(pe, 0x0022);      // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // Optional header (PE32+)
+    put16(pe, 0x020B);
+    put8(pe, 1);            // linker version
+    put8(pe, 0);
+    put32(pe, textRaw);     // SizeOfCode
+    put32(pe, dataRaw + idataRaw); // SizeOfInitializedData
+    put32(pe, 0);           // SizeOfUninitializedData
+    put32(pe, textRva + entry);
+    put32(pe, textRva);     // BaseOfCode
+    put64(pe, kImageBase);
+    put32(pe, kSectionAlign);
+    put32(pe, kFileAlign);
+    put16(pe, 6);           // OS version 6.0
+    put16(pe, 0);
+    put16(pe, 0);           // image version
+    put16(pe, 0);
+    put16(pe, 6);           // subsystem version 6.0
+    put16(pe, 0);
+    put32(pe, 0);           // Win32VersionValue
+    put32(pe, imageSize);
+    put32(pe, headersSize);
+    put32(pe, 0);           // CheckSum
+    put16(pe, 3);           // Subsystem: console
+    put16(pe, 0x8100);      // NX_COMPAT | TERMINAL_SERVER_AWARE (fixed base: no relocations)
+    put64(pe, 0x100000);    // stack reserve
+    put64(pe, 0x1000);      // stack commit
+    put64(pe, 0x100000);    // heap reserve
+    put64(pe, 0x1000);      // heap commit
+    put32(pe, 0);           // LoaderFlags
+    put32(pe, 16);          // NumberOfRvaAndSizes
+    for (int d = 0; d < 16; ++d)
+    {
+        if (d == 1) // import directory
+        {
+            put32(pe, idataRva);
+            put32(pe, ((int)dlls.size() + 1) * 20);
+        }
+        else if (d == 12) // import address table
+        {
+            put32(pe, idataRva + iatStart);
+            put32(pe, iatSize);
+        }
+        else
+        {
+            put32(pe, 0);
+            put32(pe, 0);
+        }
+    }
+    // Section headers
+    putName8(pe, ".text");
+    put32(pe, textSize);
+    put32(pe, textRva);
+    put32(pe, textRaw);
+    put32(pe, headersSize);
+    put32(pe, 0);
+    put32(pe, 0);
+    put16(pe, 0);
+    put16(pe, 0);
+    put32(pe, 0x60000020); // CODE | EXECUTE | READ
+    putName8(pe, ".data");
+    put32(pe, dataSize);
+    put32(pe, dataRva);
+    put32(pe, dataRaw);
+    put32(pe, headersSize + textRaw);
+    put32(pe, 0);
+    put32(pe, 0);
+    put16(pe, 0);
+    put16(pe, 0);
+    put32(pe, 0xC0000040); // INITIALIZED_DATA | READ | WRITE
+    putName8(pe, ".idata");
+    put32(pe, idataSize);
+    put32(pe, idataRva);
+    put32(pe, idataRaw);
+    put32(pe, headersSize + textRaw + dataRaw);
+    put32(pe, 0);
+    put32(pe, 0);
+    put16(pe, 0);
+    put16(pe, 0);
+    put32(pe, 0xC0000040); // INITIALIZED_DATA | READ | WRITE
+
+    padTo(pe, headersSize);
+    pe += text;
+    padTo(pe, headersSize + textRaw);
+    pe += data;
+    padTo(pe, headersSize + textRaw + dataRaw);
+    pe += idata;
+    padTo(pe, headersSize + textRaw + dataRaw + idataRaw);
+    return pe;
+}
+
+} // namespace native

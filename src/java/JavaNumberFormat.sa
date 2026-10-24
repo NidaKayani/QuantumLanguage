@@ -1,0 +1,64 @@
+// quantum: cpp
+// Java's Double.toString / Float.toString: shared by the Java front-end
+// (constant folding, src/java/JavaEmit.cpp) and the VM's Java runtime
+// (src/vm/VmJavaLib.cpp).
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+
+// The shortest decimal that rounds back to `d` (> 0, finite): digits
+// d1 d2 ... dn (no trailing zeros) with value d1.d2...dn × 10^exp10. Two
+// digits are always considered (JDK 19+: Double.MIN_VALUE is 4.9E-324).
+void shortestDigits(double d, bool isFloat, std::string &digits, int &exp10)
+{
+    char buf[64];
+    int maxp = isFloat ? 9 : 17;
+    for (int p = 2; p <= maxp; ++p)
+    {
+        std::snprintf(buf, sizeof buf, "%.*e", p - 1, d);
+        double back = std::strtod(buf, nullptr);
+        if (isFloat ? (float)back == (float)d : back == d)
+            break;
+    }
+    digits.clear();
+    const char *s = buf;
+    for (; *s && *s != 'e'; ++s)
+        if (std::isdigit((unsigned char)*s))
+            digits += *s;
+    exp10 = *s == 'e' ? std::atoi(s + 1) : 0;
+    while (digits.size() > 1 && digits.back() == '0')
+        digits.pop_back();
+}
+
+static std::string toJavaString(double d, bool isFloat)
+{
+    if (std::isnan(d))
+        return "NaN";
+    if (std::isinf(d))
+        return d > 0 ? "Infinity" : "-Infinity";
+    if (d == 0)
+        return std::signbit(d) ? "-0.0" : "0.0";
+    std::string sign = d < 0 ? "-" : "";
+    double a = std::fabs(d);
+    std::string digits;
+    int e;
+    shortestDigits(a, isFloat, digits, e);
+    int n = (int)digits.size();
+    if (a >= 1e-3 && a < 1e7)
+    {
+        int intDigits = e + 1;
+        if (intDigits <= 0)
+            return sign + "0." + std::string(-intDigits, '0') + digits;
+        if (intDigits >= n)
+            return sign + digits + std::string(intDigits - n, '0') + ".0";
+        return sign + digits.substr(0, intDigits) + "." + digits.substr(intDigits);
+    }
+    return sign + digits.substr(0, 1) + "." + (n > 1 ? digits.substr(1) : "0") + "E" + std::to_string(e);
+}
+
+
+std::string javaDoubleToString(double d) { return toJavaString(d, false); }
+std::string javaFloatToString(double f) { return toJavaString(f, true); }

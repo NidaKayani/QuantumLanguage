@@ -1,0 +1,61 @@
+// quantum: cpp
+// The bootstrap C++ lexer and parser, compiled by Quantum's own C/C++
+// front-end:
+//   qrun src/tools/selfhost/astdump.cpp <file>
+// prints the same tree as `qrun --dump-ast <file>` (cli/SelfHost.cpp).
+#include "../../include/AstDump.h.sa"
+#include "../../include/Error.h.sa"
+#include "../../include/Lexer.h.sa"
+#include "../../include/Parser.h.sa"
+#include "../../Token.sa"
+#include "../../lexer/LexerCore.sa"
+#include "../../lexer/LexerReaders.sa"
+#include "../../lexer/LexerTokenize.sa"
+#include "../../parser/ParserCore.sa"
+#include "../../parser/ParserExpressions.sa"
+#include "../../parser/ParserLiterals.sa"
+#include "../../parser/ParserStatements.sa"
+#include "../../cli/AstDump.sa"
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        std::cerr << "usage: astdump.cpp <file>\n";
+        return 1;
+    }
+    const std::string path = argv[1];
+    std::ifstream in(path);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    try
+    {
+        Lexer lexer(ss.str());
+        Parser parser(lexer.tokenize());
+        const std::string ext = path.size() >= 3 ? path.substr(path.size() - 3) : "";
+        parser.setPythonSource(ext == ".py" || ext == ".PY");
+        auto ast = parser.parse();
+        dumpAstTree(std::cout, ast.get());
+    }
+    catch (const ParseError &e)
+    {
+        std::cout << "ERROR\tParseError: " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+    catch (const QuantumError &e)
+    {
+        std::cout << "ERROR\t" << e.kind << ": " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+    return 0;
+}

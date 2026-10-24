@@ -1,0 +1,3080 @@
+// quantum: cpp
+// The native backend's code generator: the C++ AST (src/cpp/) to x86-64 code
+// for Windows.
+//
+// Types so far: the integer types, pointers, references, arrays, and classes
+// with constructors, destructors, single inheritance and virtual functions.
+// Every variable lives in memory at its own size: locals in the rbp frame,
+// globals, vtables and string literals in the .data section. An expression
+// leaves a scalar value in rax, already wrapped to its type (an int
+// sign-extended from 32 bits, an unsigned zero-extended, a bool 0 or 1), so
+// 64-bit instructions give C++'s results; a class or array value leaves its
+// address there. Operands of a binary operator meet on the stack.
+//
+// Calls use the Microsoft x64 registers and stack layout. Arguments, in
+// order: a hidden pointer to the result when a function returns a class,
+// `this` for a member function, then the parameters. A class passed by value
+// is a pointer to a copy the caller makes; a reference is a pointer.
+#include "Native.h.sa"
+#include "Pe.h.sa"
+#include "X64.h.sa"
+#include "../cpp/Cpp.h.sa"
+
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <sstream>
+
+namespace native
+{
+
+namespace
+{
+
+enum Kind
+{
+    K_VOID,
+    K_BOOL,
+    K_I8,
+    K_U8,
+    K_I16,
+    K_U16,
+    K_I32,
+    K_U32,
+    K_I64,
+    K_U64,
+};
+
+[[noreturn]] void fail(const std::string &msg, int line) { throw cpp::Unsupported("native: " + msg, "", line); }
+
+bool isUnsigned(Kind k) { return k == K_U8 || k == K_U16 || k == K_U32 || k == K_U64 || k == K_BOOL; }
+
+int kindSize(Kind k)
+{
+    switch (k)
+    {
+    case K_BOOL: case K_I8: case K_U8: return 1;
+    case K_I16: case K_U16: return 2;
+    case K_I32: case K_U32: return 4;
+    case K_VOID: return 0;
+    default: return 8;
+    }
+}
+
+// The type an operand takes in arithmetic (integer promotion)
+Kind promote(Kind k) { return kindSize(k) < 4 ? K_I32 : k; }
+
+// The usual arithmetic conversions between two operands
+Kind common(Kind a, Kind b)
+{
+    a = promote(a);
+    b = promote(b);
+    if (a == K_U64 || b == K_U64)
+        return K_U64;
+    if (a == K_I64 || b == K_I64)
+        return K_I64;
+    if (a == K_U32 || b == K_U32)
+        return K_U32;
+    return K_I32;
+}
+
+const uint64_t kCodeBase = 0x140001000ULL; // where .text is loaded (Pe.sa: image base + 0x1000)
+
+// ─── Types ─────────────────────────────────────────────────────────────────
+
+enum Cat
+{
+    C_VOID,
+    C_INT,
+    C_PTR,
+    C_REF,
+    C_ARRAY,
+    C_CLASS,
+};
+
+struct ClassInfo;
+struct Method;
+struct NType;
+using NT = std::shared_ptr<NType>;
+
+struct NType
+{
+    Cat cat = C_VOID;
+    Kind kind = K_VOID; // C_INT
+    NT elem;            // C_PTR / C_REF / C_ARRAY
+    int n = 0;          // C_ARRAY
+    ClassInfo *cls = nullptr;
+    bool isConst = false; // a const reference binds to a temporary
+};
+
+struct Field
+{
+    std::string name;
+    NT type;
+    int off = 0;
+    cpp::ExprP init;  // default member initializer
+    bool initBraced = false;
+    std::vector<cpp::ExprP> initArgs;
+};
+
+struct Method
+{
+    std::string name;
+    ClassInfo *owner = nullptr; // null: a free function
+    NT ret;
+    std::vector<NT> params;
+    std::vector<cpp::ExprP> defaults; // per parameter (null: none)
+    cpp::DeclP decl;                  // null: generated (implicit constructor / destructor)
+    int label = -1;
+    bool isStatic = false, isVirtual = false, isCtor = false, isDtor = false, isPure = false;
+    int vslot = -1;
+};
+
+struct ClassInfo
+{
+    std::string name;
+    std::vector<Field> fields;
+    int size = 0;
+    int align = 1;
+    ClassInfo *base = nullptr;
+    bool polymorphic = false;
+    int vtableOff = -1;
+    std::vector<Method *> vslots;
+    std::map<std::string, std::vector<Method *>> methods;
+    std::vector<Method *> ctors;
+    Method *dtor = nullptr;          // user-declared or generated
+    Method *implicitCtor = nullptr;  // generated when there is no user constructor
+    bool needsDtor = false;
+    std::map<std::string, std::string> statics; // static data member -> global name
+};
+
+NT tVoid() { return std::make_shared<NType>(); }
+NT tInt(Kind k)
+{
+    NT t = std::make_shared<NType>();
+    t->cat = k == K_VOID ? C_VOID : C_INT;
+    t->kind = k;
+    return t;
+}
+NT tPtr(const NT &to)
+{
+    NT t = std::make_shared<NType>();
+    t->cat = C_PTR;
+    t->elem = to;
+    return t;
+}
+NT tRef(const NT &to, bool isConst)
+{
+    NT t = std::make_shared<NType>();
+    t->cat = C_REF;
+    t->elem = to;
+    t->isConst = isConst;
+    return t;
+}
+NT tArray(const NT &of, int n)
+{
+    NT t = std::make_shared<NType>();
+    t->cat = C_ARRAY;
+    t->elem = of;
+    t->n = n;
+    return t;
+}
+NT tClass(ClassInfo *c)
+{
+    NT t = std::make_shared<NType>();
+    t->cat = C_CLASS;
+    t->cls = c;
+    return t;
+}
+
+int sizeOf(const NT &t)
+{
+    switch (t->cat)
+    {
+    case C_INT: return kindSize(t->kind);
+    case C_PTR: case C_REF: return 8;
+    case C_ARRAY: return t->n * sizeOf(t->elem);
+    case C_CLASS: return t->cls->size;
+    default: return 1;
+    }
+}
+
+int alignOf(const NT &t)
+{
+    switch (t->cat)
+    {
+    case C_INT: return kindSize(t->kind);
+    case C_PTR: case C_REF: return 8;
+    case C_ARRAY: return alignOf(t->elem);
+    case C_CLASS: return t->cls->align;
+    default: return 1;
+    }
+}
+
+bool isScalar(const NT &t) { return t->cat == C_INT || t->cat == C_PTR; }
+
+// The integer kind a scalar is handled as (a pointer: an unsigned 64-bit number)
+Kind valKind(const NT &t) { return t->cat == C_INT ? t->kind : K_U64; }
+
+int alignUp(int v, int a) { return (v + a - 1) / a * a; }
+
+bool derivesFrom(ClassInfo *c, ClassInfo *base)
+{
+    for (; c; c = c->base)
+        if (c == base)
+            return true;
+    return false;
+}
+
+bool sameType(const NT &a, const NT &b)
+{
+    if (a->cat != b->cat)
+        return false;
+    switch (a->cat)
+    {
+    case C_INT: return a->kind == b->kind;
+    case C_PTR: case C_REF: case C_ARRAY: return sameType(a->elem, b->elem) && a->n == b->n;
+    case C_CLASS: return a->cls == b->cls;
+    default: return true;
+    }
+}
+
+// An integer literal's value and type (decimal: int, then long long; hex and
+// octal may also be unsigned; suffixes u / l / ll)
+int64_t literalValue(const std::string &text, Kind &kind)
+{
+    std::string s;
+    for (char c : text)
+        if (c != '\'')
+            s += c;
+    bool u = false;
+    int longs = 0;
+    while (!s.empty() && (s.back() == 'u' || s.back() == 'U' || s.back() == 'l' || s.back() == 'L'))
+    {
+        if (s.back() == 'u' || s.back() == 'U')
+            u = true;
+        else
+            ++longs;
+        s.pop_back();
+    }
+    int base = 10;
+    size_t i = 0;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        base = 16, i = 2;
+    else if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B'))
+        base = 2, i = 2;
+    else if (s.size() > 1 && s[0] == '0')
+        base = 8, i = 1;
+    uint64_t v = 0;
+    for (; i < s.size(); ++i)
+    {
+        char c = s[i];
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 99;
+        v = v * base + d;
+    }
+    if (longs >= 2 || v > 0xFFFFFFFFULL)
+        kind = u || (base != 10 && v > 0x7FFFFFFFFFFFFFFFULL) ? K_U64 : K_I64;
+    else if (u || (base != 10 && v > 0x7FFFFFFFULL))
+        kind = K_U32;
+    else
+        kind = v > 0x7FFFFFFFULL ? K_I64 : K_I32;
+    return (int64_t)v;
+}
+
+const int kArgRegs[4] = {RCX, RDX, R8, R9};
+
+// Where `this` comes from for a call
+enum ThisKind
+{
+    TH_NONE,
+    TH_OBJ,      // the object an lvalue expression designates
+    TH_PTR,      // the value of a pointer expression
+    TH_CUR,      // the current member function's this
+    TH_LOCAL,    // the object at rbp+off
+    TH_INDIRECT, // the address stored at rbp+off
+    TH_GLOBAL,   // the object at .data+off
+};
+
+struct ThisSrc
+{
+    ThisKind kind = TH_NONE;
+    cpp::ExprP e;
+    int off = 0;
+};
+
+class Gen
+{
+  public:
+    Asm a;
+    std::vector<Import> imports;
+    std::string data; // the .data section
+    int entry = 0;
+
+    void program(const cpp::Program &p);
+
+  private:
+    struct Var
+    {
+        NT type;
+        bool global = false;
+        int off = 0; // rbp offset, or .data offset
+    };
+    struct Cleanup // an object to destroy when its scope ends
+    {
+        int off;
+        ClassInfo *cls;
+    };
+    struct Scope
+    {
+        std::map<std::string, Var> vars;
+        std::vector<Cleanup> cleanups;
+    };
+    struct Loop
+    {
+        int breakLabel, continueLabel;
+        size_t scopeDepth; // scopes_ size outside the loop body
+    };
+
+    std::vector<std::unique_ptr<Method>> allMethods_;
+    std::map<std::string, std::vector<Method *>> funcs_;
+    std::map<std::string, std::unique_ptr<ClassInfo>> classes_;
+    std::map<std::string, Var> globals_;
+    std::vector<std::pair<int, ClassInfo *>> globalObjects_; // .data offset, class: constructed before main
+    std::vector<std::pair<int, cpp::DeclP>> globalCtorInits_; // .data offset, declaration
+    std::map<std::string, int> runtime_; // runtime routine -> label (emitted when used)
+
+    // the function being generated
+    Method *cur_ = nullptr;
+    std::vector<Scope> scopes_;
+    std::vector<Loop> loops_;
+    int nextOff_ = 0; // lowest rbp offset handed out
+    int depth_ = 0;   // 8-byte pushes outstanding (stack alignment at calls)
+    int retLabel_ = -1;
+    NT retType_;
+    int retPtrOff_ = 0; // home slot of the hidden result pointer
+    int thisOff_ = 0;   // home slot of this
+    std::vector<Cleanup> temps_; // temporaries of the current full-expression
+    std::string nrvoName_;       // the local every `return` of a class returns (built in place)
+
+    // types
+    NT typeOf(const cpp::TypeNameP &t, int line);
+    NT baseType(const cpp::TypeNameP &t, int line);
+    int64_t constInt(const cpp::ExprP &e);
+    void classDecl(const cpp::DeclP &d);
+    Method *declareMethod(ClassInfo *c, const cpp::DeclP &m);
+    void layoutClass(ClassInfo *c);
+    Method *newMethod();
+
+    // program pieces
+    int importIndex(const std::string &dll, const std::string &name);
+    int routine(const std::string &name);
+    void function(Method &m);
+    void ctorPrologue(Method &m);
+    void dtorEpilogue(Method &m);
+    void runtime();
+    void globalVar(const cpp::DeclP &d);
+    void constInit(int off, const NT &t, const cpp::ExprP &init, int line);
+    int stringData(const std::string &bytes);
+    void fillVtables();
+
+    // values
+    void wrap(Kind k, int r = RAX);
+    void convert(const NT &to, const NT &from, int line);
+    NT expr(const cpp::ExprP &e);
+    NT addr(const cpp::ExprP &e);
+    NT valueAt(const NT &t);
+    NT typeOfExpr(const cpp::ExprP &e);
+    NT binary(const cpp::ExprP &e);
+    NT assign(const cpp::ExprP &e);
+    NT incDec(const cpp::ExprP &e, bool inc, bool post);
+    NT call(const cpp::ExprP &e, const ThisSrc *result = nullptr);
+    NT callMethod(Method *m, const ThisSrc &self, const std::vector<cpp::ExprP> &args, bool virt, int line,
+                  const ThisSrc *result = nullptr);
+    Method *resolve(const std::vector<Method *> &cands, const std::vector<cpp::ExprP> &args, const std::string &what,
+                    int line);
+    int argCost(const NT &param, const cpp::ExprP &arg, const NT &argT);
+    Method *findMethod(ClassInfo *c, const std::string &name, std::vector<Method *> &out);
+    const Field *findField(ClassInfo *c, const std::string &name, int &off);
+    void arith(const std::string &op, Kind k, int line);
+    Var *lookup(const std::string &name);
+    void pushRax();
+    void popReg(int r);
+    void copyBytes(int size);
+    void bindRef(const NT &ref, const cpp::ExprP &e, int line);
+    void loadThis(const ThisSrc &s);
+    void construct(const ThisSrc &self, ClassInfo *c, const std::vector<cpp::ExprP> &args, bool braced, int line);
+    void destroy(const ThisSrc &self, ClassInfo *c);
+    void destroyScopes(size_t downTo);
+    void endFullExpr();
+    void callRoutine(int label);
+
+    // statements
+    void stmt(const cpp::StmtP &s);
+    void cond(const cpp::ExprP &e, int falseLabel);
+    int newSlot(const NT &t);
+    void localInit(int off, const NT &t, const cpp::ExprP &init, int line);
+    void declare(const std::string &name, const NT &t, const cpp::ExprP &init, bool braced,
+                 const std::vector<cpp::ExprP> &args, int line);
+};
+
+Method *Gen::newMethod()
+{
+    allMethods_.push_back(std::make_unique<Method>());
+    Method *m = allMethods_.back().get();
+    m->label = a.newLabel();
+    return m;
+}
+
+// ─── Types ─────────────────────────────────────────────────────────────────
+
+int64_t Gen::constInt(const cpp::ExprP &e)
+{
+    switch (e->k)
+    {
+    case cpp::EK::Int:
+    {
+        Kind k;
+        return literalValue(e->str, k);
+    }
+    case cpp::EK::Char:
+        return (int64_t)e->num;
+    case cpp::EK::Bool:
+        return e->num != 0;
+    case cpp::EK::Unary:
+        if (e->op == "-")
+            return -constInt(e->kids[0]);
+        if (e->op == "+")
+            return constInt(e->kids[0]);
+        if (e->op == "~")
+            return ~constInt(e->kids[0]);
+        break;
+    case cpp::EK::Binary:
+    {
+        int64_t l = constInt(e->kids[0]), r = constInt(e->kids[1]);
+        const std::string &op = e->op;
+        if (op == "+") return l + r;
+        if (op == "-") return l - r;
+        if (op == "*") return l * r;
+        if (op == "/" && r) return l / r;
+        if (op == "%" && r) return l % r;
+        if (op == "<<") return l << r;
+        if (op == ">>") return l >> r;
+        if (op == "|") return l | r;
+        if (op == "&") return l & r;
+        break;
+    }
+    case cpp::EK::SizeofT:
+        return sizeOf(typeOf(e->type, e->line));
+    case cpp::EK::Name:
+        if (e->name.size() == 1)
+        {
+            Var *v = lookup(e->name[0]);
+            if (v && v->global && v->type->cat == C_INT)
+            {
+                int64_t x = 0; // a constant global: its initial bytes
+                int n = kindSize(v->type->kind);
+                for (int i = n - 1; i >= 0; --i)
+                    x = x * 256 + (unsigned char)data[v->off + i];
+                return x;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    fail("a constant was expected here", e->line);
+}
+
+NT Gen::baseType(const cpp::TypeNameP &t, int line)
+{
+    std::vector<std::string> n = t->name;
+    if (n.size() == 2 && n[0] == "std")
+        n.erase(n.begin());
+    if (n.size() != 1 || t->hasTargs || t->isFunction)
+        fail("type " + t->str(), line);
+    const std::string &w = n[0];
+    if (w == "void")
+        return tVoid();
+    if (w == "bool")
+        return tInt(K_BOOL);
+    if (w == "char" || w == "signed char" || w == "int8_t")
+        return tInt(K_I8);
+    if (w == "unsigned char" || w == "uint8_t")
+        return tInt(K_U8);
+    if (w == "short" || w == "short int" || w == "signed short" || w == "int16_t")
+        return tInt(K_I16);
+    if (w == "unsigned short" || w == "unsigned short int" || w == "uint16_t")
+        return tInt(K_U16);
+    if (w == "int" || w == "signed" || w == "signed int" || w == "long" || w == "long int" ||
+        w == "signed long" || w == "int32_t")
+        return tInt(K_I32); // long is 32 bits on Windows
+    if (w == "unsigned" || w == "unsigned int" || w == "unsigned long" || w == "unsigned long int" ||
+        w == "uint32_t")
+        return tInt(K_U32);
+    if (w == "long long" || w == "long long int" || w == "signed long long" || w == "int64_t" ||
+        w == "ptrdiff_t" || w == "intptr_t")
+        return tInt(K_I64);
+    if (w == "unsigned long long" || w == "unsigned long long int" || w == "uint64_t" || w == "size_t" ||
+        w == "uintptr_t")
+        return tInt(K_U64);
+    auto it = classes_.find(w);
+    if (it != classes_.end())
+        return tClass(it->second.get());
+    fail("type " + t->str(), line);
+}
+
+NT Gen::typeOf(const cpp::TypeNameP &t, int line)
+{
+    if (!t)
+        fail("a declaration without a type", line);
+    NT ty = baseType(t, line);
+    for (int i = (int)t->pointeeDims.size() - 1; i >= 0; --i)
+        ty = tArray(ty, (int)constInt(t->pointeeDims[i]));
+    for (int i = 0; i < t->pointers; ++i)
+        ty = tPtr(ty);
+    for (int i = (int)t->arrayDims.size() - 1; i >= 0; --i)
+        ty = tArray(ty, t->arrayDims[i] ? (int)constInt(t->arrayDims[i]) : 0);
+    if (t->ref || t->rref)
+        ty = tRef(ty, t->isConst && t->pointers == 0);
+    return ty;
+}
+
+Method *Gen::declareMethod(ClassInfo *c, const cpp::DeclP &m)
+{
+    Method *f = newMethod();
+    f->name = m->isCtor ? c->name : m->isDtor ? "~" + c->name : m->name.back();
+    f->owner = c;
+    f->decl = m;
+    f->isStatic = m->isStatic;
+    f->isVirtual = m->isVirtual;
+    f->isPure = m->isPure;
+    f->isCtor = m->isCtor;
+    f->isDtor = m->isDtor;
+    f->ret = m->isCtor || m->isDtor ? tVoid() : typeOf(m->ret, m->line);
+    for (const cpp::Param &pr : m->params)
+    {
+        NT pt = typeOf(pr.type, m->line);
+        if (pt->cat == C_ARRAY)
+            pt = tPtr(pt->elem);
+        f->params.push_back(pt);
+        f->defaults.push_back(pr.def);
+    }
+    if (m->variadic)
+        fail("variadic function " + f->name, m->line);
+    if (m->isCtor)
+        c->ctors.push_back(f);
+    else if (m->isDtor)
+        c->dtor = f;
+    else
+        c->methods[f->name].push_back(f);
+    return f;
+}
+
+void Gen::classDecl(const cpp::DeclP &d)
+{
+    if (d->name.size() != 1 || d->isTemplate)
+        fail("this class (not yet: templates, nested names)", d->line);
+    if (d->isUnion)
+        fail("union (not yet)", d->line);
+    auto info = std::make_unique<ClassInfo>();
+    info->name = d->name[0];
+    ClassInfo *c = info.get();
+    classes_[d->name[0]] = std::move(info); // visible to its own pointer members
+    if (d->bases.size() > 1)
+        fail("multiple inheritance (not yet)", d->line);
+    if (d->bases.size() == 1)
+    {
+        NT b = typeOf(d->bases[0], d->line);
+        if (b->cat != C_CLASS)
+            fail("base class " + d->bases[0]->str(), d->line);
+        c->base = b->cls;
+    }
+    for (const cpp::DeclP &m : d->members)
+    {
+        switch (m->k)
+        {
+        case cpp::DK::Empty:
+        case cpp::DK::StaticAssert:
+            break;
+        case cpp::DK::Var:
+            if (m->isStatic)
+            {
+                // a static data member: a global named Class::member
+                std::string g = c->name + "::" + m->var.name;
+                c->statics[m->var.name] = g;
+                auto copy = std::make_shared<cpp::Decl>(*m);
+                copy->var.name = g;
+                copy->isStatic = false;
+                globalVar(copy);
+                break;
+            }
+            {
+                Field f;
+                f.name = m->var.name;
+                f.type = typeOf(m->var.type, m->line);
+                if (f.type->cat == C_CLASS && f.type->cls == c)
+                    fail("class " + c->name + " contains itself", m->line);
+                if (m->var.init == cpp::VarDeclarator::Brace)
+                {
+                    f.initBraced = true;
+                    f.initArgs = m->var.args;
+                }
+                else if (!m->var.args.empty())
+                {
+                    f.init = m->var.args[0];
+                    f.initArgs = m->var.args;
+                }
+                c->fields.push_back(f);
+            }
+            break;
+        case cpp::DK::Func:
+            if (m->isDeleted)
+                break;
+            if (m->isOperator)
+                fail("operator overloading (not yet)", m->line);
+            if (m->isTemplate)
+                fail("member template (not yet)", m->line);
+            declareMethod(c, m);
+            break;
+        case cpp::DK::Alias:
+            fail("member type alias (not yet)", m->line);
+        default:
+            fail("this class member (not yet)", m->line);
+        }
+    }
+    layoutClass(c);
+}
+
+void Gen::layoutClass(ClassInfo *c)
+{
+    // virtual functions: the base's table, overriders in their slots, new ones appended
+    if (c->base)
+        c->vslots = c->base->vslots;
+    auto place = [&](Method *f)
+    {
+        for (size_t i = 0; i < c->vslots.size(); ++i)
+            if ((c->vslots[i]->isDtor && f->isDtor) ||
+                (c->vslots[i]->name == f->name && c->vslots[i]->params.size() == f->params.size()))
+            {
+                f->isVirtual = true;
+                f->vslot = (int)i;
+                c->vslots[i] = f;
+                return;
+            }
+        if (f->isVirtual)
+        {
+            f->vslot = (int)c->vslots.size();
+            c->vslots.push_back(f);
+        }
+    };
+    if (c->dtor)
+        place(c->dtor);
+    for (auto &kv : c->methods)
+        for (Method *f : kv.second)
+            place(f);
+    c->polymorphic = !c->vslots.empty();
+    if (c->polymorphic && c->base && !c->base->polymorphic)
+        fail("class " + c->name + " adds virtual functions to a base without any (not yet)", 0);
+
+    int off = 0;
+    if (c->base)
+    {
+        off = c->base->size;
+        c->align = c->base->align;
+    }
+    else if (c->polymorphic)
+    {
+        off = 8; // the vtable pointer
+        c->align = 8;
+    }
+    for (Field &f : c->fields)
+    {
+        off = alignUp(off, alignOf(f.type));
+        f.off = off;
+        off += sizeOf(f.type);
+        if (alignOf(f.type) > c->align)
+            c->align = alignOf(f.type);
+    }
+    c->size = alignUp(off == 0 ? 1 : off, c->align);
+    if (c->polymorphic)
+    {
+        while (data.size() % 8)
+            data.push_back('\0');
+        c->vtableOff = (int)data.size();
+        data.append(8 * c->vslots.size(), '\0'); // filled once the code is placed
+    }
+    // destructors: a user one, or one generated to destroy members and the base
+    bool memberDtors = c->base && c->base->needsDtor;
+    for (const Field &f : c->fields)
+        if (f.type->cat == C_CLASS && f.type->cls->needsDtor)
+            memberDtors = true;
+        else if (f.type->cat == C_ARRAY && f.type->elem->cat == C_CLASS && f.type->elem->cls->needsDtor)
+            fail("an array of objects with destructors as a member (not yet)", 0);
+    if (!c->dtor && (memberDtors || (c->base && c->base->dtor && c->base->dtor->isVirtual)))
+    {
+        Method *d = newMethod();
+        d->name = "~" + c->name;
+        d->owner = c;
+        d->isDtor = true;
+        d->ret = tVoid();
+        c->dtor = d;
+        place(d);
+    }
+    c->needsDtor = c->dtor != nullptr;
+    // the implicit default constructor: needed when there is anything to set
+    if (c->ctors.empty())
+    {
+        bool work = c->polymorphic || (c->base && (c->base->implicitCtor || !c->base->ctors.empty()));
+        for (const Field &f : c->fields)
+            if (f.init || f.initBraced || (f.type->cat == C_CLASS && (f.type->cls->implicitCtor || !f.type->cls->ctors.empty())))
+                work = true;
+        if (work)
+        {
+            Method *m = newMethod();
+            m->name = c->name;
+            m->owner = c;
+            m->isCtor = true;
+            m->ret = tVoid();
+            c->implicitCtor = m;
+        }
+    }
+}
+
+// ─── Program ───────────────────────────────────────────────────────────────
+
+int Gen::importIndex(const std::string &dll, const std::string &name)
+{
+    for (int i = 0; i < (int)imports.size(); ++i)
+        if (imports[i].dll == dll && imports[i].name == name)
+            return i;
+    imports.push_back({dll, name});
+    return (int)imports.size() - 1;
+}
+
+int Gen::routine(const std::string &name)
+{
+    auto it = runtime_.find(name);
+    if (it != runtime_.end())
+        return it->second;
+    int l = a.newLabel();
+    runtime_[name] = l;
+    if (name == "puts")
+        routine("putchar");
+    return l;
+}
+
+int Gen::stringData(const std::string &bytes)
+{
+    int off = (int)data.size();
+    data += bytes;
+    data.push_back('\0');
+    return off;
+}
+
+void Gen::program(const cpp::Program &p)
+{
+    // types and every function first, so a call may come before the definition
+    std::vector<cpp::DeclP> outOfClass;
+    for (const cpp::DeclP &d : p.decls)
+    {
+        switch (d->k)
+        {
+        case cpp::DK::Class:
+            if (!d->forwardOnly)
+                classDecl(d);
+            break;
+        case cpp::DK::Func:
+        {
+            if (d->isTemplate)
+                fail("function template " + d->name.back() + " (not yet)", d->line);
+            if (d->isOperator)
+                fail("operator overloading (not yet)", d->line);
+            if (d->name.size() == 2)
+            {
+                outOfClass.push_back(d); // Class::member defined outside the class
+                break;
+            }
+            if (d->name.size() != 1)
+                fail("function " + d->name.back(), d->line);
+            if (d->variadic)
+                fail("variadic function " + d->name[0], d->line);
+            Method tmp;
+            tmp.ret = typeOf(d->ret, d->line);
+            for (const cpp::Param &pr : d->params)
+            {
+                NT pt = typeOf(pr.type, d->line);
+                if (pt->cat == C_ARRAY)
+                    pt = tPtr(pt->elem);
+                tmp.params.push_back(pt);
+                tmp.defaults.push_back(pr.def);
+            }
+            Method *same = nullptr;
+            for (Method *f : funcs_[d->name[0]])
+            {
+                bool eq = f->params.size() == tmp.params.size();
+                for (size_t i = 0; eq && i < tmp.params.size(); ++i)
+                    eq = sameType(f->params[i], tmp.params[i]);
+                if (eq)
+                    same = f;
+            }
+            if (same)
+            {
+                if (d->body)
+                {
+                    if (same->decl && same->decl->body)
+                        fail("function " + d->name[0] + " defined twice", d->line);
+                    same->decl = d;
+                    for (size_t i = 0; i < tmp.defaults.size(); ++i)
+                        if (tmp.defaults[i])
+                            same->defaults[i] = tmp.defaults[i];
+                }
+                break;
+            }
+            Method *f = newMethod();
+            f->name = d->name[0];
+            f->ret = tmp.ret;
+            f->params = tmp.params;
+            f->defaults = tmp.defaults;
+            f->decl = d;
+            funcs_[d->name[0]].push_back(f);
+            break;
+        }
+        case cpp::DK::Var:
+            if (d->name.size() == 2 || d->var.name.find("::") != std::string::npos)
+            {
+                outOfClass.push_back(d); // int Class::count = 0;
+                break;
+            }
+            globalVar(d);
+            break;
+        case cpp::DK::UsingDirective:
+        case cpp::DK::Empty:
+        case cpp::DK::StaticAssert:
+            break;
+        default:
+            fail("this declaration (not yet)", d->line);
+        }
+    }
+    // out-of-class definitions: the body of a declared member
+    for (const cpp::DeclP &d : outOfClass)
+    {
+        auto ci = classes_.find(d->name[0]);
+        if (ci == classes_.end())
+            fail("unknown class " + d->name[0], d->line);
+        ClassInfo *c = ci->second.get();
+        if (d->k == cpp::DK::Var)
+        {
+            auto s = c->statics.find(d->name[1]);
+            if (s == c->statics.end())
+                fail(d->name[1] + " is not a static member of " + c->name, d->line);
+            Var &g = globals_[s->second];
+            const cpp::VarDeclarator &v = d->var;
+            if (!v.args.empty())
+            {
+                cpp::ExprP init = v.args[0];
+                if (v.init == cpp::VarDeclarator::Brace || v.args.size() > 1)
+                {
+                    auto list = std::make_shared<cpp::Expr>();
+                    list->k = cpp::EK::InitList;
+                    list->kids = v.args;
+                    init = list;
+                }
+                constInit(g.off, g.type, init, d->line);
+            }
+            continue;
+        }
+        std::vector<Method *> cands;
+        if (d->isCtor || d->name[1] == c->name)
+            cands = c->ctors;
+        else if (d->isDtor || d->name[1][0] == '~')
+            cands = {c->dtor};
+        else
+            cands = c->methods[d->name[1]];
+        Method *target = nullptr;
+        for (Method *f : cands)
+        {
+            if (!f || f->params.size() != d->params.size())
+                continue;
+            bool eq = true;
+            for (size_t i = 0; eq && i < d->params.size(); ++i)
+            {
+                NT pt = typeOf(d->params[i].type, d->line);
+                if (pt->cat == C_ARRAY)
+                    pt = tPtr(pt->elem);
+                eq = sameType(pt, f->params[i]);
+            }
+            if (eq)
+                target = f;
+        }
+        if (!target)
+            fail(c->name + "::" + d->name[1] + " was not declared in the class", d->line);
+        if (target->decl && target->decl->body)
+            fail(c->name + "::" + d->name[1] + " defined twice", d->line);
+        auto merged = std::make_shared<cpp::Decl>(*target->decl);
+        merged->body = d->body;
+        merged->inits = d->inits;
+        merged->params = d->params; // the definition's parameter names
+        target->decl = merged;
+    }
+
+    Method *mainFn = nullptr;
+    for (Method *f : funcs_["main"])
+        mainFn = f;
+    if (!mainFn || !mainFn->decl->body)
+        fail("no main()", 0);
+    if (!mainFn->params.empty())
+        fail("main with parameters (not yet)", mainFn->decl->line);
+
+    // entry: global objects are constructed, main runs, they are destroyed in
+    // reverse, and main's result is the exit code
+    entry = a.size();
+    a.push(RBP);
+    a.movRR(RBP, RSP);
+    a.subRsp(32);
+    scopes_.assign(1, Scope());
+    depth_ = 0;
+    for (auto &g : globalCtorInits_)
+    {
+        const cpp::DeclP &d = g.second;
+        ThisSrc self;
+        self.kind = TH_GLOBAL;
+        self.off = g.first;
+        NT t = typeOf(d->var.type, d->line);
+        construct(self, t->cls, d->var.args, d->var.init == cpp::VarDeclarator::Brace, d->line);
+    }
+    a.subRsp(32);
+    a.call(mainFn->label);
+    a.addRsp(32);
+    a.store(-8, RAX);
+    for (int i = (int)globalObjects_.size() - 1; i >= 0; --i)
+    {
+        ThisSrc self;
+        self.kind = TH_GLOBAL;
+        self.off = globalObjects_[i].first;
+        destroy(self, globalObjects_[i].second);
+    }
+    a.load(RCX, -8);
+    a.callImport(importIndex("kernel32.dll", "ExitProcess"));
+
+    for (auto &m : allMethods_)
+    {
+        if (m->isPure && (!m->decl || !m->decl->body))
+            continue;
+        bool generated = !m->decl;
+        if (!generated && !m->decl->body)
+        {
+            if (m->owner && (m->isCtor || m->isDtor) && m->decl->isDefault)
+                generated = true;
+            else
+                fail("function " + m->name + " is declared but not defined", m->decl->line);
+        }
+        function(*m);
+    }
+    runtime();
+    a.resolve();
+    fillVtables();
+}
+
+void Gen::fillVtables()
+{
+    for (auto &kv : classes_)
+    {
+        ClassInfo *c = kv.second.get();
+        for (size_t i = 0; i < c->vslots.size(); ++i)
+        {
+            Method *m = c->vslots[i];
+            uint64_t v = m->isPure && (!m->decl || !m->decl->body) ? 0 : kCodeBase + (uint64_t)a.labelPos(m->label);
+            for (int b = 0; b < 8; ++b)
+                data[c->vtableOff + 8 * i + b] = (char)((v >> (8 * b)) & 255);
+        }
+    }
+}
+
+void Gen::globalVar(const cpp::DeclP &d)
+{
+    if (d->isExtern)
+        fail("extern variable " + d->var.name, d->line);
+    NT t = typeOf(d->var.type, d->line);
+    const cpp::VarDeclarator &v = d->var;
+    if (t->cat == C_REF)
+        fail("a global reference (not yet)", d->line);
+    cpp::ExprP init;
+    if (v.args.size() == 1 && v.init != cpp::VarDeclarator::Brace)
+        init = v.args[0];
+    else if (!v.args.empty() || v.init == cpp::VarDeclarator::Brace)
+    {
+        auto list = std::make_shared<cpp::Expr>();
+        list->k = cpp::EK::InitList;
+        list->line = d->line;
+        list->kids = v.args;
+        if (v.args.size() == 1 && v.args[0]->k == cpp::EK::InitList)
+            list = v.args[0];
+        init = list;
+    }
+    if (t->cat == C_ARRAY && t->n == 0 && init)
+        t = tArray(t->elem, init->k == cpp::EK::Str ? (int)init->str.size() + 1 : (int)init->kids.size());
+    int align = alignOf(t);
+    while (data.size() % align)
+        data.push_back('\0');
+    int off = (int)data.size();
+    data.append(sizeOf(t), '\0');
+    globals_[v.name] = Var{t, true, off};
+    if (t->cat == C_CLASS && (!t->cls->ctors.empty() || t->cls->implicitCtor || t->cls->polymorphic))
+    {
+        globalCtorInits_.push_back({off, d}); // constructed by code before main
+        if (t->cls->needsDtor)
+            globalObjects_.push_back({off, t->cls});
+        return;
+    }
+    if (t->cat == C_CLASS && t->cls->needsDtor)
+        globalObjects_.push_back({off, t->cls});
+    if (init)
+        constInit(off, t, init, d->line);
+}
+
+// a global's initial bytes, from constants
+void Gen::constInit(int off, const NT &t, const cpp::ExprP &init, int line)
+{
+    if (t->cat == C_ARRAY && t->elem->cat == C_INT && t->elem->kind == K_I8 && init->k == cpp::EK::Str)
+    {
+        for (size_t i = 0; i < init->str.size() && (int)i < t->n; ++i)
+            data[off + i] = init->str[i];
+        return;
+    }
+    if (t->cat == C_ARRAY || t->cat == C_CLASS)
+    {
+        if (init->k != cpp::EK::InitList)
+            fail("initializer of an array or class", line);
+        for (size_t i = 0; i < init->kids.size(); ++i)
+        {
+            if (t->cat == C_ARRAY)
+            {
+                if ((int)i >= t->n)
+                    fail("too many initializers", line);
+                constInit(off + (int)i * sizeOf(t->elem), t->elem, init->kids[i], line);
+            }
+            else
+            {
+                if (i >= t->cls->fields.size())
+                    fail("too many initializers", line);
+                const Field &f = t->cls->fields[i];
+                constInit(off + f.off, f.type, init->kids[i], line);
+            }
+        }
+        return;
+    }
+    if (t->cat == C_PTR)
+        fail("a global pointer with an initial value (not yet)", line);
+    cpp::ExprP e = init;
+    if (e->k == cpp::EK::InitList && e->kids.size() == 1)
+        e = e->kids[0];
+    if (e->k == cpp::EK::InitList && e->kids.empty())
+        return;
+    int64_t v = constInt(e);
+    if (t->kind == K_BOOL)
+        v = v != 0;
+    for (int i = 0; i < kindSize(t->kind); ++i)
+        data[off + i] = (char)((v >> (8 * i)) & 255);
+}
+
+void Gen::function(Method &m)
+{
+    a.bind(m.label);
+    a.push(RBP);
+    a.movRR(RBP, RSP);
+    a.subRsp(0);
+    int framePos = a.size() - 4;
+    cur_ = &m;
+    scopes_.assign(1, Scope());
+    loops_.clear();
+    temps_.clear();
+    nextOff_ = 0;
+    depth_ = 0;
+    retLabel_ = a.newLabel();
+    retType_ = m.ret;
+    nrvoName_.clear();
+    if (m.ret->cat == C_CLASS && m.decl && m.decl->body)
+    {
+        std::vector<cpp::ExprP> rets;
+        bool other = false;
+        std::vector<cpp::StmtP> todo = {m.decl->body};
+        while (!todo.empty())
+        {
+            cpp::StmtP x = todo.back();
+            todo.pop_back();
+            if (!x)
+                continue;
+            if (x->k == cpp::SK::Return)
+            {
+                if (x->expr && x->expr->k == cpp::EK::Name && x->expr->name.size() == 1)
+                    rets.push_back(x->expr);
+                else
+                    other = true;
+            }
+            for (const cpp::StmtP &y : x->body)
+                todo.push_back(y);
+            todo.push_back(x->then);
+            todo.push_back(x->els);
+            todo.push_back(x->init);
+        }
+        bool same = !rets.empty() && !other;
+        for (const cpp::ExprP &r : rets)
+            if (r->name[0] != rets[0]->name[0])
+                same = false;
+        for (const cpp::Param &pr : m.decl->params)
+            if (!rets.empty() && pr.name == rets[0]->name[0])
+                same = false;
+        if (same)
+            nrvoName_ = rets[0]->name[0];
+    }
+    // arguments: the first four arrive in registers and go to their home
+    // slots above the return address; the rest are already there
+    int slot = 0;
+    auto home = [&](int i) { return 16 + 8 * i; };
+    if (m.ret->cat == C_CLASS)
+        retPtrOff_ = home(slot++);
+    if (m.owner && !m.isStatic)
+        thisOff_ = home(slot++);
+    int nargs = slot + (int)m.params.size();
+    for (int i = 0; i < nargs && i < 4; ++i)
+        a.store(home(i), kArgRegs[i]);
+    if (m.decl)
+        for (size_t i = 0; i < m.params.size(); ++i)
+        {
+            NT pt = m.params[i];
+            if (pt->cat == C_CLASS)
+                pt = tRef(pt, false); // by value: a pointer to the caller's copy
+            if (i < m.decl->params.size() && !m.decl->params[i].name.empty())
+                scopes_.back().vars[m.decl->params[i].name] = Var{pt, false, home(slot + (int)i)};
+        }
+    if (m.isCtor)
+        ctorPrologue(m);
+    if (m.decl && m.decl->body)
+        for (const cpp::StmtP &s : m.decl->body->body)
+            stmt(s);
+    destroyScopes(0);
+    a.movImm(RAX, 0); // falling off the end (main returns 0)
+    a.bind(retLabel_);
+    if (m.isDtor)
+        dtorEpilogue(m);
+    if (m.ret->cat == C_CLASS)
+        a.load(RAX, retPtrOff_);
+    a.leave();
+    a.ret();
+    a.patch32(framePos, alignUp(-nextOff_, 16));
+    cur_ = nullptr;
+}
+
+// A constructor's work before its body: the base, the vtable pointer, the members
+void Gen::ctorPrologue(Method &m)
+{
+    ClassInfo *c = m.owner;
+    std::vector<cpp::MemInit> inits;
+    if (m.decl)
+        inits = m.decl->inits;
+    auto initFor = [&](const std::string &name) -> const cpp::MemInit *
+    {
+        for (const cpp::MemInit &mi : inits)
+            if (mi.name == name)
+                return &mi;
+        return nullptr;
+    };
+    ThisSrc self;
+    self.kind = TH_CUR;
+    if (c->base)
+    {
+        const cpp::MemInit *bi = initFor(c->base->name);
+        std::vector<cpp::ExprP> none;
+        construct(self, c->base, bi ? bi->args : none, bi && bi->braced, m.decl ? m.decl->line : 0);
+    }
+    if (c->polymorphic)
+    {
+        a.load(RCX, thisOff_);
+        a.leaData(RAX, c->vtableOff);
+        a.storeRcx(8);
+    }
+    for (const Field &f : c->fields)
+    {
+        const cpp::MemInit *mi = initFor(f.name);
+        std::vector<cpp::ExprP> args;
+        bool braced = false;
+        if (mi)
+        {
+            args = mi->args;
+            braced = mi->braced;
+        }
+        else if (f.init || f.initBraced)
+        {
+            args = f.initArgs;
+            braced = f.initBraced;
+        }
+        int line = m.decl ? m.decl->line : 0;
+        if (f.type->cat == C_CLASS)
+        {
+            if (args.size() == 1 && !braced)
+            {
+                NT at = typeOfExpr(args[0]);
+                if (at->cat == C_CLASS && at->cls == f.type->cls && f.type->cls->ctors.empty())
+                {
+                    // a copy: memberwise
+                    expr(args[0]);
+                    a.movRR(RSI, RAX);
+                    a.load(RDI, thisOff_);
+                    if (f.off)
+                        a.addImm(RDI, f.off);
+                    copyBytes(sizeOf(f.type));
+                    endFullExpr();
+                    continue;
+                }
+            }
+            a.load(RAX, thisOff_);
+            if (f.off)
+                a.addImm(RAX, f.off);
+            int tmp = newSlot(tPtr(tVoid()));
+            a.store(tmp, RAX);
+            ThisSrc fs;
+            fs.kind = TH_INDIRECT;
+            fs.off = tmp;
+            construct(fs, f.type->cls, args, braced, line);
+            continue;
+        }
+        if (args.empty())
+            continue; // zeroed memory
+        if (f.type->cat == C_REF)
+        {
+            bindRef(f.type, args[0], line);
+            a.movRR(RDX, RAX);
+            a.load(RCX, thisOff_);
+            if (f.off)
+                a.addImm(RCX, f.off);
+            a.movRR(RAX, RDX);
+            a.storeRcx(8);
+            endFullExpr();
+            continue;
+        }
+        if (f.type->cat == C_ARRAY)
+        {
+            if (!braced)
+                fail("initializing an array member", line);
+            fail("an array member's initializer list (not yet)", line);
+        }
+        if (args.size() != 1)
+            fail("initializer of member " + f.name, line);
+        NT vt = expr(args[0]);
+        if (f.type->cat == C_PTR && (vt->cat == C_PTR || vt->cat == C_INT))
+            ;
+        else
+            convert(f.type, vt, line);
+        a.movRR(RDX, RAX);
+        a.load(RCX, thisOff_);
+        if (f.off)
+            a.addImm(RCX, f.off);
+        a.movRR(RAX, RDX);
+        a.storeRcx(sizeOf(f.type));
+        endFullExpr();
+    }
+}
+
+// A destructor's work after its body: the members in reverse, then the base
+void Gen::dtorEpilogue(Method &m)
+{
+    ClassInfo *c = m.owner;
+    for (int i = (int)c->fields.size() - 1; i >= 0; --i)
+    {
+        const Field &f = c->fields[i];
+        if (f.type->cat != C_CLASS || !f.type->cls->needsDtor)
+            continue;
+        a.load(RAX, thisOff_);
+        if (f.off)
+            a.addImm(RAX, f.off);
+        int tmp = newSlot(tPtr(tVoid()));
+        a.store(tmp, RAX);
+        ThisSrc fs;
+        fs.kind = TH_INDIRECT;
+        fs.off = tmp;
+        destroy(fs, f.type->cls);
+    }
+    if (c->base && c->base->needsDtor)
+    {
+        a.load(RAX, thisOff_);
+        int tmp = newSlot(tPtr(tVoid()));
+        a.store(tmp, RAX);
+        ThisSrc bs;
+        bs.kind = TH_INDIRECT;
+        bs.off = tmp;
+        // the base part only: no virtual dispatch
+        a.load(RCX, tmp);
+        int pad = (depth_ + 4) % 2;
+        if (pad)
+            a.subRsp(8);
+        a.subRsp(32);
+        a.call(c->base->dtor->label);
+        a.addRsp(32 + 8 * pad);
+    }
+}
+
+// The runtime: routines the program uses, in machine code
+void Gen::runtime()
+{
+    for (auto &kv : runtime_)
+    {
+        const std::string &name = kv.first;
+        a.bind(kv.second);
+        a.push(RBP);
+        a.movRR(RBP, RSP);
+        a.subRsp(64);
+        if (name == "putchar")
+        {
+            // one byte to standard output; '\n' is written as "\r\n", as the
+            // C runtime's text-mode stdout does
+            a.movzx8(RCX);
+            a.store(-24, RCX); // the result
+            a.store(16, RCX);  // the bytes to write, in the home slot
+            a.movImm(RAX, 1);
+            a.store(-16, RAX); // how many
+            int plain = a.newLabel();
+            a.movImm(RAX, 10);
+            a.alu(0x39, RCX, RAX);
+            a.jcc(CC_NE, plain);
+            a.movImm(RAX, 0x0A0D);
+            a.store(16, RAX);
+            a.movImm(RAX, 2);
+            a.store(-16, RAX);
+            a.bind(plain);
+            a.movImm(RCX, -11); // STD_OUTPUT_HANDLE
+            a.callImport(importIndex("kernel32.dll", "GetStdHandle"));
+            a.movRR(RCX, RAX);
+            a.lea(RDX, 16);
+            a.load(R8, -16);
+            a.lea(R9, -8); // bytes written
+            a.movImm(RAX, 0);
+            a.storeRsp(32, RAX); // no OVERLAPPED
+            a.callImport(importIndex("kernel32.dll", "WriteFile"));
+            a.load(RAX, -24);
+        }
+        else if (name == "puts")
+        {
+            // the string's bytes, then a newline
+            a.store(16, RCX);
+            int top = a.newLabel(), done = a.newLabel();
+            a.bind(top);
+            a.load(RCX, 16);
+            a.loadRcx(1, false);
+            a.test(RAX, RAX);
+            a.jcc(CC_E, done);
+            a.movRR(RCX, RAX);
+            a.call(runtime_["putchar"]);
+            a.load(RAX, 16);
+            a.addImm(RAX, 1);
+            a.store(16, RAX);
+            a.jmp(top);
+            a.bind(done);
+            a.movImm(RCX, 10);
+            a.call(runtime_["putchar"]);
+            a.movImm(RAX, 0);
+        }
+        else if (name == "alloc")
+        {
+            // zeroed memory from the process heap
+            a.store(16, RCX);
+            a.callImport(importIndex("kernel32.dll", "GetProcessHeap"));
+            a.movRR(RCX, RAX);
+            a.movImm(RDX, 8); // HEAP_ZERO_MEMORY
+            a.load(R8, 16);
+            a.callImport(importIndex("kernel32.dll", "HeapAlloc"));
+        }
+        else if (name == "free")
+        {
+            a.store(16, RCX);
+            int skip = a.newLabel();
+            a.test(RCX, RCX);
+            a.jcc(CC_E, skip);
+            a.callImport(importIndex("kernel32.dll", "GetProcessHeap"));
+            a.movRR(RCX, RAX);
+            a.movImm(RDX, 0);
+            a.load(R8, 16);
+            a.callImport(importIndex("kernel32.dll", "HeapFree"));
+            a.bind(skip);
+            a.movImm(RAX, 0);
+        }
+        else if (name == "pure")
+        {
+            // a pure virtual function called: exit code 3, as abort() gives
+            a.movImm(RCX, 3);
+            a.callImport(importIndex("kernel32.dll", "ExitProcess"));
+        }
+        a.leave();
+        a.ret();
+    }
+}
+
+// ─── Values ────────────────────────────────────────────────────────────────
+
+Gen::Var *Gen::lookup(const std::string &name)
+{
+    for (int i = (int)scopes_.size() - 1; i >= 0; --i)
+    {
+        auto it = scopes_[i].vars.find(name);
+        if (it != scopes_[i].vars.end())
+            return &it->second;
+    }
+    auto g = globals_.find(name);
+    return g == globals_.end() ? nullptr : &g->second;
+}
+
+int Gen::newSlot(const NT &t)
+{
+    nextOff_ -= alignUp(sizeOf(t), 8);
+    return nextOff_;
+}
+
+void Gen::pushRax()
+{
+    a.push(RAX);
+    ++depth_;
+}
+
+void Gen::popReg(int r)
+{
+    a.pop(r);
+    --depth_;
+}
+
+// a call of a routine with its arguments in registers already
+void Gen::callRoutine(int label)
+{
+    int pad = (depth_ + 4) % 2;
+    if (pad)
+        a.subRsp(8);
+    a.subRsp(32);
+    a.call(label);
+    a.addRsp(32 + 8 * pad);
+}
+
+void Gen::wrap(Kind k, int r)
+{
+    switch (k)
+    {
+    case K_BOOL:
+        if (r != RAX)
+            a.movRR(RAX, r);
+        a.test(RAX, RAX);
+        a.setcc(CC_NE);
+        if (r != RAX)
+            a.movRR(r, RAX);
+        break;
+    case K_I8: a.movsx8(r); break;
+    case K_U8: a.movzx8(r); break;
+    case K_I16: a.movsx16(r); break;
+    case K_U16: a.movzx16(r); break;
+    case K_I32: a.movsxd(r); break;
+    case K_U32: a.movzx32(r); break;
+    default: break;
+    }
+}
+
+void Gen::convert(const NT &to, const NT &from, int line)
+{
+    if (to->cat == C_VOID)
+        return;
+    if (to->cat == C_PTR && from->cat == C_PTR)
+    {
+        bool ok = to->elem->cat == C_VOID || sameType(to->elem, from->elem) ||
+                  (to->elem->cat == C_CLASS && from->elem->cat == C_CLASS && derivesFrom(from->elem->cls, to->elem->cls)) ||
+                  from->elem->cat == C_VOID;
+        if (!ok)
+            fail("converting between unrelated pointer types", line);
+        return;
+    }
+    if (!isScalar(to) || !isScalar(from))
+    {
+        if (to->cat == C_CLASS && from->cat == C_CLASS && derivesFrom(from->cls, to->cls))
+            return;
+        fail("this conversion", line);
+    }
+    if (to->cat == C_PTR)
+        fail("converting an integer to a pointer", line);
+    if (to->cat == C_INT)
+        wrap(to->kind);
+}
+
+NT Gen::valueAt(const NT &t)
+{
+    if (t->cat == C_ARRAY)
+        return tPtr(t->elem); // decays to its first element's address
+    if (t->cat == C_CLASS)
+        return t;
+    a.movRR(RCX, RAX);
+    if (t->cat == C_PTR)
+        a.loadRcx(8, false);
+    else
+        a.loadRcx(kindSize(t->kind), !isUnsigned(t->kind));
+    return t;
+}
+
+// The type an expression would have: its code is generated and dropped
+NT Gen::typeOfExpr(const cpp::ExprP &e)
+{
+    Asm::Mark m = a.mark();
+    size_t dataSize = data.size();
+    int depth = depth_, next = nextOff_;
+    size_t temps = temps_.size();
+    NT t = expr(e);
+    a.rewind(m);
+    data.resize(dataSize);
+    depth_ = depth;
+    nextOff_ = next;
+    temps_.resize(temps);
+    return t;
+}
+
+const Field *Gen::findField(ClassInfo *c, const std::string &name, int &off)
+{
+    for (ClassInfo *k = c; k; k = k->base)
+        for (const Field &f : k->fields)
+            if (f.name == name)
+            {
+                off = f.off;
+                return &f;
+            }
+    return nullptr;
+}
+
+Method *Gen::findMethod(ClassInfo *c, const std::string &name, std::vector<Method *> &out)
+{
+    for (ClassInfo *k = c; k; k = k->base)
+    {
+        auto it = k->methods.find(name);
+        if (it != k->methods.end())
+        {
+            out = it->second;
+            return out.front();
+        }
+    }
+    return nullptr;
+}
+
+void Gen::loadThis(const ThisSrc &s)
+{
+    switch (s.kind)
+    {
+    case TH_OBJ:
+    {
+        NT t = addr(s.e);
+        if (t->cat != C_CLASS)
+            fail("a member call on a non-object", s.e->line);
+        break;
+    }
+    case TH_PTR:
+    {
+        NT t = expr(s.e);
+        if (t->cat != C_PTR || t->elem->cat != C_CLASS)
+            fail("-> on a non-object pointer", s.e->line);
+        break;
+    }
+    case TH_CUR:
+        a.load(RAX, thisOff_);
+        break;
+    case TH_LOCAL:
+        a.lea(RAX, s.off);
+        break;
+    case TH_INDIRECT:
+        a.load(RAX, s.off);
+        break;
+    case TH_GLOBAL:
+        a.leaData(RAX, s.off);
+        break;
+    default:
+        break;
+    }
+}
+
+NT Gen::addr(const cpp::ExprP &e)
+{
+    switch (e->k)
+    {
+    case cpp::EK::Name:
+    {
+        if (e->name.size() == 2)
+        {
+            auto ci = classes_.find(e->name[0]);
+            if (ci != classes_.end())
+            {
+                auto s = ci->second->statics.find(e->name[1]);
+                if (s != ci->second->statics.end())
+                {
+                    Var &g = globals_[s->second];
+                    a.leaData(RAX, g.off);
+                    return g.type;
+                }
+            }
+            fail("name " + e->name[0] + "::" + e->name[1], e->line);
+        }
+        if (e->name.size() != 1)
+            fail("name " + e->name.back(), e->line);
+        const std::string &n = e->name[0];
+        Var *v = lookup(n);
+        // a member of the current class, through this
+        if (cur_ && cur_->owner && !cur_->isStatic && (!v || v->global))
+        {
+            bool local = false;
+            for (int i = (int)scopes_.size() - 1; i >= 0; --i)
+                if (scopes_[i].vars.count(n))
+                    local = true;
+            int off = 0;
+            const Field *f = local ? nullptr : findField(cur_->owner, n, off);
+            if (f)
+            {
+                a.load(RAX, thisOff_);
+                if (off)
+                    a.addImm(RAX, off);
+                if (f->type->cat == C_REF)
+                {
+                    a.movRR(RCX, RAX);
+                    a.loadRcx(8, false);
+                    return f->type->elem;
+                }
+                return f->type;
+            }
+        }
+        if (!v && cur_ && cur_->owner)
+            for (ClassInfo *k = cur_->owner; k; k = k->base)
+            {
+                auto s = k->statics.find(n);
+                if (s != k->statics.end())
+                    v = &globals_[s->second];
+            }
+        if (!v)
+            fail("unknown name " + n, e->line);
+        if (v->global)
+            a.leaData(RAX, v->off);
+        else
+            a.lea(RAX, v->off);
+        if (v->type->cat == C_REF)
+        {
+            a.movRR(RCX, RAX);
+            a.loadRcx(8, false);
+            return v->type->elem;
+        }
+        return v->type;
+    }
+    case cpp::EK::This:
+        fail("this is not an object (use *this)", e->line);
+    case cpp::EK::Unary:
+        if (e->op == "*")
+        {
+            NT p = expr(e->kids[0]);
+            if (p->cat != C_PTR)
+                fail("* of a non-pointer", e->line);
+            if (p->elem->cat == C_VOID)
+                fail("* of a void pointer", e->line);
+            return p->elem;
+        }
+        break;
+    case cpp::EK::Index:
+    {
+        NT b = expr(e->kids[0]);
+        if (b->cat != C_PTR)
+            fail("[] of a non-pointer", e->line);
+        pushRax();
+        NT i = expr(e->kids[1]);
+        if (i->cat != C_INT)
+            fail("a non-integer index", e->line);
+        a.imulImm(RAX, sizeOf(b->elem));
+        a.movRR(RCX, RAX);
+        popReg(RAX);
+        a.alu(0x01, RAX, RCX);
+        return b->elem;
+    }
+    case cpp::EK::Member:
+    {
+        NT s;
+        if (e->arrow)
+        {
+            NT p = expr(e->kids[0]);
+            if (p->cat != C_PTR || p->elem->cat != C_CLASS)
+                fail("-> on a non-object pointer", e->line);
+            s = p->elem;
+        }
+        else
+        {
+            s = addr(e->kids[0]);
+            if (s->cat != C_CLASS)
+                fail(". on a non-object", e->line);
+        }
+        int off = 0;
+        const Field *f = findField(s->cls, e->op, off);
+        if (!f)
+            fail("class " + s->cls->name + " has no data member " + e->op, e->line);
+        if (off)
+            a.addImm(RAX, off);
+        if (f->type->cat == C_REF)
+        {
+            a.movRR(RCX, RAX);
+            a.loadRcx(8, false);
+            return f->type->elem;
+        }
+        return f->type;
+    }
+    case cpp::EK::Str:
+        a.leaData(RAX, stringData(e->str));
+        return tArray(tInt(K_I8), (int)e->str.size() + 1);
+    case cpp::EK::Call:
+    {
+        NT t = call(e);
+        if (t->cat == C_REF)
+            return t->elem;
+        if (t->cat == C_CLASS)
+            return t; // a temporary object
+        break;
+    }
+    case cpp::EK::Assign:
+    {
+        NT t = assign(e);
+        if (t->cat == C_CLASS)
+            return t;
+        break;
+    }
+    case cpp::EK::Construct:
+    case cpp::EK::Cast:
+    {
+        NT t = expr(e);
+        if (t->cat == C_CLASS)
+            return t; // a temporary object
+        break;
+    }
+    default:
+        break;
+    }
+    fail("this expression is not an object", e->line);
+}
+
+void Gen::arith(const std::string &op, Kind k, int line)
+{
+    bool u = isUnsigned(k);
+    if (op == "+")
+        a.alu(0x01, RAX, RCX);
+    else if (op == "-")
+        a.alu(0x29, RAX, RCX);
+    else if (op == "*")
+        a.imul(RAX, RCX);
+    else if (op == "&")
+        a.alu(0x21, RAX, RCX);
+    else if (op == "|")
+        a.alu(0x09, RAX, RCX);
+    else if (op == "^")
+        a.alu(0x31, RAX, RCX);
+    else if (op == "/" || op == "%")
+    {
+        if (u)
+        {
+            a.alu(0x31, RDX, RDX);
+            a.div(RCX);
+        }
+        else
+        {
+            a.cqo();
+            a.idiv(RCX);
+        }
+        if (op == "%")
+            a.movRR(RAX, RDX);
+    }
+    else if (op == "<<")
+        a.shiftCl(4, RAX);
+    else if (op == ">>")
+        a.shiftCl(u ? 5 : 7, RAX);
+    else
+        fail("operator " + op, line);
+    wrap(k);
+}
+
+NT Gen::binary(const cpp::ExprP &e)
+{
+    const std::string &op = e->op;
+    if (op == "&&" || op == "||")
+    {
+        int shortCut = a.newLabel(), end = a.newLabel();
+        expr(e->kids[0]);
+        a.test(RAX, RAX);
+        a.jcc(op == "&&" ? CC_E : CC_NE, shortCut);
+        expr(e->kids[1]);
+        a.test(RAX, RAX);
+        a.setcc(CC_NE);
+        a.jmp(end);
+        a.bind(shortCut);
+        a.movImm(RAX, op == "&&" ? 0 : 1);
+        a.bind(end);
+        return tInt(K_BOOL);
+    }
+    NT lt = expr(e->kids[0]);
+    pushRax();
+    NT rt = expr(e->kids[1]);
+    a.movRR(RCX, RAX);
+    popReg(RAX);
+    if (!isScalar(lt) || !isScalar(rt))
+        fail("operator " + op + " on an object (operator overloading: not yet)", e->line);
+    if ((op == "+" || op == "-") && (lt->cat == C_PTR || rt->cat == C_PTR))
+    {
+        if (lt->cat == C_PTR && rt->cat == C_INT)
+        {
+            a.imulImm(RCX, sizeOf(lt->elem));
+            a.alu(op == "+" ? 0x01 : 0x29, RAX, RCX);
+            return lt;
+        }
+        if (lt->cat == C_INT && rt->cat == C_PTR && op == "+")
+        {
+            a.imulImm(RAX, sizeOf(rt->elem));
+            a.alu(0x01, RAX, RCX);
+            return rt;
+        }
+        if (lt->cat == C_PTR && rt->cat == C_PTR && op == "-")
+        {
+            a.alu(0x29, RAX, RCX);
+            a.cqo();
+            a.movImm(RCX, sizeOf(lt->elem));
+            a.idiv(RCX);
+            return tInt(K_I64);
+        }
+        fail("this pointer arithmetic", e->line);
+    }
+    Kind lk = valKind(lt), rk = valKind(rt);
+    if (op == "<<" || op == ">>")
+    {
+        Kind k = promote(lk);
+        arith(op, k, e->line);
+        return tInt(k);
+    }
+    Kind k = common(lk, rk);
+    if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=")
+    {
+        wrap(k, RAX);
+        wrap(k, RCX);
+        bool u = isUnsigned(k);
+        int cc = op == "==" ? CC_E : op == "!=" ? CC_NE : op == "<" ? (u ? CC_B : CC_L)
+               : op == ">" ? (u ? CC_A : CC_G) : op == "<=" ? (u ? CC_BE : CC_LE) : (u ? CC_AE : CC_GE);
+        a.alu(0x39, RAX, RCX);
+        a.setcc(cc);
+        return tInt(K_BOOL);
+    }
+    if (lt->cat == C_PTR || rt->cat == C_PTR)
+        fail("operator " + op + " on a pointer", e->line);
+    wrap(k, RAX);
+    wrap(k, RCX);
+    arith(op, k, e->line);
+    return tInt(k);
+}
+
+// [rdi] = [rsi], `size` bytes (rep movsb)
+void Gen::copyBytes(int size)
+{
+    a.movImm(RCX, size);
+    a.byte(0xF3);
+    a.byte(0xA4);
+}
+
+NT Gen::assign(const cpp::ExprP &e)
+{
+    if (e->op == "=")
+    {
+        NT rt = expr(e->kids[1]);
+        pushRax();
+        NT lt = addr(e->kids[0]);
+        if (lt->cat == C_CLASS)
+        {
+            if (rt->cat != C_CLASS || !derivesFrom(rt->cls, lt->cls))
+                fail("assigning a different type to an object", e->line);
+            a.movRR(RDI, RAX);
+            popReg(RSI);
+            pushRax();
+            int skip = lt->cls->polymorphic ? 8 : 0; // the target keeps its own vtable
+            if (skip)
+            {
+                a.addImm(RDI, 8);
+                a.addImm(RSI, 8);
+            }
+            copyBytes(sizeOf(lt) - skip);
+            popReg(RAX);
+            return lt;
+        }
+        if (!isScalar(lt))
+            fail("assignment to an array", e->line);
+        a.movRR(RCX, RAX);
+        popReg(RAX);
+        a.push(RCX);
+        ++depth_;
+        if (lt->cat == C_PTR && rt->cat == C_INT && e->kids[1]->k == cpp::EK::Int)
+            ; // p = 0
+        else
+            convert(lt, rt, e->line);
+        popReg(RCX);
+        a.storeRcx(sizeOf(lt));
+        return lt;
+    }
+    std::string op = e->op.substr(0, e->op.size() - 1);
+    NT lt = addr(e->kids[0]);
+    if (!isScalar(lt))
+        fail("compound assignment to an object or array", e->line);
+    pushRax(); // the address
+    valueAt(lt);
+    pushRax(); // the old value
+    NT rt = expr(e->kids[1]);
+    a.movRR(RCX, RAX);
+    popReg(RAX);
+    if (lt->cat == C_PTR)
+    {
+        if (rt->cat != C_INT || (op != "+" && op != "-"))
+            fail("this pointer arithmetic", e->line);
+        a.imulImm(RCX, sizeOf(lt->elem));
+        a.alu(op == "+" ? 0x01 : 0x29, RAX, RCX);
+    }
+    else
+    {
+        Kind vk = lt->kind, rk = valKind(rt);
+        Kind k = op == "<<" || op == ">>" ? promote(vk) : common(vk, rk);
+        wrap(k, RAX);
+        if (op != "<<" && op != ">>")
+            wrap(k, RCX);
+        arith(op, k, e->line);
+        wrap(vk);
+    }
+    popReg(RCX);
+    a.storeRcx(sizeOf(lt));
+    return lt;
+}
+
+NT Gen::incDec(const cpp::ExprP &e, bool inc, bool post)
+{
+    NT t = addr(e->kids[0]);
+    if (!isScalar(t))
+        fail("++/-- of an object or array", e->line);
+    pushRax();
+    valueAt(t);
+    a.movRR(RDX, RAX); // the old value
+    a.movImm(RCX, t->cat == C_PTR ? sizeOf(t->elem) : 1);
+    a.alu(inc ? 0x01 : 0x29, RAX, RCX);
+    if (t->cat == C_INT)
+        wrap(t->kind);
+    popReg(RCX);
+    a.storeRcx(sizeOf(t));
+    if (post)
+        a.movRR(RAX, RDX);
+    return t;
+}
+
+// rax = the address a reference of type `ref` binds to: the object itself, or
+// (a const reference to a value) a temporary holding the value
+void Gen::bindRef(const NT &ref, const cpp::ExprP &e, int line)
+{
+    const NT &to = ref->elem;
+    NT t = typeOfExpr(e);
+    bool lvalue = e->k == cpp::EK::Name || e->k == cpp::EK::Member || e->k == cpp::EK::Index ||
+                  (e->k == cpp::EK::Unary && e->op == "*") || t->cat == C_REF || t->cat == C_CLASS;
+    if (e->k == cpp::EK::Call && t->cat != C_REF && t->cat != C_CLASS)
+        lvalue = false;
+    if (lvalue && (t->cat == C_CLASS || sameType(t->cat == C_REF ? t->elem : t, to)))
+    {
+        NT got = addr(e);
+        if (to->cat == C_CLASS && (got->cat != C_CLASS || !derivesFrom(got->cls, to->cls)))
+            fail("binding a reference to a different type", line);
+        return;
+    }
+    if (!ref->isConst && to->cat != C_CLASS)
+        fail("binding a non-const reference to a value", line);
+    // a temporary holding the converted value
+    NT v = expr(e);
+    if (to->cat == C_CLASS)
+    {
+        if (v->cat != C_CLASS || !derivesFrom(v->cls, to->cls))
+            fail("binding a reference to a different type", line);
+        return; // a temporary object already
+    }
+    if (to->cat == C_PTR && v->cat == C_PTR)
+        ;
+    else
+        convert(to, v, line);
+    int slot = newSlot(to);
+    a.lea(RCX, slot);
+    a.storeRcx(sizeOf(to));
+    a.lea(RAX, slot);
+}
+
+// Overload resolution: the cost of passing `arg` (of type argT) to `param`
+int Gen::argCost(const NT &param, const cpp::ExprP &arg, const NT &argT)
+{
+    NT p = param->cat == C_REF ? param->elem : param;
+    NT t = argT->cat == C_REF ? argT->elem : argT;
+    if (sameType(p, t))
+        return 0;
+    if (p->cat == C_INT && t->cat == C_INT)
+        return promote(t->kind) == p->kind ? 1 : 2;
+    if (p->cat == C_PTR && t->cat == C_PTR)
+    {
+        if (p->elem->cat == C_VOID)
+            return 3;
+        if (p->elem->cat == C_CLASS && t->elem->cat == C_CLASS && derivesFrom(t->elem->cls, p->elem->cls))
+            return 2;
+        if (t->elem->cat == C_VOID && arg->k == cpp::EK::Nullptr)
+            return 1;
+        return -1;
+    }
+    if (p->cat == C_PTR && t->cat == C_INT && arg->k == cpp::EK::Int && arg->str == "0")
+        return 3;
+    if (p->cat == C_CLASS && t->cat == C_CLASS && derivesFrom(t->cls, p->cls))
+        return 2;
+    if (p->cat == C_CLASS)
+    {
+        // a converting constructor taking it
+        for (Method *c : p->cls->ctors)
+            if (c->params.size() == 1 && !(c->decl && c->decl->isExplicit))
+            {
+                NT cp = c->params[0]->cat == C_REF ? c->params[0]->elem : c->params[0];
+                if (sameType(cp, t) || (cp->cat == C_INT && t->cat == C_INT))
+                    return 5;
+            }
+    }
+    return -1;
+}
+
+Method *Gen::resolve(const std::vector<Method *> &cands, const std::vector<cpp::ExprP> &args, const std::string &what,
+                     int line)
+{
+    if (cands.size() == 1 && cands[0]->params.size() == args.size())
+        return cands[0];
+    std::vector<NT> types;
+    for (const cpp::ExprP &x : args)
+        types.push_back(typeOfExpr(x));
+    Method *best = nullptr;
+    int bestCost = 1 << 30;
+    bool tie = false;
+    for (Method *m : cands)
+    {
+        if (args.size() > m->params.size())
+            continue;
+        bool ok = true;
+        for (size_t i = args.size(); i < m->params.size(); ++i)
+            if (!m->defaults[i])
+                ok = false;
+        int cost = 0;
+        for (size_t i = 0; ok && i < args.size(); ++i)
+        {
+            int c = argCost(m->params[i], args[i], types[i]);
+            if (c < 0)
+                ok = false;
+            cost += c;
+        }
+        if (!ok)
+            continue;
+        if (cost < bestCost)
+        {
+            best = m;
+            bestCost = cost;
+            tie = false;
+        }
+        else if (cost == bestCost)
+            tie = true;
+    }
+    if (!best)
+        fail("no " + what + " matches these arguments", line);
+    if (tie)
+        fail("ambiguous call of " + what, line);
+    return best;
+}
+
+// A call: the result's place, this, then the arguments, in the argument
+// registers / stack slots. Returns the result type (a class result: its
+// address in rax).
+NT Gen::callMethod(Method *m, const ThisSrc &self, const std::vector<cpp::ExprP> &argsIn, bool virt, int line,
+                   const ThisSrc *result)
+{
+    std::vector<cpp::ExprP> args = argsIn;
+    for (size_t i = args.size(); i < m->params.size(); ++i)
+        args.push_back(m->defaults[i]);
+    bool hasThis = m->owner && !m->isStatic && self.kind != TH_NONE;
+    if (m->owner && !m->isStatic && !hasThis)
+        fail("calling member function " + m->name + " without an object", line);
+    bool classRet = m->ret->cat == C_CLASS;
+    ThisSrc place; // where the result is built
+    if (classRet && result)
+        place = *result;
+    else if (classRet)
+    {
+        place.kind = TH_LOCAL; // a temporary
+        place.off = newSlot(m->ret);
+        if (m->ret->cls->needsDtor)
+            temps_.push_back(Cleanup{place.off, m->ret->cls});
+    }
+    int n = (classRet ? 1 : 0) + (hasThis ? 1 : 0) + (int)args.size();
+    int onStack = n > 4 ? n - 4 : 0;
+    int pad = (depth_ + onStack + 4) % 2;
+    if (pad)
+    {
+        a.subRsp(8);
+        ++depth_;
+    }
+    for (int i = (int)args.size() - 1; i >= 0; --i)
+    {
+        NT pt = m->params[i];
+        if (pt->cat == C_REF)
+            bindRef(pt, args[i], line);
+        else if (pt->cat == C_CLASS)
+        {
+            // by value: a copy in the caller's frame, passed by address
+            int slot = newSlot(pt);
+            std::vector<cpp::ExprP> one = {args[i]};
+            ThisSrc cs;
+            cs.kind = TH_LOCAL;
+            cs.off = slot;
+            construct(cs, pt->cls, one, false, line);
+            if (pt->cls->needsDtor)
+                temps_.push_back(Cleanup{slot, pt->cls});
+            a.lea(RAX, slot);
+        }
+        else
+        {
+            NT at = expr(args[i]);
+            if (pt->cat == C_PTR && at->cat == C_INT && args[i]->k == cpp::EK::Int)
+                ; // 0 as a null pointer
+            else
+                convert(pt, at, line);
+        }
+        pushRax();
+    }
+    if (hasThis)
+    {
+        loadThis(self);
+        pushRax();
+    }
+    if (classRet)
+    {
+        loadThis(place);
+        pushRax();
+    }
+    for (int i = 0; i < n && i < 4; ++i)
+        popReg(kArgRegs[i]);
+    a.subRsp(32);
+    if (virt && m->isVirtual)
+    {
+        int thisReg = kArgRegs[classRet ? 1 : 0];
+        a.loadInd(RAX, thisReg);     // the vtable
+        a.addImm(RAX, 8 * m->vslot);
+        a.loadInd(RAX, RAX);
+        a.callReg(RAX);
+    }
+    else
+        a.call(m->label);
+    a.addRsp(32 + 8 * (onStack + pad));
+    depth_ -= onStack + pad;
+    if (classRet)
+        loadThis(place);
+    return m->ret;
+}
+
+NT Gen::call(const cpp::ExprP &e, const ThisSrc *result)
+{
+    const cpp::ExprP &callee = e->kids[0];
+    std::vector<cpp::ExprP> args(e->kids.begin() + 1, e->kids.end());
+    // obj.f(...) / p->f(...)
+    if (callee->k == cpp::EK::Member)
+    {
+        NT ot = typeOfExpr(callee->kids[0]);
+        if (callee->arrow)
+            ot = ot->cat == C_PTR ? ot->elem : ot;
+        else if (ot->cat == C_REF)
+            ot = ot->elem;
+        if (ot->cat != C_CLASS)
+            fail("a member call on a non-object", e->line);
+        std::vector<Method *> cands;
+        if (!findMethod(ot->cls, callee->op, cands))
+            fail("class " + ot->cls->name + " has no member function " + callee->op, e->line);
+        Method *m = resolve(cands, args, ot->cls->name + "::" + callee->op, e->line);
+        ThisSrc self;
+        self.kind = callee->arrow ? TH_PTR : TH_OBJ;
+        self.e = callee->kids[0];
+        return callMethod(m, self, args, true, e->line, result);
+    }
+    if (callee->k != cpp::EK::Name)
+        fail("this call (not yet: function pointers)", e->line);
+    // Class::f(...): a static member, or a base class's version
+    if (callee->name.size() == 2)
+    {
+        auto ci = classes_.find(callee->name[0]);
+        if (ci == classes_.end())
+            fail("unknown class " + callee->name[0], e->line);
+        std::vector<Method *> cands;
+        if (!findMethod(ci->second.get(), callee->name[1], cands))
+            fail("unknown member function " + callee->name[0] + "::" + callee->name[1], e->line);
+        Method *m = resolve(cands, args, callee->name[0] + "::" + callee->name[1], e->line);
+        ThisSrc self;
+        if (!m->isStatic)
+            self.kind = TH_CUR;
+        return callMethod(m, self, args, false, e->line, result);
+    }
+    if (callee->name.size() != 1)
+        fail("this call", e->line);
+    const std::string &name = callee->name[0];
+    // a member function of the current class
+    if (cur_ && cur_->owner)
+    {
+        std::vector<Method *> cands;
+        if (findMethod(cur_->owner, name, cands))
+        {
+            Method *m = resolve(cands, args, name, e->line);
+            ThisSrc self;
+            if (!m->isStatic)
+                self.kind = TH_CUR;
+            return callMethod(m, self, args, true, e->line, result);
+        }
+    }
+    auto it = funcs_.find(name);
+    if (it != funcs_.end() && !it->second.empty())
+    {
+        Method *m = resolve(it->second, args, name, e->line);
+        return callMethod(m, ThisSrc(), args, false, e->line, result);
+    }
+    // the C library routines the runtime provides
+    int label = -1;
+    std::vector<NT> params;
+    NT ret;
+    if (name == "putchar")
+    {
+        label = routine("putchar");
+        params = {tInt(K_I32)};
+        ret = tInt(K_I32);
+    }
+    else if (name == "puts")
+    {
+        label = routine("puts");
+        params = {tPtr(tInt(K_I8))};
+        ret = tInt(K_I32);
+    }
+    else if (name == "malloc")
+    {
+        label = routine("alloc");
+        params = {tInt(K_U64)};
+        ret = tPtr(tVoid());
+    }
+    else if (name == "free")
+    {
+        label = routine("free");
+        params = {tPtr(tVoid())};
+        ret = tVoid();
+    }
+    else
+        fail("unknown function " + name, e->line);
+    if (args.size() != params.size())
+        fail(name + " takes " + std::to_string(params.size()) + " arguments", e->line);
+    NT at = expr(args[0]);
+    if (!(params[0]->cat == C_PTR && at->cat == C_PTR))
+        convert(params[0], at, e->line);
+    a.movRR(RCX, RAX);
+    callRoutine(label);
+    return ret;
+}
+
+// Constructs an object of class c where `self` says
+void Gen::construct(const ThisSrc &self, ClassInfo *c, const std::vector<cpp::ExprP> &args, bool braced, int line)
+{
+    // a prvalue of the class (T(...), or a call returning T) is built in place
+    if (args.size() == 1 && !(braced && args[0]->k == cpp::EK::InitList))
+    {
+        const cpp::ExprP &x = args[0];
+        if ((x->k == cpp::EK::Construct || x->k == cpp::EK::Cast) && x->type)
+        {
+            NT t = typeOf(x->type, line);
+            if (t->cat == C_CLASS && t->cls == c)
+            {
+                construct(self, c, x->kids, x->braced, line);
+                return;
+            }
+        }
+        if (x->k == cpp::EK::Call && (self.kind == TH_LOCAL || self.kind == TH_INDIRECT || self.kind == TH_GLOBAL))
+        {
+            NT t = typeOfExpr(x);
+            if (t->cat == C_CLASS && t->cls == c)
+            {
+                call(x, &self);
+                return;
+            }
+        }
+    }
+    if (!c->ctors.empty())
+    {
+        std::vector<cpp::ExprP> as = args;
+        if (braced && as.size() == 1 && as[0]->k == cpp::EK::InitList)
+            as = as[0]->kids;
+        // copying an object of the class with no user copy constructor: memberwise
+        if (as.size() == 1)
+        {
+            NT at = typeOfExpr(as[0]);
+            NT bt = at->cat == C_REF ? at->elem : at;
+            bool userCopy = false;
+            for (Method *k : c->ctors)
+                if (k->params.size() == 1 && k->params[0]->cat == C_REF && k->params[0]->elem->cat == C_CLASS &&
+                    k->params[0]->elem->cls == c)
+                    userCopy = true;
+            if (bt->cat == C_CLASS && bt->cls == c && !userCopy)
+            {
+                addr(as[0]);
+                a.movRR(RSI, RAX);
+                pushRax();
+                loadThis(self);
+                a.movRR(RDI, RAX);
+                popReg(RSI);
+                copyBytes(c->size);
+                return;
+            }
+        }
+        Method *m = resolve(c->ctors, as, c->name + " constructor", line);
+        callMethod(m, self, as, false, line);
+        return;
+    }
+    if (args.empty() || (braced && args.size() == 1 && args[0]->k == cpp::EK::InitList && args[0]->kids.empty()))
+    {
+        if (c->implicitCtor)
+            callMethod(c->implicitCtor, self, {}, false, line);
+        return; // zeroed memory
+    }
+    // copy, or aggregate initialization {a, b, ...}
+    if (args.size() == 1 && !(braced && args[0]->k == cpp::EK::InitList))
+    {
+        NT at = typeOfExpr(args[0]);
+        NT bt = at->cat == C_REF ? at->elem : at;
+        if (bt->cat == C_CLASS && derivesFrom(bt->cls, c))
+        {
+            addr(args[0]);
+            pushRax();
+            loadThis(self);
+            a.movRR(RDI, RAX);
+            popReg(RSI);
+            copyBytes(c->size);
+            return;
+        }
+    }
+    if (c->polymorphic || c->base)
+        fail("aggregate initialization of " + c->name + " (it has a base or virtual functions)", line);
+    std::vector<cpp::ExprP> items = args;
+    if (items.size() == 1 && items[0]->k == cpp::EK::InitList)
+        items = items[0]->kids;
+    if (items.size() > c->fields.size())
+        fail("too many initializers for " + c->name, line);
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const Field &f = c->fields[i];
+        if (f.type->cat == C_CLASS)
+        {
+            loadThis(self);
+            if (f.off)
+                a.addImm(RAX, f.off);
+            int tmp = newSlot(tPtr(tVoid()));
+            a.store(tmp, RAX);
+            ThisSrc fs;
+            fs.kind = TH_INDIRECT;
+            fs.off = tmp;
+            std::vector<cpp::ExprP> one = {items[i]};
+            construct(fs, f.type->cls, one, items[i]->k == cpp::EK::InitList, line);
+            continue;
+        }
+        if (!isScalar(f.type))
+            fail("initializing member " + f.name, line);
+        NT vt = expr(items[i]);
+        if (f.type->cat == C_PTR && (vt->cat == C_PTR || vt->cat == C_INT))
+            ;
+        else
+            convert(f.type, vt, line);
+        pushRax();
+        loadThis(self);
+        if (f.off)
+            a.addImm(RAX, f.off);
+        a.movRR(RCX, RAX);
+        popReg(RAX);
+        a.storeRcx(sizeOf(f.type));
+    }
+}
+
+void Gen::destroy(const ThisSrc &self, ClassInfo *c)
+{
+    if (!c->needsDtor)
+        return;
+    loadThis(self);
+    a.movRR(RCX, RAX);
+    callRoutine(c->dtor->label);
+}
+
+// destructors of the scopes above `downTo`, innermost first (rax is kept)
+void Gen::destroyScopes(size_t downTo)
+{
+    bool any = false;
+    for (size_t i = downTo; i < scopes_.size(); ++i)
+        if (!scopes_[i].cleanups.empty())
+            any = true;
+    if (!any)
+        return;
+    pushRax();
+    for (size_t i = scopes_.size(); i-- > downTo;)
+        for (size_t k = scopes_[i].cleanups.size(); k-- > 0;)
+        {
+            ThisSrc s;
+            s.kind = TH_LOCAL;
+            s.off = scopes_[i].cleanups[k].off;
+            destroy(s, scopes_[i].cleanups[k].cls);
+        }
+    popReg(RAX);
+}
+
+// the temporaries of a full-expression die at its end (rax is kept)
+void Gen::endFullExpr()
+{
+    if (temps_.empty())
+        return;
+    std::vector<Cleanup> t;
+    t.swap(temps_);
+    pushRax();
+    for (size_t k = t.size(); k-- > 0;)
+    {
+        ThisSrc s;
+        s.kind = TH_LOCAL;
+        s.off = t[k].off;
+        destroy(s, t[k].cls);
+    }
+    popReg(RAX);
+}
+
+NT Gen::expr(const cpp::ExprP &e)
+{
+    switch (e->k)
+    {
+    case cpp::EK::Int:
+    {
+        Kind k;
+        int64_t v = literalValue(e->str, k);
+        a.movImm(RAX, v);
+        return tInt(k);
+    }
+    case cpp::EK::Char:
+        a.movImm(RAX, (int64_t)(signed char)(int)e->num);
+        return tInt(K_I8);
+    case cpp::EK::Bool:
+        a.movImm(RAX, e->num != 0 ? 1 : 0);
+        return tInt(K_BOOL);
+    case cpp::EK::Nullptr:
+        a.movImm(RAX, 0);
+        return tPtr(tVoid());
+    case cpp::EK::This:
+        if (!cur_ || !cur_->owner || cur_->isStatic)
+            fail("this outside a member function", e->line);
+        a.load(RAX, thisOff_);
+        return tPtr(tClass(cur_->owner));
+    case cpp::EK::Name:
+    case cpp::EK::Index:
+    case cpp::EK::Member:
+    case cpp::EK::Str:
+        return valueAt(addr(e));
+    case cpp::EK::Binary:
+        return binary(e);
+    case cpp::EK::Comma:
+    {
+        NT t = tVoid();
+        for (const cpp::ExprP &x : e->kids)
+            t = expr(x);
+        return t;
+    }
+    case cpp::EK::Assign:
+        return assign(e);
+    case cpp::EK::Unary:
+    {
+        const std::string &op = e->op;
+        if (op == "++" || op == "--")
+            return incDec(e, op == "++", false);
+        if (op == "&")
+            return tPtr(addr(e->kids[0]));
+        if (op == "*")
+            return valueAt(addr(e));
+        NT t = expr(e->kids[0]);
+        if (op == "!")
+        {
+            a.test(RAX, RAX);
+            a.setcc(CC_E);
+            return tInt(K_BOOL);
+        }
+        if (t->cat != C_INT)
+            fail("operator " + op + " on a non-integer", e->line);
+        Kind pk = promote(t->kind);
+        if (op == "-")
+            a.neg(RAX);
+        else if (op == "~")
+            a.notr(RAX);
+        else if (op != "+")
+            fail("operator " + op, e->line);
+        wrap(pk);
+        return tInt(pk);
+    }
+    case cpp::EK::Postfix:
+        return incDec(e, e->op == "++", true);
+    case cpp::EK::Cond:
+    {
+        int other = a.newLabel(), end = a.newLabel();
+        expr(e->kids[0]);
+        a.test(RAX, RAX);
+        a.jcc(CC_E, other);
+        NT t1 = expr(e->kids[1]);
+        a.jmp(end);
+        a.bind(other);
+        NT t2 = expr(e->kids[2]);
+        a.bind(end);
+        if (t1->cat == C_INT && t2->cat == C_INT)
+        {
+            Kind k = t1->kind == t2->kind ? t1->kind : common(t1->kind, t2->kind);
+            wrap(k);
+            return tInt(k);
+        }
+        return t1->cat == C_PTR ? t1 : t2;
+    }
+    case cpp::EK::Call:
+    {
+        NT t = call(e);
+        if (t->cat == C_REF)
+            return valueAt(t->elem);
+        return t;
+    }
+    case cpp::EK::Cast:
+    case cpp::EK::Construct:
+    {
+        NT t = typeOf(e->type, e->line);
+        if (t->cat == C_CLASS)
+        {
+            // T(args) / T{args}: a temporary object
+            int slot = newSlot(t);
+            a.movImm(RAX, 0);
+            for (int k = 0; k < alignUp(sizeOf(t), 8); k += 8)
+                a.store(slot + k, RAX);
+            ThisSrc s;
+            s.kind = TH_LOCAL;
+            s.off = slot;
+            construct(s, t->cls, e->kids, e->braced, e->line);
+            if (t->cls->needsDtor)
+                temps_.push_back(Cleanup{slot, t->cls});
+            a.lea(RAX, slot);
+            return t;
+        }
+        if (e->kids.size() != 1)
+        {
+            if (e->kids.empty() && t->cat == C_INT)
+            {
+                a.movImm(RAX, 0); // int()
+                return t;
+            }
+            fail("this conversion", e->line);
+        }
+        NT from = expr(e->kids[0]);
+        if (t->cat == C_VOID)
+            return t;
+        if (t->cat == C_PTR && (from->cat == C_PTR || from->cat == C_INT))
+            return t; // a pointer cast reinterprets
+        if (t->cat == C_INT && from->cat == C_PTR)
+        {
+            wrap(t->kind);
+            return t;
+        }
+        convert(t, from, e->line);
+        return t;
+    }
+    case cpp::EK::SizeofT:
+        a.movImm(RAX, sizeOf(typeOf(e->type, e->line)));
+        return tInt(K_U64);
+    case cpp::EK::SizeofE:
+    {
+        NT t = typeOfExpr(e->kids[0]);
+        if (t->cat == C_REF)
+            t = t->elem;
+        // an array name decays in typeOfExpr; ask for the object's type instead
+        if (e->kids[0]->k == cpp::EK::Name || e->kids[0]->k == cpp::EK::Member || e->kids[0]->k == cpp::EK::Index)
+        {
+            Asm::Mark m = a.mark();
+            int depth = depth_;
+            t = addr(e->kids[0]);
+            a.rewind(m);
+            depth_ = depth;
+        }
+        a.movImm(RAX, sizeOf(t));
+        return tInt(K_U64);
+    }
+    case cpp::EK::New:
+    {
+        NT t = typeOf(e->type, e->line);
+        if (e->newArray)
+        {
+            if (e->braced)
+                fail("new[] with an initializer list (not yet)", e->line);
+            if (t->cat == C_CLASS && (t->cls->needsDtor || !t->cls->ctors.empty() || t->cls->implicitCtor))
+                fail("new[] of objects with constructors or destructors (not yet)", e->line);
+            NT n = expr(e->kids[0]);
+            if (n->cat != C_INT)
+                fail("a non-integer array size", e->line);
+            a.imulImm(RAX, sizeOf(t));
+            a.movRR(RCX, RAX);
+            callRoutine(routine("alloc"));
+            return tPtr(t);
+        }
+        a.movImm(RCX, sizeOf(t));
+        callRoutine(routine("alloc"));
+        if (t->cat == C_CLASS)
+        {
+            int slot = newSlot(tPtr(t));
+            a.store(slot, RAX);
+            ThisSrc s;
+            s.kind = TH_INDIRECT;
+            s.off = slot;
+            construct(s, t->cls, e->kids, e->braced, e->line);
+            a.load(RAX, slot);
+            return tPtr(t);
+        }
+        if (!e->kids.empty())
+        {
+            if (e->kids.size() != 1)
+                fail("new with several values", e->line);
+            int slot = newSlot(tPtr(t));
+            a.store(slot, RAX);
+            NT v = expr(e->kids[0]);
+            if (!(t->cat == C_PTR && v->cat == C_PTR))
+                convert(t, v, e->line);
+            a.load(RCX, slot);
+            a.storeRcx(sizeOf(t));
+            a.load(RAX, slot);
+        }
+        return tPtr(t);
+    }
+    case cpp::EK::Delete:
+    {
+        NT p = expr(e->kids[0]);
+        if (p->cat != C_PTR)
+            fail("delete of a non-pointer", e->line);
+        if (p->elem->cat == C_CLASS && p->elem->cls->needsDtor)
+        {
+            int slot = newSlot(p);
+            a.store(slot, RAX);
+            int skip = a.newLabel();
+            a.test(RAX, RAX);
+            a.jcc(CC_E, skip);
+            ClassInfo *c = p->elem->cls;
+            a.movRR(RCX, RAX);
+            if (c->dtor->isVirtual)
+            {
+                // the dynamic type's destructor
+                int pad = (depth_ + 4) % 2;
+                if (pad)
+                    a.subRsp(8);
+                a.subRsp(32);
+                a.loadInd(RAX, RCX);
+                a.addImm(RAX, 8 * c->dtor->vslot);
+                a.loadInd(RAX, RAX);
+                a.callReg(RAX);
+                a.addRsp(32 + 8 * pad);
+            }
+            else
+                callRoutine(c->dtor->label);
+            a.bind(skip);
+            a.load(RAX, slot);
+        }
+        a.movRR(RCX, RAX);
+        callRoutine(routine("free"));
+        return tVoid();
+    }
+    default:
+        fail("this expression (not yet)", e->line);
+    }
+}
+
+void Gen::cond(const cpp::ExprP &e, int falseLabel)
+{
+    NT t = expr(e);
+    if (t->cat == C_REF)
+        t = t->elem;
+    if (!isScalar(t))
+        fail("an object as a condition", e->line);
+    endFullExpr();
+    a.test(RAX, RAX);
+    a.jcc(CC_E, falseLabel);
+}
+
+// A local's initial value, stored in place (the slot is zeroed first)
+void Gen::localInit(int off, const NT &t, const cpp::ExprP &init, int line)
+{
+    if (t->cat == C_ARRAY && t->elem->cat == C_INT && t->elem->kind == K_I8 && init->k == cpp::EK::Str)
+    {
+        for (size_t i = 0; i < init->str.size() && (int)i < t->n; ++i)
+        {
+            a.lea(RCX, off + (int)i);
+            a.movImm(RAX, (unsigned char)init->str[i]);
+            a.storeRcx(1);
+        }
+        return;
+    }
+    if (t->cat == C_ARRAY)
+    {
+        if (init->k != cpp::EK::InitList)
+            fail("initializer of an array", line);
+        for (size_t i = 0; i < init->kids.size(); ++i)
+        {
+            if ((int)i >= t->n)
+                fail("too many initializers", line);
+            localInit(off + (int)i * sizeOf(t->elem), t->elem, init->kids[i], line);
+        }
+        return;
+    }
+    if (t->cat == C_CLASS)
+    {
+        ThisSrc s;
+        s.kind = TH_LOCAL;
+        s.off = off;
+        std::vector<cpp::ExprP> args = {init};
+        bool braced = init->k == cpp::EK::InitList;
+        if (braced)
+            args = init->kids;
+        construct(s, t->cls, args, braced, line);
+        return;
+    }
+    cpp::ExprP e = init;
+    if (e->k == cpp::EK::InitList)
+    {
+        if (e->kids.size() > 1)
+            fail("too many initializers", line);
+        if (e->kids.empty())
+            return; // {}: zero
+        e = e->kids[0];
+    }
+    NT from = expr(e);
+    if (from->cat == C_REF)
+        from = from->elem;
+    if (t->cat == C_PTR && (from->cat == C_PTR || (from->cat == C_INT && e->k == cpp::EK::Int)))
+        convert(t, from->cat == C_PTR ? from : t, line);
+    else
+        convert(t, from, line);
+    a.lea(RCX, off);
+    a.storeRcx(sizeOf(t));
+}
+
+void Gen::declare(const std::string &name, const NT &tIn, const cpp::ExprP &init, bool braced,
+                  const std::vector<cpp::ExprP> &args, int line)
+{
+    NT t = tIn;
+    if (t->cat == C_ARRAY && t->n == 0)
+    {
+        if (!init)
+            fail("array without a size", line);
+        t = tArray(t->elem, init->k == cpp::EK::Str ? (int)init->str.size() + 1 : (int)init->kids.size());
+    }
+    if (t->cat == C_VOID)
+        fail("a void variable", line);
+    if (t->cat == C_ARRAY && t->elem->cat == C_CLASS &&
+        (t->elem->cls->needsDtor || !t->elem->cls->ctors.empty() || t->elem->cls->implicitCtor))
+        fail("an array of objects with constructors or destructors (not yet)", line);
+    if (t->cat == C_REF)
+    {
+        if (!init)
+            fail("a reference without an initializer", line);
+        bindRef(t, init, line);
+        int off = newSlot(tPtr(tVoid()));
+        a.store(off, RAX);
+        endFullExpr();
+        scopes_.back().vars[name] = Var{t, false, off};
+        return;
+    }
+    int off = newSlot(t);
+    a.movImm(RAX, 0);
+    for (int k = 0; k < alignUp(sizeOf(t), 8); k += 8)
+        a.store(off + k, RAX);
+    if (t->cat == C_CLASS)
+    {
+        if (name == nrvoName_ && retType_->cat == C_CLASS && t->cls == retType_->cls)
+        {
+            // the named return value: built in the caller's place from the start
+            ThisSrc rs;
+            rs.kind = TH_INDIRECT;
+            rs.off = retPtrOff_;
+            construct(rs, t->cls, args, braced, line);
+            endFullExpr();
+            scopes_.back().vars[name] = Var{tRef(t, false), false, retPtrOff_};
+            return;
+        }
+        ThisSrc s;
+        s.kind = TH_LOCAL;
+        s.off = off;
+        construct(s, t->cls, args, braced, line);
+    }
+    else if (init)
+        localInit(off, t, init, line);
+    endFullExpr();
+    scopes_.back().vars[name] = Var{t, false, off};
+    if (t->cat == C_CLASS && t->cls->needsDtor)
+        scopes_.back().cleanups.push_back(Cleanup{off, t->cls});
+}
+
+void Gen::stmt(const cpp::StmtP &s)
+{
+    switch (s->k)
+    {
+    case cpp::SK::Expr:
+        expr(s->expr);
+        endFullExpr();
+        break;
+    case cpp::SK::Empty:
+        break;
+    case cpp::SK::Decl:
+        if (s->isStatic)
+            fail("static local variable (not yet)", s->line);
+        for (const cpp::VarDeclarator &d : s->decls)
+        {
+            if (!d.bindings.empty())
+                fail("structured binding", s->line);
+            NT t = typeOf(d.type, s->line);
+            cpp::ExprP init;
+            bool braced = d.init == cpp::VarDeclarator::Brace;
+            if (d.args.size() == 1 && !braced)
+                init = d.args[0];
+            else if (!d.args.empty() || braced)
+            {
+                auto list = std::make_shared<cpp::Expr>();
+                list->k = cpp::EK::InitList;
+                list->line = s->line;
+                list->kids = d.args;
+                if (d.args.size() == 1 && d.args[0]->k == cpp::EK::InitList)
+                    list = d.args[0];
+                init = list;
+            }
+            std::vector<cpp::ExprP> args = d.args;
+            if (braced && args.size() == 1 && args[0]->k == cpp::EK::InitList)
+                args = args[0]->kids;
+            declare(d.name, t, init, braced, args, s->line);
+        }
+        break;
+    case cpp::SK::Block:
+        scopes_.emplace_back();
+        for (const cpp::StmtP &x : s->body)
+            stmt(x);
+        destroyScopes(scopes_.size() - 1);
+        scopes_.pop_back();
+        break;
+    case cpp::SK::If:
+    {
+        if (s->condDecl)
+            fail("a declaration as the condition", s->line);
+        scopes_.emplace_back();
+        if (s->init)
+            stmt(s->init);
+        int other = a.newLabel(), end = a.newLabel();
+        cond(s->expr, other);
+        stmt(s->then);
+        a.jmp(end);
+        a.bind(other);
+        if (s->els)
+            stmt(s->els);
+        a.bind(end);
+        destroyScopes(scopes_.size() - 1);
+        scopes_.pop_back();
+        break;
+    }
+    case cpp::SK::While:
+    {
+        if (s->condDecl)
+            fail("a declaration as the condition", s->line);
+        int top = a.newLabel(), end = a.newLabel();
+        a.bind(top);
+        cond(s->expr, end);
+        loops_.push_back(Loop{end, top, scopes_.size()});
+        stmt(s->then);
+        loops_.pop_back();
+        a.jmp(top);
+        a.bind(end);
+        break;
+    }
+    case cpp::SK::Do:
+    {
+        int top = a.newLabel(), next = a.newLabel(), end = a.newLabel();
+        a.bind(top);
+        loops_.push_back(Loop{end, next, scopes_.size()});
+        stmt(s->then);
+        loops_.pop_back();
+        a.bind(next);
+        cond(s->expr, end);
+        a.jmp(top);
+        a.bind(end);
+        break;
+    }
+    case cpp::SK::For:
+    {
+        scopes_.emplace_back();
+        if (s->init)
+            stmt(s->init);
+        int top = a.newLabel(), next = a.newLabel(), end = a.newLabel(), out = a.newLabel();
+        a.bind(top);
+        if (s->cond2)
+            cond(s->cond2, end);
+        loops_.push_back(Loop{out, next, scopes_.size()});
+        stmt(s->then);
+        loops_.pop_back();
+        a.bind(next);
+        if (s->step)
+        {
+            expr(s->step);
+            endFullExpr();
+        }
+        a.jmp(top);
+        a.bind(out);
+        a.bind(end);
+        destroyScopes(scopes_.size() - 1);
+        scopes_.pop_back();
+        break;
+    }
+    case cpp::SK::Switch:
+    {
+        if (s->condDecl || s->init)
+            fail("switch with a declaration", s->line);
+        NT st = expr(s->expr);
+        if (st->cat != C_INT)
+            fail("switch on a non-integer", s->line);
+        endFullExpr();
+        Kind k = promote(st->kind);
+        int slot = newSlot(tInt(K_I64));
+        a.store(slot, RAX);
+        int end = a.newLabel(), deflt = -1;
+        std::vector<int> labels;
+        for (const cpp::StmtP &x : s->body)
+        {
+            if (x->k == cpp::SK::Case)
+            {
+                int l = a.newLabel();
+                labels.push_back(l);
+                NT ct = expr(x->expr);
+                Kind cmpK = common(k, ct->kind);
+                wrap(cmpK);
+                a.movRR(RCX, RAX);
+                a.load(RAX, slot);
+                wrap(cmpK);
+                a.alu(0x39, RAX, RCX);
+                a.jcc(CC_E, l);
+            }
+            else if (x->k == cpp::SK::Default)
+            {
+                deflt = a.newLabel();
+                labels.push_back(deflt);
+            }
+        }
+        a.jmp(deflt >= 0 ? deflt : end);
+        scopes_.emplace_back();
+        // break leaves the switch; continue still belongs to the enclosing loop
+        int cont = loops_.empty() ? -1 : loops_.back().continueLabel;
+        loops_.push_back(Loop{end, cont, scopes_.size() - 1});
+        size_t next = 0;
+        for (const cpp::StmtP &x : s->body)
+        {
+            if (x->k == cpp::SK::Case || x->k == cpp::SK::Default)
+                a.bind(labels[next++]);
+            else
+                stmt(x);
+        }
+        loops_.pop_back();
+        destroyScopes(scopes_.size() - 1);
+        scopes_.pop_back();
+        a.bind(end);
+        break;
+    }
+    case cpp::SK::Break:
+        if (loops_.empty())
+            fail("break outside a loop", s->line);
+        destroyScopes(loops_.back().scopeDepth);
+        a.jmp(loops_.back().breakLabel);
+        break;
+    case cpp::SK::Continue:
+    {
+        int i = (int)loops_.size() - 1;
+        if (i < 0 || loops_[i].continueLabel < 0)
+            fail("continue outside a loop", s->line);
+        // a switch's entry carries the enclosing loop's continue label
+        size_t depth = loops_[i].scopeDepth;
+        for (int k = i; k >= 0; --k)
+            if (loops_[k].continueLabel == loops_[i].continueLabel)
+                depth = loops_[k].scopeDepth;
+        destroyScopes(depth);
+        a.jmp(loops_[i].continueLabel);
+        break;
+    }
+    case cpp::SK::Return:
+        if (s->expr)
+        {
+            if (retType_->cat == C_CLASS && !nrvoName_.empty() && s->expr->k == cpp::EK::Name &&
+                s->expr->name[0] == nrvoName_)
+                ; // already there
+            else if (retType_->cat == C_CLASS)
+            {
+                // build the result in the caller's place
+                a.load(RAX, retPtrOff_);
+                int slot = newSlot(tPtr(tVoid()));
+                a.store(slot, RAX);
+                ThisSrc rs;
+                rs.kind = TH_INDIRECT;
+                rs.off = slot;
+                std::vector<cpp::ExprP> one = {s->expr};
+                bool braced = s->expr->k == cpp::EK::InitList;
+                if (braced)
+                    one = s->expr->kids;
+                construct(rs, retType_->cls, one, braced, s->line);
+            }
+            else if (retType_->cat == C_REF)
+                bindRef(retType_, s->expr, s->line);
+            else
+            {
+                NT t = expr(s->expr);
+                if (t->cat == C_REF)
+                    t = t->elem;
+                if (retType_->cat == C_PTR && (t->cat == C_PTR || (t->cat == C_INT && s->expr->k == cpp::EK::Int)))
+                    convert(retType_, t->cat == C_PTR ? t : retType_, s->line);
+                else if (retType_->cat != C_VOID)
+                    convert(retType_, t, s->line);
+            }
+            endFullExpr();
+        }
+        destroyScopes(0);
+        a.jmp(retLabel_);
+        break;
+    default:
+        fail("this statement (not yet)", s->line);
+    }
+}
+
+} // namespace
+
+std::string compileExe(const std::string &path, const std::string &source)
+{
+    cpp::Preprocessed pp = cpp::preprocess(path, source);
+    cpp::Program prog = cpp::parse(pp);
+    Gen g;
+    g.program(prog);
+    return writePe(g.a, g.entry, g.imports, g.data);
+}
+
+} // namespace native
+
+int nativeCompileFile(const std::string &path, const std::string &outPath)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        std::cerr << path << ": error: cannot open\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    try
+    {
+        std::string exe = native::compileExe(path, ss.str());
+        std::ofstream out(outPath, std::ios::binary);
+        out << exe;
+        return out ? 0 : 1;
+    }
+    catch (const cpp::Unsupported &u)
+    {
+        std::cerr << (u.file.empty() ? path : u.file) << ":" << u.line << ": error: " << u.what() << "\n";
+        return 1;
+    }
+}

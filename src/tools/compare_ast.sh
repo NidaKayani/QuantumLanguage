@@ -6,7 +6,7 @@
 cd "$(dirname "$0")/../.."
 DIR=${1:-examples}
 OUT=${2:-build/selfhost-compare}
-QRUN=build/qrun.exe
+QRUN=${QRUN:-build/qrun.exe}
 mkdir -p "$OUT/ast"
 : > "$OUT/ast_mismatch.txt"
 ok=0

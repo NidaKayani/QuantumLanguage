@@ -1,0 +1,224 @@
+// quantum: cpp
+// Support for the Quantum-written compiler in src/: the C++ front-end's
+// tokens and bytecode to check it against, and a runner for the bytecode
+// files it writes (qrun --dump-tokens / --emit-qbc / --exec).
+#include "AstDump.h.sa"
+#include "Cli.h.sa"
+#include "Dialect.h.sa"
+#include "Disassembler.h.sa"
+#include "Error.h.sa"
+#include "Lexer.h.sa"
+#include "Parser.h.sa"
+#include "Pipeline.h.sa"
+#include "QbcCore.h.sa"
+#include "Serializer.h.sa"
+#include "Vm.h.sa"
+#include "../cpp/Cpp.h.sa"
+
+#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+namespace
+{
+bool readText(const std::string &path, std::string &out)
+{
+    std::ifstream in(path); // text mode, as runFile reads a program
+    if (!in)
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+} // namespace
+
+int dumpTokens(const std::string &path)
+{
+    std::string source;
+    if (!readText(path, source))
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    try
+    {
+        Lexer lexer(source);
+        for (const Token &t : lexer.tokenize())
+            std::cout << static_cast<int>(t.type) << "\t" << t.line << "\t" << t.col << "\t" << selfhostEscape(t.value)
+                      << "\n";
+    }
+    catch (const QuantumError &e)
+    {
+        std::cout << "ERROR\t" << e.kind << ": " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+int dumpAst(const std::string &path)
+{
+    std::string source;
+    if (!readText(path, source))
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    try
+    {
+        Lexer lexer(source);
+        Parser parser(lexer.tokenize());
+        const std::string ext = path.size() >= 3 ? path.substr(path.size() - 3) : "";
+        parser.setPythonSource(ext == ".py" || ext == ".PY");
+        auto ast = parser.parse();
+        dumpAstTree(std::cout, ast.get());
+    }
+    catch (const ParseError &e)
+    {
+        std::cout << "ERROR\tParseError: " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+    catch (const QuantumError &e)
+    {
+        std::cout << "ERROR\t" << e.kind << ": " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+    return 0;
+}
+
+int emitBytecodeFile(const std::string &path, const std::string &outPath)
+{
+    std::string source;
+    if (!readText(path, source))
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    try
+    {
+        auto chunk = compileSource(applyDialect(source, path), path, false);
+        auto bytes = Serializer::serialize(chunk);
+        std::ofstream out(outPath, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return out ? 0 : 1;
+    }
+    catch (const ParseError &e)
+    {
+        std::cerr << path << ":" << e.line << ": ParseError: " << e.what() << "\n";
+        return 1;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Error] " << e.what() << "\n";
+        return 1;
+    }
+}
+
+int emitCoreBytecodeFile(const std::string &path, const std::string &outPath)
+{
+    std::string source;
+    if (!readText(path, source))
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    try
+    {
+        const std::string ext = path.size() >= 3 ? path.substr(path.size() - 3) : "";
+        auto bytes = coreBytecode(source, ext == ".py" || ext == ".PY");
+        std::ofstream out(outPath, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return out ? 0 : 1;
+    }
+    catch (const ParseError &e)
+    {
+        std::cout << "ERROR\tParseError: " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+    catch (const QuantumError &e)
+    {
+        std::cout << "ERROR\t" << e.kind << ": " << e.what() << " (line " << e.line << ")\n";
+        return 1;
+    }
+}
+
+int dumpCppAst(const std::string &path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    try
+    {
+        ASTNodePtr program = cpp::compileProgram(path, ss.str());
+        dumpAstTree(std::cout, program.get());
+        return 0;
+    }
+    catch (const cpp::Unsupported &u)
+    {
+        std::cout << "UNSUPPORTED\t" << u.what() << " (line " << u.line << ")\n";
+        return 1;
+    }
+    catch (const std::exception &e)
+    {
+        std::cout << "ERROR\t" << e.what() << "\n";
+        return 1;
+    }
+}
+
+int disassembleBytecodeFile(const std::string &path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open bytecode file: " << path << "\n";
+        return 1;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try
+    {
+        disassembleChunk(*Serializer::deserialize(bytes), std::cout);
+        return 0;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Error] " << e.what() << "\n";
+        return 1;
+    }
+}
+
+int execBytecodeFile(const std::string &path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open bytecode file: " << path << "\n";
+        return 1;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    try
+    {
+        auto chunk = Serializer::deserialize(bytes);
+        VM vm;
+        vm.run(chunk);
+        return 0;
+    }
+    catch (const QuantumError &e)
+    {
+        std::cerr << Colors::RED << Colors::BOLD << "\n  X " << e.kind << Colors::RESET;
+        if (e.line > 0)
+            std::cerr << " at line " << e.line;
+        std::cerr << "\n    " << e.what() << "\n\n";
+        return 1;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Fatal] " << e.what() << "\n";
+        return 1;
+    }
+}

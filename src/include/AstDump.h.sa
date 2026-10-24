@@ -1,0 +1,16 @@
+// quantum: cpp
+#pragma once
+// The self-hosting dumps (qrun --dump-tokens / --dump-ast), shared with the
+// drivers in src/tools/selfhost/ that run this code under Quantum's own
+// C/C++ front-end.
+#include "AST.h.sa"
+#include <ostream>
+#include <string>
+
+// A value on one line: \ \n \t \r and other control bytes escaped.
+std::string selfhostEscape(const std::string &s);
+
+// The tree, one node per line, children indented under `.field` labels.
+// Field order and spelling follow src/ast.sa, so src/tools/astdump.sa prints
+// the Quantum parser's tree the same way.
+void dumpAstTree(std::ostream &out, const ASTNode *root);

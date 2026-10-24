@@ -1,0 +1,406 @@
+// quantum: cpp
+#include "X64.h.sa"
+
+#include <stdexcept>
+
+namespace native
+{
+
+void Asm::byte(int b) { code.push_back((char)(b & 255)); }
+
+void Asm::dword(int32_t v)
+{
+    uint32_t u = (uint32_t)v;
+    for (int i = 0; i < 4; ++i)
+        byte((int)((u >> (8 * i)) & 255));
+}
+
+void Asm::qword(int64_t v)
+{
+    uint64_t u = (uint64_t)v;
+    for (int i = 0; i < 8; ++i)
+        byte((int)((u >> (8 * i)) & 255));
+}
+
+void Asm::patch32(int pos, int32_t v)
+{
+    uint32_t u = (uint32_t)v;
+    for (int i = 0; i < 4; ++i)
+        code[pos + i] = (char)((u >> (8 * i)) & 255);
+}
+
+int Asm::newLabel()
+{
+    labels_.push_back(-1);
+    return (int)labels_.size() - 1;
+}
+
+void Asm::bind(int label) { labels_[label] = size(); }
+
+void Asm::resolve()
+{
+    for (const Fixup &f : fixups_)
+    {
+        int target = labels_[f.label];
+        if (target < 0)
+            throw std::runtime_error("native: jump to an unbound label");
+        patch32(f.pos, target - (f.pos + 4));
+    }
+    fixups_.clear();
+}
+
+// REX prefix: W (64-bit operand), R (reg >= 8), B (rm >= 8); none when not needed
+void Asm::rex(bool w, int reg, int rm)
+{
+    int b = 0x40 | (w ? 8 : 0) | (reg >= 8 ? 4 : 0) | (rm >= 8 ? 1 : 0);
+    if (b != 0x40)
+        byte(b);
+}
+
+// ModRM for [rbp+disp32] with `reg` in the reg field
+void Asm::modrmRbp(int reg, int disp)
+{
+    byte(0x80 | ((reg & 7) << 3) | 5);
+    dword(disp);
+}
+
+void Asm::push(int r)
+{
+    rex(false, 0, r);
+    byte(0x50 + (r & 7));
+}
+
+void Asm::pop(int r)
+{
+    rex(false, 0, r);
+    byte(0x58 + (r & 7));
+}
+
+void Asm::movRR(int dst, int src)
+{
+    rex(true, src, dst);
+    byte(0x89);
+    byte(0xC0 | ((src & 7) << 3) | (dst & 7));
+}
+
+void Asm::movImm(int r, int64_t v)
+{
+    if (v >= -2147483648LL && v <= 2147483647LL)
+    {
+        rex(true, 0, r);
+        byte(0xC7);
+        byte(0xC0 | (r & 7));
+        dword((int32_t)v);
+        return;
+    }
+    rex(true, 0, r);
+    byte(0xB8 + (r & 7));
+    qword(v);
+}
+
+void Asm::load(int r, int disp)
+{
+    rex(true, r, RBP);
+    byte(0x8B);
+    modrmRbp(r, disp);
+}
+
+void Asm::store(int disp, int r)
+{
+    rex(true, r, RBP);
+    byte(0x89);
+    modrmRbp(r, disp);
+}
+
+void Asm::lea(int r, int disp)
+{
+    rex(true, r, RBP);
+    byte(0x8D);
+    modrmRbp(r, disp);
+}
+
+// [addr] with no displacement: rsp needs a SIB byte, rbp a zero disp8
+static void indirect(Asm &a, int opcode, int r, int addr)
+{
+    int b = 0x48 | (r >= 8 ? 4 : 0) | (addr >= 8 ? 1 : 0);
+    a.byte(b);
+    a.byte(opcode);
+    if ((addr & 7) == 4)
+    {
+        a.byte(0x04 | ((r & 7) << 3));
+        a.byte(0x24);
+    }
+    else if ((addr & 7) == 5)
+    {
+        a.byte(0x45 | ((r & 7) << 3));
+        a.byte(0);
+    }
+    else
+        a.byte(((r & 7) << 3) | (addr & 7));
+}
+
+void Asm::loadInd(int r, int addr) { indirect(*this, 0x8B, r, addr); }
+void Asm::storeInd(int addr, int r) { indirect(*this, 0x89, r, addr); }
+
+void Asm::leaData(int r, int dataOff)
+{
+    rex(true, r, 0);
+    byte(0x8D);
+    byte(((r & 7) << 3) | 5); // [rip+disp32]
+    dataRefs.push_back({size(), dataOff});
+    dword(0);
+}
+
+void Asm::loadRcx(int size, bool isSigned)
+{
+    switch (size)
+    {
+    case 1:
+        if (isSigned)
+            byte(0x48);
+        byte(0x0F);
+        byte(isSigned ? 0xBE : 0xB6);
+        break;
+    case 2:
+        if (isSigned)
+            byte(0x48);
+        byte(0x0F);
+        byte(isSigned ? 0xBF : 0xB7);
+        break;
+    case 4:
+        if (isSigned)
+            byte(0x48);
+        byte(isSigned ? 0x63 : 0x8B);
+        break;
+    default:
+        byte(0x48);
+        byte(0x8B);
+        break;
+    }
+    byte(0x01); // rax, [rcx]
+}
+
+void Asm::storeRcx(int size)
+{
+    if (size == 2)
+        byte(0x66);
+    if (size == 8)
+        byte(0x48);
+    byte(size == 1 ? 0x88 : 0x89);
+    byte(0x01); // [rcx], al/ax/eax/rax
+}
+
+void Asm::addImm(int r, int32_t v)
+{
+    rex(true, 0, r);
+    byte(0x81);
+    byte(0xC0 | (r & 7));
+    dword(v);
+}
+
+void Asm::imulImm(int r, int32_t v)
+{
+    rex(true, r, r);
+    byte(0x69);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+    dword(v);
+}
+
+void Asm::alu(int opcode, int dst, int src)
+{
+    rex(true, src, dst);
+    byte(opcode);
+    byte(0xC0 | ((src & 7) << 3) | (dst & 7));
+}
+
+void Asm::imul(int dst, int src)
+{
+    rex(true, dst, src);
+    byte(0x0F);
+    byte(0xAF);
+    byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+}
+
+void Asm::cqo()
+{
+    byte(0x48);
+    byte(0x99);
+}
+
+void Asm::idiv(int r)
+{
+    rex(true, 0, r);
+    byte(0xF7);
+    byte(0xF8 | (r & 7));
+}
+
+void Asm::div(int r)
+{
+    rex(true, 0, r);
+    byte(0xF7);
+    byte(0xF0 | (r & 7));
+}
+
+void Asm::neg(int r)
+{
+    rex(true, 0, r);
+    byte(0xF7);
+    byte(0xD8 | (r & 7));
+}
+
+void Asm::notr(int r)
+{
+    rex(true, 0, r);
+    byte(0xF7);
+    byte(0xD0 | (r & 7));
+}
+
+void Asm::shiftCl(int ext, int r)
+{
+    rex(true, 0, r);
+    byte(0xD3);
+    byte(0xC0 | (ext << 3) | (r & 7));
+}
+
+void Asm::test(int a, int b)
+{
+    rex(true, b, a);
+    byte(0x85);
+    byte(0xC0 | ((b & 7) << 3) | (a & 7));
+}
+
+void Asm::setcc(int cc)
+{
+    byte(0x0F);
+    byte(0x90 + cc);
+    byte(0xC0); // al
+    byte(0x0F);
+    byte(0xB6);
+    byte(0xC0); // movzx eax, al
+}
+
+void Asm::movsxd(int r)
+{
+    rex(true, r, r);
+    byte(0x63);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::movzx32(int r)
+{
+    rex(false, r, r);
+    byte(0x89);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::movsx8(int r)
+{
+    rex(true, r, r);
+    byte(0x0F);
+    byte(0xBE);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::movzx8(int r)
+{
+    rex(true, r, r);
+    byte(0x0F);
+    byte(0xB6);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::movsx16(int r)
+{
+    rex(true, r, r);
+    byte(0x0F);
+    byte(0xBF);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::movzx16(int r)
+{
+    rex(true, r, r);
+    byte(0x0F);
+    byte(0xB7);
+    byte(0xC0 | ((r & 7) << 3) | (r & 7));
+}
+
+void Asm::subRsp(int n)
+{
+    byte(0x48);
+    byte(0x81);
+    byte(0xEC);
+    dword(n);
+}
+
+void Asm::addRsp(int n)
+{
+    byte(0x48);
+    byte(0x81);
+    byte(0xC4);
+    dword(n);
+}
+
+void Asm::storeRsp(int disp, int r)
+{
+    rex(true, r, RSP);
+    byte(0x89);
+    byte(0x84 | ((r & 7) << 3));
+    byte(0x24);
+    dword(disp);
+}
+
+void Asm::jmp(int label)
+{
+    byte(0xE9);
+    fixups_.push_back({size(), label});
+    dword(0);
+}
+
+void Asm::jcc(int cc, int label)
+{
+    byte(0x0F);
+    byte(0x80 + cc);
+    fixups_.push_back({size(), label});
+    dword(0);
+}
+
+void Asm::call(int label)
+{
+    byte(0xE8);
+    fixups_.push_back({size(), label});
+    dword(0);
+}
+
+void Asm::callImport(int import)
+{
+    byte(0xFF);
+    byte(0x15);
+    importRefs.push_back({size(), import});
+    dword(0);
+}
+
+void Asm::callReg(int r)
+{
+    rex(false, 0, r);
+    byte(0xFF);
+    byte(0xD0 | (r & 7));
+}
+
+Asm::Mark Asm::mark() const
+{
+    return Mark{size(), (int)fixups_.size(), (int)importRefs.size(), (int)dataRefs.size()};
+}
+
+void Asm::rewind(const Mark &m)
+{
+    code.resize(m.code);
+    fixups_.resize(m.fixups);
+    importRefs.resize(m.imports);
+    dataRefs.resize(m.data);
+}
+
+void Asm::leave() { byte(0xC9); }
+void Asm::ret() { byte(0xC3); }
+
+} // namespace native

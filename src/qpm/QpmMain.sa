@@ -1,0 +1,440 @@
+// quantum: cpp
+// qpm — the Quantum Package Manager.
+//
+// A standalone, from-scratch npm-compatible installer, publisher + script
+// runner: it talks to the (npm-compatible) QPM registry directly over HTTPS
+// (via WinHTTP) and packs/unpacks tarballs itself (via zlib + a small tar
+// reader/writer), so it needs neither npm nor Node.js installed to install or
+// publish packages. Running the
+// dependencies' own scripts (`qpm run` / `qpm start`) still shells out to
+// whatever the script names — same as npm, qpm doesn't include a JS engine.
+
+#include "QpmBuild.h.sa"
+#include "QpmColor.h.sa"
+#include "QpmManifest.h.sa"
+#include "QpmPublish.h.sa"
+#include "QpmRegistry.h.sa"
+#include "QpmResolver.h.sa"
+#include "QpmScripts.h.sa"
+#include "QpmSearch.h.sa"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+    void printHelp()
+    {
+        std::cout <<
+            "qpm - Quantum Package Manager\n"
+            "\n"
+            "Usage:\n"
+            "  qpm init                    creates a package.json (asks for each field)\n"
+            "  qpm init -y                 creates a package.json with defaults, no questions\n"
+            "  qpm install                 installs all dependencies from the manifest\n"
+            "  qpm install <pkg> [...]     adds and installs one or more packages: Quantum\n"
+            "                              packages into ./quantum_qubits, npm ones into\n"
+            "                              ./node_modules (where Node.js looks for them)\n"
+            "  qpm install --no-dev        skip devDependencies\n"
+            "  qpm i / qpm add             aliases for `qpm install`\n"
+            "  qpm run <script>            runs a manifest \"scripts\" entry\n"
+            "  qpm start                   shorthand for `qpm run start`\n"
+            "  qpm build                   runs the \"build\" script, or builds a C/C++ project\n"
+            "                              (CMakeLists.txt / Makefile / plain sources) natively\n"
+            "  qpm build [name] --run      builds, then runs the program (args after --)\n"
+            "  qpm build --debug           debug build (default --release)\n"
+            "  qpm build --clean           removes the build outputs\n"
+            "  qpm build --cmake | --make | --direct   picks how a C/C++ project is built\n"
+            "  qpm build -j <n> / -v       parallel compiles / print each command\n"
+            "  qpm search [<term>...]      searches the registry's names, descriptions and keywords\n"
+            "                              (no term lists every package; =<user> finds a user's)\n"
+            "  qpm search --npm <term>     searches npm instead (install falls back to it)\n"
+            "  qpm search --json | --parseable | --long | --limit <n> | --no-description\n"
+            "  qpm view [<pkg>[@<ver>]]    shows a package's details (aliases: info, show)\n"
+            "  qpm view <pkg> <field>...   prints fields only, e.g. `qpm view minidb version`\n"
+            "  qpm view <pkg> --json       the package document as JSON\n"
+            "  qpm publish                 packs this package and uploads it to the registry\n"
+            "  qpm publish --dry-run       shows what would be published, uploads nothing\n"
+            "  qpm publish --token <t>     publish with this token instead of the saved login\n"
+            "  qpm pack                    writes <name>-<version>.tgz without publishing\n"
+            "  qpm login                   asks for your API token (Profile on the website, Copy\n"
+            "                              token) and saves it, so you only log in once\n"
+            "  qpm login <token>           the same without the question\n"
+            "  qpm login --password        logs in with username and password instead\n"
+            "  qpm logout                  forgets the saved token\n"
+            "  qpm whoami                  prints the username you're logged in as\n"
+            "  qpm auth                    shows which profile qpm is attached to: account, email,\n"
+            "                              packages, and whether the saved token works / expires\n"
+            "  qpm auth login | logout     same as qpm login / qpm logout\n"
+            "  qpm --help                  show this help\n"
+            "  qpm --version               show version\n"
+            "\n"
+            "Any command takes --registry <url> to use another registry API for that run,\n"
+            "and --no-color for plain output.\n"
+            "\n"
+            "Manifest (the first one found in the project folder is used):\n"
+            "  package.qon       JSON like package.json, or requirements style\n"
+            "  package.json      npm's manifest\n"
+            "  requirements.txt  one `name==1.2.3` / `name ^1.2` per line\n"
+            "\n"
+            "Registry: https://qpm.quantumlogicslimited.com (browse packages, sign up, publish)\n"
+            "\n"
+            "Environment:\n"
+            "  QPM_REGISTRY   registry API base (default https://qpm.quantumlogicslimited.com/api/registry/;\n"
+            "                 a local backend is http://localhost:8000/api/registry/)\n"
+            "  QPM_UPSTREAM   where install looks up packages the registry doesn't have\n"
+            "                 (default https://registry.npmjs.org/, \"none\" to turn off)\n"
+            "  QPM_TOKEN      auth token, overrides the one saved by `qpm login`\n"
+            "  NO_COLOR       turns off colored output\n"
+            "\n"
+            "qpm downloads packages straight from the registry — no npm or Node.js\n"
+            "install required. Running a script (`qpm run`/`qpm start`) still shells\n"
+            "out to whatever that script names (often `node ...`), so a script that\n"
+            "itself invokes Node.js still needs Node.js present to execute.\n";
+    }
+
+    int runPublishCommand(const std::vector<std::string> &args, const std::string &cwd)
+    {
+        qpm::PublishOptions opts;
+        opts.projectDir = cwd;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--dry-run")
+            {
+                opts.dryRun = true;
+            }
+            else if (args[i] == "--token" && i + 1 < args.size())
+            {
+                opts.token = args[++i];
+            }
+            else if (args[i] == "--access" && i + 1 < args.size())
+            {
+                ++i; // npm habit; every package on the QPM registry is public
+            }
+            else
+            {
+                std::cerr << "[qpm] unknown publish option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm publish [--dry-run] [--token <token>] [--registry <url>]\n";
+                return 1;
+            }
+        }
+        return qpm::runPublish(opts);
+    }
+
+    // `qpm login ...` (first = 1) or `qpm auth login ...` (first = 2).
+    int runLoginCommand(const std::vector<std::string> &args, size_t first)
+    {
+        qpm::LoginOptions opts;
+        for (size_t i = first; i < args.size(); ++i)
+        {
+            if (args[i] == "--password" || args[i] == "-p")
+                opts.password = true;
+            else if (args[i] == "--token" && i + 1 < args.size())
+                opts.token = args[++i];
+            else if (!args[i].empty() && args[i][0] != '-' && opts.token.empty())
+                opts.token = args[i];
+            else
+            {
+                std::cerr << "[qpm] unknown login option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm login [<token>] [--password]\n";
+                return 1;
+            }
+        }
+        return qpm::runLogin(opts);
+    }
+
+    // True for "--name=value", with "value" put in `value`.
+    bool optionValue(const std::string &a, const std::string &name, std::string &value)
+    {
+        if (a.compare(0, name.size() + 1, name + "=") != 0)
+            return false;
+        value = a.substr(name.size() + 1);
+        return true;
+    }
+
+    int runSearchCommand(const std::vector<std::string> &args)
+    {
+        qpm::SearchOptions opts;
+        const char *usage = "[qpm] usage: qpm search [<term>...] [--npm] [--json|--parseable] [--long]"
+                            " [--limit <n>] [--no-description] [--no-color]\n";
+        bool termsOnly = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            std::string value;
+            if (termsOnly || a.empty() || a[0] != '-' || a == "-")
+                opts.terms.push_back(a);
+            else if (a == "--")
+                termsOnly = true;
+            else if (a == "--json")
+                opts.json = true;
+            else if (a == "--parseable" || a == "-p")
+                opts.parseable = true;
+            else if (a == "--long" || a == "-l")
+                opts.longFormat = true;
+            else if (a == "--no-description")
+                opts.description = false;
+            else if (a == "--no-color")
+                opts.color = false;
+            else if (a == "--npm")
+                opts.npm = true;
+            else if ((a == "--limit" || a == "--searchlimit") && i + 1 < args.size())
+                opts.limit = std::atoi(args[++i].c_str());
+            else if (optionValue(a, "--limit", value) || optionValue(a, "--searchlimit", value))
+                opts.limit = std::atoi(value.c_str());
+            else
+            {
+                std::cerr << "[qpm] unknown search option: " << a << "\n" << usage;
+                return 1;
+            }
+        }
+        if (opts.limit <= 0)
+        {
+            std::cerr << "[qpm] --limit needs a number above 0\n" << usage;
+            return 1;
+        }
+        return qpm::runSearch(opts);
+    }
+
+    int runViewCommand(const std::vector<std::string> &args, const std::string &cwd)
+    {
+        qpm::ViewOptions opts;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            if (a == "--json")
+                opts.json = true;
+            else if (a == "--no-color")
+                opts.color = false;
+            else if (a.size() > 1 && a[0] == '-')
+            {
+                std::cerr << "[qpm] unknown view option: " << a << "\n"
+                          << "[qpm] usage: qpm view [<pkg>[@<version>]] [<field>...] [--json]\n";
+                return 1;
+            }
+            else if (opts.spec.empty())
+                opts.spec = a;
+            else
+                opts.fields.push_back(a);
+        }
+        // Like npm, no package (or ".") means the one this folder's manifest describes.
+        if (opts.spec.empty() || opts.spec == ".")
+        {
+            fs::path manifest = qpm::findManifest(cwd);
+            std::string name;
+            try
+            {
+                if (!manifest.empty())
+                    name = qpm::loadManifest(manifest).data.get("name").asString();
+            }
+            catch (const std::exception &)
+            {
+            }
+            if (name.empty())
+            {
+                std::cerr << "[qpm] usage: qpm view <pkg>[@<version>] [<field>...]\n"
+                          << "[qpm] (without <pkg> it shows this folder's package, but there's no named package here)\n";
+                return 1;
+            }
+            opts.spec = name;
+        }
+        return qpm::runView(opts);
+    }
+
+    int runBuildCommand(const std::vector<std::string> &args, const std::string &cwd)
+    {
+        qpm::BuildOptions opts;
+        opts.projectDir = cwd;
+        const char *usage = "[qpm] usage: qpm build [name] [--run] [--debug|--release] [--clean]"
+                            " [--cmake|--make|--direct] [-j <n>] [-v] [-- <program args>]\n";
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            const std::string &a = args[i];
+            if (a == "--")
+            {
+                opts.runArgs.assign(args.begin() + static_cast<std::ptrdiff_t>(i) + 1, args.end());
+                opts.run = true;
+                break;
+            }
+            if (a == "--run" || a == "-r")
+                opts.run = true;
+            else if (a == "--debug")
+                opts.release = false;
+            else if (a == "--release")
+                opts.release = true;
+            else if (a == "--clean")
+                opts.clean = true;
+            else if (a == "--verbose" || a == "-v")
+                opts.verbose = true;
+            else if (a == "--cmake")
+                opts.backend = qpm::BuildBackend::CMake;
+            else if (a == "--make")
+                opts.backend = qpm::BuildBackend::Make;
+            else if (a == "--direct")
+                opts.backend = qpm::BuildBackend::Direct;
+            else if ((a == "-j" || a == "--jobs") && i + 1 < args.size())
+                opts.jobs = std::atoi(args[++i].c_str());
+            else if (a.size() > 2 && a.compare(0, 2, "-j") == 0)
+                opts.jobs = std::atoi(a.c_str() + 2);
+            else if (!a.empty() && a[0] != '-' && opts.target.empty())
+                opts.target = a;
+            else
+            {
+                std::cerr << "[qpm] unknown build option: " << a << "\n" << usage;
+                return 1;
+            }
+        }
+        return qpm::runBuild(opts);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
+    std::vector<std::string> args(argv + 1, argv + argc);
+    std::string cwd = fs::current_path().string();
+
+    // --registry and --no-color work with every command, so they're taken out
+    // before dispatch (but not from a program's arguments after `--`).
+    for (size_t i = 0; i < args.size() && args[i] != "--";)
+    {
+        std::string url;
+        if (args[i] == "--no-color")
+        {
+            qpm::disableColor();
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (args[i] == "--registry")
+        {
+            size_t count = i + 1 < args.size() ? 2 : 1;
+            if (count == 2)
+                url = args[i + 1];
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i), args.begin() + static_cast<std::ptrdiff_t>(i + count));
+        }
+        else if (optionValue(args[i], "--registry", url))
+        {
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        else
+        {
+            ++i;
+            continue;
+        }
+        if (url.empty())
+        {
+            std::cerr << "[qpm] --registry needs a URL, e.g. --registry http://localhost:8000/api/registry/\n";
+            return 1;
+        }
+        qpm::setRegistryOverride(url);
+    }
+
+    if (args.empty() || args[0] == "--help" || args[0] == "-h")
+    {
+        printHelp();
+        return 0;
+    }
+    if (args[0] == "--version" || args[0] == "-v")
+    {
+        std::cout << "qpm 1.0.0\n";
+        return 0;
+    }
+
+    const std::string &cmd = args[0];
+
+    if (cmd == "install" || cmd == "i" || cmd == "add")
+    {
+        qpm::InstallOptions opts;
+        opts.projectDir = cwd;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--no-dev")
+                opts.includeDev = false;
+            else
+                opts.addPackages.push_back(args[i]);
+        }
+        return qpm::runInstall(opts);
+    }
+
+    if (cmd == "run" || cmd == "run-script")
+    {
+        if (args.size() < 2)
+        {
+            std::cerr << "[qpm] usage: qpm run <script>\n";
+            return 1;
+        }
+        return qpm::runScript(cwd, args[1]);
+    }
+
+    if (cmd == "start")
+        return qpm::runScript(cwd, "start");
+    if (cmd == "build")
+        return runBuildCommand(args, cwd);
+    if (cmd == "init")
+    {
+        bool yes = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "-y" || args[i] == "--yes")
+            {
+                yes = true;
+            }
+            else
+            {
+                std::cerr << "[qpm] unknown init option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm init [-y]\n";
+                return 1;
+            }
+        }
+        return qpm::runInit(cwd, yes);
+    }
+    if (cmd == "search" || cmd == "s" || cmd == "se" || cmd == "find")
+        return runSearchCommand(args);
+    if (cmd == "view" || cmd == "info" || cmd == "show" || cmd == "v")
+        return runViewCommand(args, cwd);
+    if (cmd == "publish")
+        return runPublishCommand(args, cwd);
+    if (cmd == "pack")
+        return qpm::runPack(cwd);
+    if (cmd == "login")
+        return runLoginCommand(args, 1);
+    if (cmd == "logout")
+        return qpm::runLogout();
+    if (cmd == "whoami")
+        return qpm::runWhoami();
+    if (cmd == "auth")
+    {
+        std::string sub = args.size() > 1 ? args[1] : "status";
+        if (sub == "status" && args.size() <= 2)
+            return qpm::runAuthStatus();
+        if (sub == "login")
+            return runLoginCommand(args, 2);
+        if (sub == "logout" && args.size() == 2)
+            return qpm::runLogout();
+        std::cerr << "[qpm] usage: qpm auth [status | login [<token>] [--password] | logout]\n";
+        return 1;
+    }
+
+    std::cerr << "[qpm] unknown command: " << cmd << "\n";
+    printHelp();
+    return 1;
+}

@@ -143,7 +143,7 @@ Pointers (`&var`, `*ptr`, `ptr->member`) are first-class values backed by `share
 
 ### Serializer
 
-`src/Serializer.cpp` converts a `Chunk` tree to a flat binary payload and back. It walks the chunk recursively — opcodes, operands, line info, and constants (including nested sub-chunks for functions) — writing everything to a `vector<uint8_t>`. This is the payload appended to `quantum_stub.exe` to create `hello.exe`.
+`src/Serializer.sa` converts a `Chunk` tree to a flat binary payload and back. It walks the chunk recursively — opcodes, operands, line info, and constants (including nested sub-chunks for functions) — writing everything to a `vector<uint8_t>`. This is the payload appended to `quantum_stub.exe` to create `hello.exe`.
 
 The trailer format is:
 
@@ -475,6 +475,12 @@ Runs every `.sa` file in the directory, prints `PASS` / `FAIL` per file with err
 
 ## Build
 
+### The compiler is written in Quantum
+
+Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp` is written in Quantum's C++ syntax; `X.h.sa` declares and `X.sa` defines. Quantum compiles these itself: `qrun src/tools/selfhost/quantumc.sa <file> <out.qbc>` is the whole compiler, compiled by Quantum and running on the Quantum VM. Fed its own source, it reproduces itself byte for byte (`src/tools/bootstrap.sh`).
+
+The native `.exe` binaries are still linked by a C++ compiler. CMake compiles the same `.sa` files with g++ (`-x c++`) until Quantum's native x86-64 backend replaces it.
+
 ### Prerequisites
 
 | Tool                    | Minimum version                       |
@@ -529,47 +535,23 @@ On non-MSVC targets, CMake passes `-static -static-libgcc -static-libstdc++` so 
 
 ```
 Quantum-Language/
-├── src/
-│   ├── main.cpp                  # Entry point — mode dispatch, REPL, bundler, test runner
-│   ├── lexer/
-│   │   ├── LexerCore.cpp
-│   │   ├── LexerReaders.cpp      # readNumber, readString, readIdentifier
-│   │   └── LexerTokenize.cpp
-│   ├── parser/
-│   │   ├── ParserCore.cpp
-│   │   ├── ParserStatements.cpp
-│   │   ├── ParserExpressions.cpp # Pratt precedence climbing
-│   │   └── ParserLiterals.cpp
-│   ├── compiler/
-│   │   ├── CompilerCore.cpp
-│   │   ├── CompilerStatements.cpp
-│   │   ├── CompilerExpressions.cpp
-│   │   └── CompilerFunctions.cpp # closure + upvalue compilation
-│   ├── vm/
-│   │   ├── VmCore.cpp
-│   │   ├── VmRun.cpp             # main dispatch loop
-│   │   ├── VmNatives.cpp         # all built-in function registrations
-│   │   ├── VmArrayMethods.cpp
-│   │   ├── VmDictMethods.cpp
-│   │   └── VmStringMethods.cpp
-│   ├── Serializer.cpp            # Chunk ↔ binary payload
-│   ├── Disassembler.cpp          # bytecode pretty-printer
-│   ├── TypeChecker.cpp           # static type warnings
-│   ├── Token.cpp
-│   └── Value.cpp
-├── include/
-│   ├── AST.h                     # variant-based AST node definitions
-│   ├── Compiler.h
-│   ├── Disassembler.h
-│   ├── Error.h                   # ParseError, RuntimeError, TypeError, …
-│   ├── Lexer.h
-│   ├── Opcode.h                  # Op enum + Instruction + Chunk
-│   ├── Parser.h
-│   ├── Serializer.h
-│   ├── Token.h
-│   ├── TypeChecker.h
-│   ├── Value.h                   # QuantumValue variant + all heap types
-│   └── Vm.h                      # VM, CallFrame, Closure, ExceptionHandler
+├── src/                          # The compiler's source — Quantum
+│   ├── main.sa                   # Entry point — mode dispatch, REPL, bundler, test runner
+│   ├── include/                  # Declarations (X.h.sa): AST, Token, Value, Vm, Opcode, ...
+│   ├── lexer/  parser/           # Lexer and Pratt parser
+│   ├── compiler/                 # AST → bytecode (closures, upvalues)
+│   ├── vm/                       # Bytecode VM, natives, C++/Java runtimes
+│   ├── cpp/                      # Typed C/C++ front-end
+│   ├── java/                     # Java front-end (+ prelude/*.jpl standard library)
+│   ├── dialect/                  # Python / JS / Ruby / C++ dialect passes
+│   ├── cli/                      # CLI, bundler, test runner, self-host hooks
+│   ├── qpm/                      # qpm package manager
+│   ├── Serializer.sa  Disassembler.sa  TypeChecker.sa  Pipeline.sa  ...
+│   ├── lexer.sa  parser*.sa  ast.sa   # an independent port in Quantum's own syntax
+│   └── tools/
+│       ├── selfhost/quantumc.sa  # the whole compiler as one program (self-compile driver)
+│       ├── bootstrap.sh          # fixed point: q1 == q2 == q3
+│       └── compare_selfhost.sh   # self-hosted vs g++-built output on every example
 ├── examples/                     # Runnable .sa programs
 │   ├── hello.sa
 │   ├── features.sa               # Full feature showcase

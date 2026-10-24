@@ -1,0 +1,17 @@
+// quantum: cpp
+#pragma once
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <string>
+
+// How a Quantum number prints: whole values below 1e15 as integers, others
+// with 10 significant digits (QuantumValue::toString, the AST dump).
+inline std::string formatNumber(double v)
+{
+    if (std::floor(v) == v && std::abs(v) < 1e15)
+        return std::to_string((long long)v);
+    std::ostringstream oss;
+    oss << std::setprecision(10) << v;
+    return oss.str();
+}

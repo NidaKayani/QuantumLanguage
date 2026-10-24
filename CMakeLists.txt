@@ -13,36 +13,61 @@ else()
     add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
-# The compiler's own source is Quantum, in src/. bootstrap/ holds the C++
-# implementation that builds the binaries until the Quantum one replaces it;
-# each part is removed there once its src/ counterpart passes the same tests.
-include_directories(${CMAKE_SOURCE_DIR}/bootstrap/include)
+# The compiler's own source is Quantum, in src/: files whose first line is
+# `// quantum: cpp` are Quantum in C++ syntax (X.h.sa declares, X.sa defines).
+# Until Quantum builds its own binaries, g++ compiles those same files as C++.
+include_directories(${CMAKE_SOURCE_DIR}/src/include)
 
 # ── Collect sources ────────────────────────────────────────────────────────────
-file(GLOB_RECURSE QUANTUM_SOURCES CONFIGURE_DEPENDS "bootstrap/src/*.cpp")
-list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*main_vm\\.cpp$")
-# qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
-# built from bootstrap/src/qpm/ separately — keep it out of the other 3 targets' sources.
-list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/bootstrap/src/qpm/.*\\.cpp$")
-# ...except its self-contained manifest readers: `# @use` package resolution
-# (bootstrap/src/ModuleResolver.cpp) reads package.qon / package.json / requirements.txt.
-list(APPEND QUANTUM_SOURCES
-    "${CMAKE_SOURCE_DIR}/bootstrap/src/qpm/QpmJson.cpp"
-    "${CMAKE_SOURCE_DIR}/bootstrap/src/qpm/QpmManifest.cpp"
-    "${CMAKE_SOURCE_DIR}/bootstrap/src/qpm/QpmSemver.cpp")
+file(GLOB_RECURSE ALL_SA CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.sa")
+set(CPP_SA)
+foreach(f ${ALL_SA})
+    if(f MATCHES "/src/tools/" OR f MATCHES "[.]h[.]sa$")
+        continue()
+    endif()
+    file(STRINGS "${f}" first LIMIT_COUNT 1)
+    if(first MATCHES "^// quantum: cpp")
+        list(APPEND CPP_SA "${f}")
+    endif()
+endforeach()
+set_source_files_properties(${CPP_SA} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xc++")
 
-# ── Java standard library: bootstrap/src/java/prelude/**/*.jpl, embedded as C++ ────────
-file(GLOB_RECURSE JAVA_PRELUDE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/bootstrap/src/java/prelude/*.jpl")
+set(QUANTUM_SOURCES ${CPP_SA})
+# qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
+# built from src/qpm/ separately — keep it out of the other 3 targets' sources...
+list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*[.]sa$")
+# ...except its self-contained manifest readers: `# @use` package resolution
+# (src/ModuleResolver.sa) reads package.qon / package.json / requirements.txt.
+list(APPEND QUANTUM_SOURCES
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmJson.sa"
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmManifest.sa"
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmSemver.sa")
+
+# ── Java standard library: src/java/prelude/**/*.jpl, embedded as C++ ────────
+file(GLOB_RECURSE JAVA_PRELUDE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/java/prelude/*.jpl")
 set(JAVA_PRELUDE_CPP "${CMAKE_BINARY_DIR}/generated/JavaPreludeData.cpp")
 add_custom_command(
     OUTPUT ${JAVA_PRELUDE_CPP}
-    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_SOURCE_DIR}/bootstrap/src/java/prelude -DOUT=${JAVA_PRELUDE_CPP}
+    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_SOURCE_DIR}/src/java/prelude -DOUT=${JAVA_PRELUDE_CPP}
             -P ${CMAKE_SOURCE_DIR}/cmake/EmbedJavaPrelude.cmake
     DEPENDS ${JAVA_PRELUDE_SOURCES} ${CMAKE_SOURCE_DIR}/cmake/EmbedJavaPrelude.cmake
     COMMENT "Embedding the Java prelude")
 # one target owns the generation, so parallel builds of the executables share it
 add_custom_target(java_prelude DEPENDS ${JAVA_PRELUDE_CPP})
 list(APPEND QUANTUM_SOURCES ${JAVA_PRELUDE_CPP})
+
+# ── C/C++ library headers: lib/cpp/* (<filesystem>, <regex>, ...), embedded as C++ ─
+file(GLOB_RECURSE CPP_LIB_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/lib/cpp/*")
+set(CPP_LIB_CPP "${CMAKE_BINARY_DIR}/generated/CppLibData.cpp")
+add_custom_command(
+    OUTPUT ${CPP_LIB_CPP}
+    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_SOURCE_DIR}/lib/cpp -DOUT=${CPP_LIB_CPP}
+            -P ${CMAKE_SOURCE_DIR}/cmake/EmbedCppLib.cmake
+    DEPENDS ${CPP_LIB_HEADERS} ${CMAKE_SOURCE_DIR}/cmake/EmbedCppLib.cmake
+    COMMENT "Embedding the C/C++ library headers")
+add_dependencies(java_prelude cpp_lib)
+add_custom_target(cpp_lib DEPENDS ${CPP_LIB_CPP})
+list(APPEND QUANTUM_SOURCES ${CPP_LIB_CPP})
 
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})
@@ -68,7 +93,8 @@ if(WIN32)
 endif()
 
 # ── qpm  — standalone npm-compatible package manager ──────────────────────────
-file(GLOB QPM_SOURCES CONFIGURE_DEPENDS "bootstrap/src/qpm/*.cpp")
+set(QPM_SOURCES ${CPP_SA})
+list(FILTER QPM_SOURCES INCLUDE REGEX ".*/src/qpm/.*[.]sa$")
 add_executable(qpm ${QPM_SOURCES})
 if(WIN32)
     # z: zlib (statically linked via the -static link flag above, same as the
