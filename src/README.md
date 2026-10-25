@@ -26,9 +26,28 @@ Checks:
 | `tools/bootstrap.sh`               | it compiles itself to a fixed point: q1 == q2 == q3      |
 | `tools/cpp_coverage.sh`            | which files compile on their own (strict, no fallback)   |
 
-## What still needs a C++ compiler
+## Building without a C++ compiler
 
-The `.exe` binaries (`quantum`, `qrun`, `quantum_stub`, `qpm`). CMake compiles
-these same `.sa` files with g++ (`-x c++`, see `../CMakeLists.txt`). Removing
-that step needs Quantum's native x86-64 PE backend, so that Quantum can compile
-the VM to machine code itself.
+`../build-quantum.bat` builds `quantum.exe` from this directory with no C++
+compiler, using `tools/selfhost/quantum.sa`, the compiler's command-line
+driver:
+- `../seed/quantum.exe` (the VM plus that driver as bytecode) compiles it;
+- the result compiles itself again.
+
+`--verify` checks the fixed point.
+
+The VM runtime (`vm/`, `Value.sa`) runs as native code inside the seed, so
+an edit to it needs the VM recompiled. Until `native/` can compile the VM, that
+step uses CMake and g++ (`../CMakeLists.txt`).
+
+## The native backend
+
+`native/` compiles C++ straight to an x86-64 Windows executable: no
+assembler, linker or C++ compiler (`quantum --native prog.cpp prog.exe`).
+`tools/native_test.sh` checks it against `../tests/native/`. It handles:
+- integers, floating point, pointers, arrays
+- classes with constructors, destructors, inheritance and virtual functions
+- references, operator overloading, function and class templates
+- lambdas, exceptions
+
+The standard library comes next, then the VM itself.

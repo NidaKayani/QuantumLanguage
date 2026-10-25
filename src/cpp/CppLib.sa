@@ -1727,6 +1727,21 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
             XV r = lowerExpr(args[0]);
             return mkxv(read(r), tVoid());
         }
+        if (m == "assign" && args.size() == 2 && probeType(args[0])->k == T::Iter)
+        {
+            // s.assign(first, last): s = std::string(first, last)
+            auto ty = std::make_shared<TypeName>();
+            ty->name = {"std", "string"};
+            ty->targs.emplace_back();
+            ty->targs.emplace_back();
+            auto ce = std::make_shared<Expr>();
+            ce->k = EK::Construct;
+            ce->line = ln;
+            ce->type = ty;
+            ce->kids = {args[0], args[1]};
+            XV v = lowerExpr(ce);
+            return mkxv(store(obj, read(v), ln), tVoid());
+        }
         if (m == "insert" || m == "erase" || m == "replace" || m == "resize" || m == "assign" || m == "swap")
         {
             std::vector<ASTNodePtr> a;

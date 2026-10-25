@@ -117,6 +117,11 @@ class Asm
     void movzx8(int r);            // r = zero-extend low 8 bits
     void movsx16(int r);           // r = sign-extend low 16 bits
     void movzx16(int r);           // r = zero-extend low 16 bits
+    // SSE: `prefix` 0F `op` with xmm/general registers in the ModRM fields
+    // (prefix 0 = none; w = REX.W for a 64-bit general register operand)
+    void sse(int prefix, int op, int reg, int rm, bool w = false);
+    void toXmm(int x, int r, bool is64);   // movq/movd xmm, r
+    void fromXmm(int r, int x, bool is64); // movq/movd r, xmm
     void subRsp(int n);
     void addRsp(int n);
     void storeRsp(int disp, int r); // [rsp+disp] = r
@@ -125,6 +130,9 @@ class Asm
     void call(int label);
     void callImport(int import);
     void callReg(int r); // call r
+    void jmpReg(int r);  // jmp r
+    void leaLabel(int r, int label);              // r = the address of a code label
+    void loadDisp(int r, int base, int disp8);    // r = [base+disp8]
     void leave();
     void ret();
 

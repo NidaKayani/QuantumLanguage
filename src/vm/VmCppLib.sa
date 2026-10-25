@@ -3,8 +3,13 @@
 // __q_* functions those headers declare. Each is a thin call into the host
 // library, so <filesystem> behaves exactly like the g++ build's.
 #include "Vm.h.sa"
+#include "Cli.h.sa"
+#include "Error.h.sa"
+#include "Pipeline.h.sa"
+#include "Serializer.h.sa"
 
 #include <filesystem>
+#include <iostream>
 #include <regex>
 #include <string>
 #include <system_error>
@@ -39,6 +44,43 @@ void VM::registerCppLibNatives()
         n->fn = std::move(fn);
         globals->define(name, QuantumValue(n));
     };
+
+    // ── Quantum itself, compiled by Quantum (src/tools/selfhost/quantum.sa) ──
+    // the running executable's path
+    reg("__q_self_exe", [](std::vector<QV>) -> QV { return QV(getExecutablePath()); });
+    // runs serialized bytecode (a string of its bytes) in a fresh VM with
+    // `args` as its command line; the exit status
+    reg("__q_run_qbc", [](std::vector<QV> a) -> QV
+        {
+        const std::string bytes = str(arg(a, 0));
+        std::vector<std::string> argv;
+        if (arg(a, 1).isArray())
+            for (const QV &x : *arg(a, 1).asArray())
+                argv.push_back(str(x));
+        std::vector<std::string> saved = g_scriptArgv;
+        g_scriptArgv = argv;
+        int status = 0;
+        try
+        {
+            auto chunk = Serializer::deserialize(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+            VM vm;
+            vm.run(chunk);
+        }
+        catch (const QuantumError &e)
+        {
+            std::cerr << "\n  X " << e.kind;
+            if (e.line > 0)
+                std::cerr << " at line " << e.line;
+            std::cerr << "\n    " << e.what() << "\n\n";
+            status = 1;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[Fatal] " << e.what() << "\n";
+            status = 1;
+        }
+        g_scriptArgv = saved;
+        return QV((double)status); });
 
     // ── <filesystem> ──
     // path decomposition: op is parent, filename, stem, extension, root,

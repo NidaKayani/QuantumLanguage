@@ -479,7 +479,20 @@ Runs every `.sa` file in the directory, prints `PASS` / `FAIL` per file with err
 
 Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp` is written in Quantum's C++ syntax; `X.h.sa` declares and `X.sa` defines. Quantum compiles these itself: `qrun src/tools/selfhost/quantumc.sa <file> <out.qbc>` is the whole compiler, compiled by Quantum and running on the Quantum VM. Fed its own source, it reproduces itself byte for byte (`src/tools/bootstrap.sh`).
 
-The native `.exe` binaries are still linked by a C++ compiler. CMake compiles the same `.sa` files with g++ (`-x c++`) until Quantum's native x86-64 backend replaces it.
+### Building without a C++ compiler
+
+```bat
+build-quantum.bat            :: build\selfhost\quantum.exe
+build-quantum.bat --verify   :: and check it rebuilds itself byte for byte
+```
+
+No g++, CMake or MSYS2 is involved, only Windows' `cmd`. `seed\quantum.exe` is a Quantum VM carrying the compiler as bytecode. It compiles the compiler's source in `src\` (`--build-self`), and the result compiles itself again. Each step takes about 3 minutes. The new `quantum.exe` runs programs, writes bytecode (`--emit-qbc`), bundles standalone executables (`--bundle`), and compiles C++ to native x86-64 code (`--native`).
+
+Edits to the compiler (front-ends, dialects, bytecode compiler, native backend) take effect through this build. The VM inside the seed is native code, so an edit to the VM runtime itself (`src/vm/`, `src/Value.sa`) needs that VM recompiled. Until the native backend (`src/native/`) can compile the VM, that one step uses the CMake/g++ build below. After it, the new `quantum_stub.exe` plus a `--build-self` gives a new seed.
+
+### Building with CMake and g++
+
+The CMake build compiles the same `.sa` files with g++ (`-x c++`), producing `quantum.exe`, `qrun.exe`, `quantum_stub.exe` and `qpm.exe` as native binaries.
 
 ### Prerequisites
 

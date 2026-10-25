@@ -20,6 +20,7 @@
 #include "X64.h.sa"
 #include "../cpp/Cpp.h.sa"
 
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -44,11 +45,14 @@ enum Kind
     K_U32,
     K_I64,
     K_U64,
+    K_F32, // float
+    K_F64, // double
 };
 
 [[noreturn]] void fail(const std::string &msg, int line) { throw cpp::Unsupported("native: " + msg, "", line); }
 
 bool isUnsigned(Kind k) { return k == K_U8 || k == K_U16 || k == K_U32 || k == K_U64 || k == K_BOOL; }
+bool isFloat(Kind k) { return k == K_F32 || k == K_F64; }
 
 int kindSize(Kind k)
 {
@@ -56,20 +60,24 @@ int kindSize(Kind k)
     {
     case K_BOOL: case K_I8: case K_U8: return 1;
     case K_I16: case K_U16: return 2;
-    case K_I32: case K_U32: return 4;
+    case K_I32: case K_U32: case K_F32: return 4;
     case K_VOID: return 0;
     default: return 8;
     }
 }
 
 // The type an operand takes in arithmetic (integer promotion)
-Kind promote(Kind k) { return kindSize(k) < 4 ? K_I32 : k; }
+Kind promote(Kind k) { return isFloat(k) ? k : kindSize(k) < 4 ? K_I32 : k; }
 
 // The usual arithmetic conversions between two operands
 Kind common(Kind a, Kind b)
 {
     a = promote(a);
     b = promote(b);
+    if (a == K_F64 || b == K_F64)
+        return K_F64;
+    if (a == K_F32 || b == K_F32)
+        return K_F32;
     if (a == K_U64 || b == K_U64)
         return K_U64;
     if (a == K_I64 || b == K_I64)
@@ -97,6 +105,14 @@ struct ClassInfo;
 struct Method;
 struct NType;
 using NT = std::shared_ptr<NType>;
+
+// A template instance's arguments: type parameters and value parameters
+struct Binding
+{
+    std::map<std::string, NT> types;
+    std::map<std::string, int64_t> values;
+};
+using BindP = std::shared_ptr<Binding>;
 
 struct NType
 {
@@ -129,6 +145,7 @@ struct Method
     int label = -1;
     bool isStatic = false, isVirtual = false, isCtor = false, isDtor = false, isPure = false;
     int vslot = -1;
+    BindP bind; // a template instance's arguments (null: not a template)
 };
 
 struct ClassInfo
@@ -147,6 +164,8 @@ struct ClassInfo
     Method *implicitCtor = nullptr;  // generated when there is no user constructor
     bool needsDtor = false;
     std::map<std::string, std::string> statics; // static data member -> global name
+    BindP bind;                                 // a class template instance's arguments
+    std::string templateName;                   // its template (the injected class name)
 };
 
 NT tVoid() { return std::make_shared<NType>(); }
@@ -219,6 +238,21 @@ Kind valKind(const NT &t) { return t->cat == C_INT ? t->kind : K_U64; }
 
 int alignUp(int v, int a) { return (v + a - 1) / a * a; }
 
+std::string typeKey(const NT &t)
+{
+    static const char *const kinds[] = {"void", "bool", "char", "uchar", "short", "ushort",
+                                        "int", "uint", "llong", "ullong", "float", "double"};
+    switch (t->cat)
+    {
+    case C_INT: return kinds[t->kind];
+    case C_PTR: return typeKey(t->elem) + "*";
+    case C_REF: return typeKey(t->elem) + "&";
+    case C_ARRAY: return typeKey(t->elem) + "[" + std::to_string(t->n) + "]";
+    case C_CLASS: return t->cls->name;
+    default: return "void";
+    }
+}
+
 bool derivesFrom(ClassInfo *c, ClassInfo *base)
 {
     for (; c; c = c->base)
@@ -238,6 +272,49 @@ bool sameType(const NT &a, const NT &b)
     case C_CLASS: return a->cls == b->cls;
     default: return true;
     }
+}
+
+// The IEEE-754 bits of v with `mant` mantissa bits and `bias` (double: 52 /
+// 1023, float: 23 / 127), rounded to nearest even. Computed with frexp/ldexp
+// so that every build of the compiler writes the same bytes.
+uint64_t ieeeBits(double v, int mant, int bias)
+{
+    uint64_t sign = 0;
+    if (v != v)
+        return mant == 52 ? 0x7FF8000000000000ULL : 0x7FC00000ULL;
+    if (v < 0)
+    {
+        sign = 1ULL << (mant == 52 ? 63 : 31);
+        v = -v;
+    }
+    int expBits = mant == 52 ? 11 : 8;
+    uint64_t expMax = (1ULL << expBits) - 1;
+    if (v == 0)
+        return sign;
+    int e;
+    double m = frexp(v, &e); // v = m * 2^e, 0.5 <= m < 1
+    int64_t exp = e - 1 + bias;
+    double scaled;
+    if (exp <= 0)
+    {
+        scaled = ldexp(v, bias - 1 + mant); // a subnormal: v / 2^(1 - bias - mant)
+        exp = 0;
+    }
+    else
+        scaled = ldexp(m * 2 - 1, mant);
+    double whole = floor(scaled);
+    double frac = scaled - whole;
+    uint64_t bits = (uint64_t)whole;
+    if (frac > 0.5 || (frac == 0.5 && (bits & 1)))
+        ++bits;
+    if (bits >> mant)
+    {
+        bits &= (1ULL << mant) - 1;
+        ++exp;
+    }
+    if (exp >= (int64_t)expMax)
+        return sign | (expMax << mant); // infinity
+    return sign | ((uint64_t)exp << mant) | bits;
 }
 
 // An integer literal's value and type (decimal: int, then long long; hex and
@@ -323,7 +400,8 @@ class Gen
     struct Cleanup // an object to destroy when its scope ends
     {
         int off;
-        ClassInfo *cls;
+        ClassInfo *cls; // null: only a handler record to pop (a try block)
+        int ehRec = 0;  // rbp offset of its handler record (0: none)
     };
     struct Scope
     {
@@ -343,6 +421,23 @@ class Gen
     std::vector<std::pair<int, ClassInfo *>> globalObjects_; // .data offset, class: constructed before main
     std::vector<std::pair<int, cpp::DeclP>> globalCtorInits_; // .data offset, declaration
     std::map<std::string, int> runtime_; // runtime routine -> label (emitted when used)
+    std::map<std::string, cpp::DeclP> classTemplates_;
+    std::map<std::string, std::vector<cpp::DeclP>> funcTemplates_;
+    std::map<std::string, Method *> funcInstances_; // name<args> -> instance
+    BindP bind_;                                   // template arguments in effect
+    // expression -> template binding -> its type (keyed by plain pointers:
+    // compared by identity)
+    std::map<const cpp::Expr *, std::map<const Binding *, NT>> typeMemo_;
+    // lambda expression -> template binding -> its closure class
+    std::map<const cpp::Expr *, std::map<const Binding *, ClassInfo *>> closures_;
+    int lambdaCount_ = 0;
+    bool deducing_ = false; // generating a body only to find its return type
+    // exceptions: .data offsets of the handler chain's top, the exception in
+    // flight (its object, type record, destructor), and the type records
+    int ehTop_ = -1, ehObj_ = -1, ehType_ = -1, ehDtor_ = -1;
+    std::map<std::string, int> typeInfo_;
+    std::vector<int> catchSaves_; // rbp offsets where the enclosing handlers keep their exception
+    NT deducedRet_;
 
     // the function being generated
     Method *cur_ = nullptr;
@@ -361,7 +456,25 @@ class Gen
     NT typeOf(const cpp::TypeNameP &t, int line);
     NT baseType(const cpp::TypeNameP &t, int line);
     int64_t constInt(const cpp::ExprP &e);
-    void classDecl(const cpp::DeclP &d);
+    void classDecl(const cpp::DeclP &d, const std::string &name = "");
+    ClassInfo *instantiateClass(const std::string &name, const std::vector<cpp::TArg> &targs, int line);
+    Method *instantiateFunc(const cpp::DeclP &d, int which, const std::vector<cpp::ExprP> &args,
+                            const std::vector<cpp::TArg> &targs, bool explicitArgs, int line);
+    Method *makeFunction(const cpp::DeclP &d, const BindP &bind);
+    std::vector<Method *> functionCands(const std::string &name, const std::vector<cpp::ExprP> &args,
+                                        const cpp::ExprP &callee, int line);
+    NT operatorCall(const std::string &op, const std::vector<cpp::ExprP> &kids, int line, bool &found);
+    void constructElements(const ThisSrc &base, int off, const NT &arr, int line);
+    NT lambda(const cpp::ExprP &e);
+    ClassInfo *closureClass(const cpp::ExprP &e, std::vector<std::pair<std::string, bool>> &caps);
+    void deduceReturn(Method *m);
+    NT autoType(const cpp::TypeNameP &t, const cpp::ExprP &init, int line);
+    int typeInfo(const NT &t);
+    int pushHandler(int landing);  // a handler record in the frame, made the chain's top
+    void popHandler(int rec);      // the chain's top back to the record's predecessor
+    void throwExpr(const cpp::ExprP &e);
+    void tryStmt(const cpp::StmtP &s);
+    void protect(Cleanup &c);      // destroy c's object if an exception passes
     Method *declareMethod(ClassInfo *c, const cpp::DeclP &m);
     void layoutClass(ClassInfo *c);
     Method *newMethod();
@@ -380,6 +493,10 @@ class Gen
 
     // values
     void wrap(Kind k, int r = RAX);
+    void convKind(Kind from, Kind to); // rax: a `from` value -> a `to` value
+    void truth(const NT &t);           // rax: a value -> 0/1 (floats: != 0.0)
+    void arithFloat(const std::string &op, Kind k, int line);
+    void compareFloat(const std::string &op, Kind k);
     void convert(const NT &to, const NT &from, int line);
     NT expr(const cpp::ExprP &e);
     NT addr(const cpp::ExprP &e);
@@ -467,6 +584,8 @@ int64_t Gen::constInt(const cpp::ExprP &e)
     case cpp::EK::SizeofT:
         return sizeOf(typeOf(e->type, e->line));
     case cpp::EK::Name:
+        if (e->name.size() == 1 && bind_ && bind_->values.count(e->name[0]))
+            return bind_->values[e->name[0]];
         if (e->name.size() == 1)
         {
             Var *v = lookup(e->name[0]);
@@ -491,13 +610,25 @@ NT Gen::baseType(const cpp::TypeNameP &t, int line)
     std::vector<std::string> n = t->name;
     if (n.size() == 2 && n[0] == "std")
         n.erase(n.begin());
+    if (n.size() == 1 && t->hasTargs && !t->targs.empty() && classTemplates_.count(n[0]))
+        return tClass(instantiateClass(n[0], t->targs.back(), line));
     if (n.size() != 1 || t->hasTargs || t->isFunction)
         fail("type " + t->str(), line);
     const std::string &w = n[0];
+    if (bind_)
+    {
+        auto b = bind_->types.find(w);
+        if (b != bind_->types.end())
+            return b->second;
+    }
     if (w == "void")
         return tVoid();
     if (w == "bool")
         return tInt(K_BOOL);
+    if (w == "double" || w == "long double")
+        return tInt(K_F64);
+    if (w == "float")
+        return tInt(K_F32);
     if (w == "char" || w == "signed char" || w == "int8_t")
         return tInt(K_I8);
     if (w == "unsigned char" || w == "uint8_t")
@@ -521,13 +652,40 @@ NT Gen::baseType(const cpp::TypeNameP &t, int line)
     auto it = classes_.find(w);
     if (it != classes_.end())
         return tClass(it->second.get());
+    // inside a class template, its own name means the current instance
+    if (cur_ && cur_->owner && cur_->owner->templateName == w)
+        return tClass(cur_->owner);
     fail("type " + t->str(), line);
+}
+
+// The type of `auto x = init` (also auto&, const auto&, auto*)
+NT Gen::autoType(const cpp::TypeNameP &t, const cpp::ExprP &init, int line)
+{
+    if (!init)
+        fail("auto without an initializer", line);
+    cpp::ExprP e = init;
+    if (e->k == cpp::EK::InitList)
+    {
+        if (e->kids.size() != 1)
+            fail("auto from a braced list", line);
+        e = e->kids[0];
+    }
+    NT v = typeOfExpr(e);
+    if (v->cat == C_REF)
+        v = v->elem;
+    if (t->ref || t->rref)
+        return tRef(v, t->isConst);
+    if (v->cat == C_ARRAY)
+        v = tPtr(v->elem); // decays
+    return v;
 }
 
 NT Gen::typeOf(const cpp::TypeNameP &t, int line)
 {
     if (!t)
         fail("a declaration without a type", line);
+    if (t->isAuto())
+        fail("auto here (only for variables with an initializer so far)", line);
     NT ty = baseType(t, line);
     for (int i = (int)t->pointeeDims.size() - 1; i >= 0; --i)
         ty = tArray(ty, (int)constInt(t->pointeeDims[i]));
@@ -545,6 +703,7 @@ Method *Gen::declareMethod(ClassInfo *c, const cpp::DeclP &m)
     Method *f = newMethod();
     f->name = m->isCtor ? c->name : m->isDtor ? "~" + c->name : m->name.back();
     f->owner = c;
+    f->bind = c->bind;
     f->decl = m;
     f->isStatic = m->isStatic;
     f->isVirtual = m->isVirtual;
@@ -571,16 +730,20 @@ Method *Gen::declareMethod(ClassInfo *c, const cpp::DeclP &m)
     return f;
 }
 
-void Gen::classDecl(const cpp::DeclP &d)
+void Gen::classDecl(const cpp::DeclP &d, const std::string &instName)
 {
-    if (d->name.size() != 1 || d->isTemplate)
-        fail("this class (not yet: templates, nested names)", d->line);
+    if (d->name.size() != 1 || (d->isTemplate && instName.empty()))
+        fail("this class (not yet: nested names)", d->line);
     if (d->isUnion)
         fail("union (not yet)", d->line);
     auto info = std::make_unique<ClassInfo>();
-    info->name = d->name[0];
+    std::string cname = instName.empty() ? d->name[0] : instName;
+    info->name = cname;
+    info->bind = bind_;
+    if (!instName.empty())
+        info->templateName = d->name[0];
     ClassInfo *c = info.get();
-    classes_[d->name[0]] = std::move(info); // visible to its own pointer members
+    classes_[cname] = std::move(info); // visible to its own pointer members
     if (d->bases.size() > 1)
         fail("multiple inheritance (not yet)", d->line);
     if (d->bases.size() == 1)
@@ -631,8 +794,6 @@ void Gen::classDecl(const cpp::DeclP &d)
         case cpp::DK::Func:
             if (m->isDeleted)
                 break;
-            if (m->isOperator)
-                fail("operator overloading (not yet)", m->line);
             if (m->isTemplate)
                 fail("member template (not yet)", m->line);
             declareMethod(c, m);
@@ -727,8 +888,13 @@ void Gen::layoutClass(ClassInfo *c)
     {
         bool work = c->polymorphic || (c->base && (c->base->implicitCtor || !c->base->ctors.empty()));
         for (const Field &f : c->fields)
-            if (f.init || f.initBraced || (f.type->cat == C_CLASS && (f.type->cls->implicitCtor || !f.type->cls->ctors.empty())))
+        {
+            NT el = f.type;
+            while (el->cat == C_ARRAY)
+                el = el->elem;
+            if (f.init || f.initBraced || (el->cat == C_CLASS && (el->cls->implicitCtor || !el->cls->ctors.empty())))
                 work = true;
+        }
         if (work)
         {
             Method *m = newMethod();
@@ -739,6 +905,158 @@ void Gen::layoutClass(ClassInfo *c)
             c->implicitCtor = m;
         }
     }
+}
+
+ClassInfo *Gen::instantiateClass(const std::string &name, const std::vector<cpp::TArg> &targs, int line)
+{
+    const cpp::DeclP &d = classTemplates_[name];
+    auto bind = std::make_shared<Binding>();
+    std::string key = name + "<";
+    for (size_t i = 0; i < d->templateParams.size(); ++i)
+    {
+        if (i >= targs.size())
+            fail("template " + name + " needs " + std::to_string(d->templateParams.size()) + " arguments", line);
+        const std::string &p = d->templateParams[i];
+        if (i)
+            key += ",";
+        if (targs[i].type)
+        {
+            // a name that is a value (a template's own N) parses as a type
+            const cpp::TypeNameP &tt = targs[i].type;
+            if (bind_ && tt->name.size() == 1 && bind_->values.count(tt->name[0]))
+            {
+                bind->values[p] = bind_->values[tt->name[0]];
+                key += std::to_string(bind->values[p]);
+                continue;
+            }
+            NT t = typeOf(tt, line);
+            bind->types[p] = t;
+            key += typeKey(t);
+        }
+        else
+        {
+            bind->values[p] = constInt(targs[i].expr);
+            key += std::to_string(bind->values[p]);
+        }
+    }
+    key += ">";
+    auto it = classes_.find(key);
+    if (it != classes_.end())
+        return it->second.get();
+    BindP saved = bind_;
+    Method *savedCur = cur_;
+    bind_ = bind;
+    cur_ = nullptr;
+    classDecl(d, key);
+    bind_ = saved;
+    cur_ = savedCur;
+    return classes_[key].get();
+}
+
+Method *Gen::makeFunction(const cpp::DeclP &d, const BindP &bind)
+{
+    BindP saved = bind_;
+    bind_ = bind;
+    Method *f = newMethod();
+    f->name = d->name[0];
+    f->ret = typeOf(d->ret, d->line);
+    for (const cpp::Param &pr : d->params)
+    {
+        NT pt = typeOf(pr.type, d->line);
+        if (pt->cat == C_ARRAY)
+            pt = tPtr(pt->elem);
+        f->params.push_back(pt);
+        f->defaults.push_back(pr.def);
+    }
+    f->decl = d;
+    f->bind = bind;
+    bind_ = saved;
+    return f;
+}
+
+// A function template's instance for these arguments (null: they don't fit)
+Method *Gen::instantiateFunc(const cpp::DeclP &d, int which, const std::vector<cpp::ExprP> &args,
+                             const std::vector<cpp::TArg> &targs, bool explicitArgs, int line)
+{
+    auto bind = std::make_shared<Binding>();
+    const std::vector<std::string> &ps = d->templateParams;
+    if (explicitArgs)
+        for (size_t i = 0; i < targs.size() && i < ps.size(); ++i)
+        {
+            if (targs[i].type)
+                bind->types[ps[i]] = typeOf(targs[i].type, line);
+            else
+                bind->values[ps[i]] = constInt(targs[i].expr);
+        }
+    if (args.size() > d->params.size())
+        return nullptr;
+    // deduction: a parameter written T, T*, const T& ... takes T from its argument
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const cpp::TypeNameP &pt = d->params[i].type;
+        if (!pt || pt->name.size() != 1 || pt->hasTargs)
+            continue;
+        const std::string &tn = pt->name[0];
+        bool isParam = false;
+        for (const std::string &p : ps)
+            if (p == tn)
+                isParam = true;
+        if (!isParam || bind->types.count(tn))
+            continue;
+        NT at = typeOfExpr(args[i]);
+        if (at->cat == C_REF)
+            at = at->elem;
+        for (int k = 0; k < pt->pointers; ++k)
+        {
+            if (at->cat != C_PTR)
+                return nullptr;
+            at = at->elem;
+        }
+        if (at->cat == C_INT && args[i]->k == cpp::EK::Char && pt->pointers == 0)
+            at = tInt(K_I8);
+        bind->types[tn] = at;
+    }
+    std::string key = d->name[0] + "<";
+    for (const std::string &p : ps)
+    {
+        if (bind->types.count(p))
+            key += typeKey(bind->types[p]) + ",";
+        else if (bind->values.count(p))
+            key += std::to_string(bind->values[p]) + ",";
+        else
+            return nullptr; // not deducible from these arguments
+    }
+    key += ">#" + std::to_string(which); // which template of that name
+    auto it = funcInstances_.find(key);
+    if (it != funcInstances_.end())
+        return it->second;
+    Method *f = makeFunction(d, bind);
+    funcInstances_[key] = f;
+    return f;
+}
+
+// The functions a call by name may mean: the plain ones and template instances
+std::vector<Method *> Gen::functionCands(const std::string &name, const std::vector<cpp::ExprP> &args,
+                                         const cpp::ExprP &callee, int line)
+{
+    std::vector<Method *> cands;
+    bool explicitArgs = callee && callee->hasTargs;
+    if (!explicitArgs)
+    {
+        auto it = funcs_.find(name);
+        if (it != funcs_.end())
+            cands = it->second;
+    }
+    auto t = funcTemplates_.find(name);
+    if (t != funcTemplates_.end())
+        for (size_t i = 0; i < t->second.size(); ++i)
+        {
+            std::vector<cpp::TArg> none;
+            Method *m = instantiateFunc(t->second[i], (int)i, args, callee ? callee->targs : none, explicitArgs, line);
+            if (m)
+                cands.push_back(m);
+        }
+    return cands;
 }
 
 // ─── Program ───────────────────────────────────────────────────────────────
@@ -774,6 +1092,14 @@ int Gen::stringData(const std::string &bytes)
 
 void Gen::program(const cpp::Program &p)
 {
+    // the exception state: four 8-byte globals
+    while (data.size() % 8)
+        data.push_back('\0');
+    ehTop_ = (int)data.size();
+    ehObj_ = ehTop_ + 8;
+    ehType_ = ehTop_ + 16;
+    ehDtor_ = ehTop_ + 24;
+    data.append(32, '\0');
     // types and every function first, so a call may come before the definition
     std::vector<cpp::DeclP> outOfClass;
     for (const cpp::DeclP &d : p.decls)
@@ -781,15 +1107,25 @@ void Gen::program(const cpp::Program &p)
         switch (d->k)
         {
         case cpp::DK::Class:
+            if (d->isTemplate)
+            {
+                if (!d->forwardOnly)
+                    classTemplates_[d->name[0]] = d;
+                break;
+            }
             if (!d->forwardOnly)
                 classDecl(d);
             break;
         case cpp::DK::Func:
         {
             if (d->isTemplate)
-                fail("function template " + d->name.back() + " (not yet)", d->line);
-            if (d->isOperator)
-                fail("operator overloading (not yet)", d->line);
+            {
+                if (d->name.size() != 1)
+                    fail("a member template defined outside its class (not yet)", d->line);
+                if (d->body)
+                    funcTemplates_[d->name[0]].push_back(d);
+                break;
+            }
             if (d->name.size() == 2)
             {
                 outOfClass.push_back(d); // Class::member defined outside the class
@@ -957,8 +1293,12 @@ void Gen::program(const cpp::Program &p)
     a.load(RCX, -8);
     a.callImport(importIndex("kernel32.dll", "ExitProcess"));
 
-    for (auto &m : allMethods_)
+    // (instances made while generating code join the list)
+    for (size_t mi = 0; mi < allMethods_.size(); ++mi)
     {
+        Method *m = allMethods_[mi].get();
+        if (!m->ret)
+            deduceReturn(m);
         if (m->isPure && (!m->decl || !m->decl->body))
             continue;
         bool generated = !m->decl;
@@ -1071,6 +1411,20 @@ void Gen::constInit(int off, const NT &t, const cpp::ExprP &init, int line)
         e = e->kids[0];
     if (e->k == cpp::EK::InitList && e->kids.empty())
         return;
+    if (isFloat(t->kind))
+    {
+        double dv;
+        if (e->k == cpp::EK::Float)
+            dv = e->num;
+        else if (e->k == cpp::EK::Unary && e->op == "-" && e->kids[0]->k == cpp::EK::Float)
+            dv = -e->kids[0]->num;
+        else
+            dv = (double)constInt(e);
+        uint64_t bits = t->kind == K_F64 ? ieeeBits(dv, 52, 1023) : ieeeBits(dv, 23, 127);
+        for (int i = 0; i < kindSize(t->kind); ++i)
+            data[off + i] = (char)((bits >> (8 * i)) & 255);
+        return;
+    }
     int64_t v = constInt(e);
     if (t->kind == K_BOOL)
         v = v != 0;
@@ -1080,6 +1434,8 @@ void Gen::constInit(int off, const NT &t, const cpp::ExprP &init, int line)
 
 void Gen::function(Method &m)
 {
+    BindP savedBind = bind_;
+    bind_ = m.bind;
     a.bind(m.label);
     a.push(RBP);
     a.movRR(RBP, RSP);
@@ -1164,6 +1520,7 @@ void Gen::function(Method &m)
     a.ret();
     a.patch32(framePos, alignUp(-nextOff_, 16));
     cur_ = nullptr;
+    bind_ = savedBind;
 }
 
 // A constructor's work before its body: the base, the vtable pointer, the members
@@ -1210,6 +1567,13 @@ void Gen::ctorPrologue(Method &m)
             braced = f.initBraced;
         }
         int line = m.decl ? m.decl->line : 0;
+        if (f.type->cat == C_ARRAY && args.empty())
+        {
+            ThisSrc ts;
+            ts.kind = TH_CUR;
+            constructElements(ts, f.off, f.type, line);
+            continue;
+        }
         if (f.type->cat == C_CLASS)
         {
             if (args.size() == 1 && !braced)
@@ -1273,6 +1637,34 @@ void Gen::ctorPrologue(Method &m)
         a.movRR(RAX, RDX);
         a.storeRcx(sizeOf(f.type));
         endFullExpr();
+    }
+}
+
+// Default-constructs the class elements of the array at `off` in base's object
+void Gen::constructElements(const ThisSrc &base, int off, const NT &arr, int line)
+{
+    NT el = arr;
+    int count = 1;
+    while (el->cat == C_ARRAY)
+    {
+        count *= el->n;
+        el = el->elem;
+    }
+    if (el->cat != C_CLASS || (el->cls->ctors.empty() && !el->cls->implicitCtor))
+        return;
+    if (count > 64)
+        fail("an array of more than 64 objects with constructors (not yet)", line);
+    for (int i = 0; i < count; ++i)
+    {
+        loadThis(base);
+        a.addImm(RAX, off + i * el->cls->size);
+        int tmp = newSlot(tPtr(tVoid()));
+        a.store(tmp, RAX);
+        ThisSrc es;
+        es.kind = TH_INDIRECT;
+        es.off = tmp;
+        std::vector<cpp::ExprP> none;
+        construct(es, el->cls, none, false, line);
     }
 }
 
@@ -1398,6 +1790,26 @@ void Gen::runtime()
             a.bind(skip);
             a.movImm(RAX, 0);
         }
+        else if (name == "throw")
+        {
+            // the newest handler record: popped, its frame restored, its landing pad run
+            int none = a.newLabel();
+            a.leaData(RCX, ehTop_);
+            a.loadRcx(8, false);
+            a.test(RAX, RAX);
+            a.jcc(CC_E, none);
+            a.loadInd(RCX, RAX); // the record before it
+            a.leaData(RDX, ehTop_);
+            a.storeInd(RDX, RCX);
+            a.loadDisp(RBP, RAX, 8);
+            a.loadDisp(RSP, RAX, 16);
+            a.loadDisp(RAX, RAX, 24);
+            a.jmpReg(RAX);
+            a.bind(none);
+            // nothing catches it: abort's exit code
+            a.movImm(RCX, 3);
+            a.callImport(importIndex("kernel32.dll", "ExitProcess"));
+        }
         else if (name == "pure")
         {
             // a pure virtual function called: exit code 3, as abort() gives
@@ -1474,6 +1886,126 @@ void Gen::wrap(Kind k, int r)
     }
 }
 
+void Gen::convKind(Kind from, Kind to)
+{
+    if (from == to)
+        return;
+    if (!isFloat(from) && !isFloat(to))
+    {
+        wrap(to);
+        return;
+    }
+    if (isFloat(from) && isFloat(to))
+    {
+        a.toXmm(0, RAX, from == K_F64);
+        a.sse(from == K_F64 ? 0xF2 : 0xF3, 0x5A, 0, 0); // cvtsd2ss / cvtss2sd
+        a.fromXmm(RAX, 0, to == K_F64);
+        return;
+    }
+    if (isFloat(to))
+    {
+        int pre = to == K_F64 ? 0xF2 : 0xF3;
+        if (from == K_U64)
+        {
+            // an unsigned value from 2^63 up: halve it (keeping the low bit), convert, double
+            int big = a.newLabel(), done = a.newLabel();
+            a.test(RAX, RAX);
+            a.jcc(0x8, big); // js
+            a.sse(pre, 0x2A, 0, RAX, true);
+            a.jmp(done);
+            a.bind(big);
+            a.movRR(RDX, RAX);
+            a.movImm(RCX, 1);
+            a.shiftCl(5, RDX);       // rdx = rax >> 1
+            a.alu(0x21, RAX, RCX);   // rax &= 1
+            a.alu(0x09, RDX, RAX);   // rdx |= rax
+            a.sse(pre, 0x2A, 0, RDX, true);
+            a.sse(pre, 0x58, 0, 0);  // x + x
+            a.bind(done);
+            a.fromXmm(RAX, 0, to == K_F64);
+            return;
+        }
+        a.sse(pre, 0x2A, 0, RAX, true); // cvtsi2sd/ss xmm0, rax
+        a.fromXmm(RAX, 0, to == K_F64);
+        return;
+    }
+    // float -> integer: truncation toward zero
+    if (to == K_BOOL)
+    {
+        truth(tInt(from));
+        return;
+    }
+    a.toXmm(0, RAX, from == K_F64);
+    a.sse(from == K_F64 ? 0xF2 : 0xF3, 0x2C, RAX, 0, true); // cvttsd2si / cvttss2si rax, xmm0
+    wrap(to);
+}
+
+void Gen::truth(const NT &t)
+{
+    if (t->cat != C_INT || !isFloat(t->kind))
+        return;
+    bool d = t->kind == K_F64;
+    a.toXmm(0, RAX, d);
+    a.sse(0x66, 0x57, 1, 1);          // xorpd xmm1, xmm1
+    a.sse(d ? 0x66 : 0, 0x2E, 0, 1);  // ucomisd/ss xmm0, xmm1
+    a.byte(0x0F);
+    a.byte(0x95);
+    a.byte(0xC0); // setne al
+    a.byte(0x0F);
+    a.byte(0x9A);
+    a.byte(0xC1); // setp cl (NaN is true)
+    a.byte(0x08);
+    a.byte(0xC8); // or al, cl
+    a.movzx8(RAX);
+}
+
+void Gen::arithFloat(const std::string &op, Kind k, int line)
+{
+    bool d = k == K_F64;
+    int pre = d ? 0xF2 : 0xF3;
+    a.toXmm(0, RAX, d);
+    a.toXmm(1, RCX, d);
+    if (op == "+")
+        a.sse(pre, 0x58, 0, 1);
+    else if (op == "-")
+        a.sse(pre, 0x5C, 0, 1);
+    else if (op == "*")
+        a.sse(pre, 0x59, 0, 1);
+    else if (op == "/")
+        a.sse(pre, 0x5E, 0, 1);
+    else
+        fail("operator " + op + " on floating point", line);
+    a.fromXmm(RAX, 0, d);
+}
+
+// rax = (rax op rcx) for two floating-point values; NaN compares unequal
+void Gen::compareFloat(const std::string &op, Kind k)
+{
+    bool d = k == K_F64;
+    a.toXmm(0, RAX, d);
+    a.toXmm(1, RCX, d);
+    int pre = d ? 0x66 : 0;
+    if (op == "<" || op == "<=")
+        a.sse(pre, 0x2E, 1, 0); // ucomis b, a: a < b is b above a
+    else
+        a.sse(pre, 0x2E, 0, 1);
+    if (op == "==" || op == "!=")
+    {
+        bool eq = op == "==";
+        a.byte(0x0F);
+        a.byte(eq ? 0x94 : 0x95);
+        a.byte(0xC0); // sete / setne al
+        a.byte(0x0F);
+        a.byte(eq ? 0x9B : 0x9A);
+        a.byte(0xC1); // setnp / setp cl
+        a.byte(eq ? 0x20 : 0x08);
+        a.byte(0xC8); // and / or al, cl
+        a.movzx8(RAX);
+        return;
+    }
+    a.setcc(op == "<" || op == ">" ? CC_A : CC_AE);
+}
+
 void Gen::convert(const NT &to, const NT &from, int line)
 {
     if (to->cat == C_VOID)
@@ -1496,7 +2028,7 @@ void Gen::convert(const NT &to, const NT &from, int line)
     if (to->cat == C_PTR)
         fail("converting an integer to a pointer", line);
     if (to->cat == C_INT)
-        wrap(to->kind);
+        convKind(from->cat == C_INT ? from->kind : K_U64, to->kind);
 }
 
 NT Gen::valueAt(const NT &t)
@@ -1509,23 +2041,26 @@ NT Gen::valueAt(const NT &t)
     if (t->cat == C_PTR)
         a.loadRcx(8, false);
     else
-        a.loadRcx(kindSize(t->kind), !isUnsigned(t->kind));
+        a.loadRcx(kindSize(t->kind), !isUnsigned(t->kind) && !isFloat(t->kind));
     return t;
 }
 
 // The type an expression would have: its code is generated and dropped
 NT Gen::typeOfExpr(const cpp::ExprP &e)
 {
+    std::map<const Binding *, NT> &memo = typeMemo_[e.get()];
+    auto known = memo.find(bind_.get());
+    if (known != memo.end() && cur_ && !scopes_.empty())
+        return known->second;
     Asm::Mark m = a.mark();
-    size_t dataSize = data.size();
     int depth = depth_, next = nextOff_;
     size_t temps = temps_.size();
     NT t = expr(e);
     a.rewind(m);
-    data.resize(dataSize);
     depth_ = depth;
     nextOff_ = next;
     temps_.resize(temps);
+    memo[bind_.get()] = t;
     return t;
 }
 
@@ -1674,7 +2209,21 @@ NT Gen::addr(const cpp::ExprP &e)
         break;
     case cpp::EK::Index:
     {
+        {
+            bool found = false;
+            NT r = operatorCall("[]", e->kids, e->line, found);
+            if (found)
+            {
+                if (r->cat == C_REF)
+                    return r->elem;
+                if (r->cat == C_CLASS)
+                    return r;
+                fail("operator[] returning a value, used as an object", e->line);
+            }
+        }
         NT b = expr(e->kids[0]);
+        if (b->cat == C_REF)
+            b = b->elem;
         if (b->cat != C_PTR)
             fail("[] of a non-pointer", e->line);
         pushRax();
@@ -1744,14 +2293,48 @@ NT Gen::addr(const cpp::ExprP &e)
             return t; // a temporary object
         break;
     }
+    case cpp::EK::Lambda:
+        return lambda(e); // its closure, a temporary
+    case cpp::EK::Cond:
+    {
+        int other = a.newLabel(), end = a.newLabel();
+        expr(e->kids[0]);
+        a.test(RAX, RAX);
+        a.jcc(CC_E, other);
+        NT t1 = addr(e->kids[1]);
+        a.jmp(end);
+        a.bind(other);
+        addr(e->kids[2]);
+        a.bind(end);
+        return t1;
+    }
     default:
         break;
+    }
+    // an operator on objects yields an object (or a reference to one)
+    {
+        NT t = typeOfExpr(e);
+        if (t->cat == C_CLASS || t->cat == C_REF)
+        {
+            if (e->k == cpp::EK::Binary || e->k == cpp::EK::Unary)
+            {
+                bool found = false;
+                NT r = operatorCall(e->op, e->kids, e->line, found);
+                if (found)
+                    return r->cat == C_REF ? r->elem : r;
+            }
+        }
     }
     fail("this expression is not an object", e->line);
 }
 
 void Gen::arith(const std::string &op, Kind k, int line)
 {
+    if (isFloat(k))
+    {
+        arithFloat(op, k, line);
+        return;
+    }
     bool u = isUnsigned(k);
     if (op == "+")
         a.alu(0x01, RAX, RCX);
@@ -1795,10 +2378,10 @@ NT Gen::binary(const cpp::ExprP &e)
     if (op == "&&" || op == "||")
     {
         int shortCut = a.newLabel(), end = a.newLabel();
-        expr(e->kids[0]);
+        truth(expr(e->kids[0]));
         a.test(RAX, RAX);
         a.jcc(op == "&&" ? CC_E : CC_NE, shortCut);
-        expr(e->kids[1]);
+        truth(expr(e->kids[1]));
         a.test(RAX, RAX);
         a.setcc(CC_NE);
         a.jmp(end);
@@ -1807,13 +2390,23 @@ NT Gen::binary(const cpp::ExprP &e)
         a.bind(end);
         return tInt(K_BOOL);
     }
+    {
+        bool found = false;
+        NT r = operatorCall(op, e->kids, e->line, found);
+        if (found)
+            return r->cat == C_REF ? valueAt(r->elem) : r;
+    }
     NT lt = expr(e->kids[0]);
     pushRax();
     NT rt = expr(e->kids[1]);
     a.movRR(RCX, RAX);
     popReg(RAX);
+    if (lt->cat == C_REF)
+        lt = lt->elem;
+    if (rt->cat == C_REF)
+        rt = rt->elem;
     if (!isScalar(lt) || !isScalar(rt))
-        fail("operator " + op + " on an object (operator overloading: not yet)", e->line);
+        fail("operator " + op + " on an object without operator" + op, e->line);
     if ((op == "+" || op == "-") && (lt->cat == C_PTR || rt->cat == C_PTR))
     {
         if (lt->cat == C_PTR && rt->cat == C_INT)
@@ -1846,6 +2439,23 @@ NT Gen::binary(const cpp::ExprP &e)
         return tInt(k);
     }
     Kind k = common(lk, rk);
+    if (isFloat(k))
+    {
+        // both operands to k: rcx through rax
+        convKind(lk, k);
+        a.movRR(RDX, RAX);
+        a.movRR(RAX, RCX);
+        convKind(rk, k);
+        a.movRR(RCX, RAX);
+        a.movRR(RAX, RDX);
+        if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=")
+        {
+            compareFloat(op, k);
+            return tInt(K_BOOL);
+        }
+        arithFloat(op, k, e->line);
+        return tInt(k);
+    }
     if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=")
     {
         wrap(k, RAX);
@@ -1875,6 +2485,23 @@ void Gen::copyBytes(int size)
 
 NT Gen::assign(const cpp::ExprP &e)
 {
+    {
+        NT lt0 = typeOfExpr(e->kids[0]);
+        if (lt0->cat == C_REF)
+            lt0 = lt0->elem;
+        if (lt0->cat == C_CLASS)
+        {
+            std::vector<Method *> ops;
+            if (e->op != "=" || findMethod(lt0->cls, "operator=", ops))
+            {
+                bool found = false;
+                NT r = operatorCall(e->op, e->kids, e->line, found);
+                if (!found)
+                    fail("no operator" + e->op + " for " + lt0->cls->name, e->line);
+                return r->cat == C_REF ? r->elem : r;
+            }
+        }
+    }
     if (e->op == "=")
     {
         NT rt = expr(e->kids[1]);
@@ -1932,11 +2559,25 @@ NT Gen::assign(const cpp::ExprP &e)
     {
         Kind vk = lt->kind, rk = valKind(rt);
         Kind k = op == "<<" || op == ">>" ? promote(vk) : common(vk, rk);
-        wrap(k, RAX);
-        if (op != "<<" && op != ">>")
-            wrap(k, RCX);
-        arith(op, k, e->line);
-        wrap(vk);
+        if (isFloat(k))
+        {
+            convKind(vk, k);
+            a.movRR(RDX, RAX);
+            a.movRR(RAX, RCX);
+            convKind(rk, k);
+            a.movRR(RCX, RAX);
+            a.movRR(RAX, RDX);
+            arithFloat(op, k, e->line);
+            convKind(k, vk);
+        }
+        else
+        {
+            wrap(k, RAX);
+            if (op != "<<" && op != ">>")
+                wrap(k, RCX);
+            arith(op, k, e->line);
+            wrap(vk);
+        }
     }
     popReg(RCX);
     a.storeRcx(sizeOf(lt));
@@ -1951,10 +2592,18 @@ NT Gen::incDec(const cpp::ExprP &e, bool inc, bool post)
     pushRax();
     valueAt(t);
     a.movRR(RDX, RAX); // the old value
-    a.movImm(RCX, t->cat == C_PTR ? sizeOf(t->elem) : 1);
-    a.alu(inc ? 0x01 : 0x29, RAX, RCX);
-    if (t->cat == C_INT)
-        wrap(t->kind);
+    if (t->cat == C_INT && isFloat(t->kind))
+    {
+        a.movImm(RCX, (int64_t)ieeeBits(1.0, t->kind == K_F64 ? 52 : 23, t->kind == K_F64 ? 1023 : 127));
+        arithFloat(inc ? "+" : "-", t->kind, e->line);
+    }
+    else
+    {
+        a.movImm(RCX, t->cat == C_PTR ? sizeOf(t->elem) : 1);
+        a.alu(inc ? 0x01 : 0x29, RAX, RCX);
+        if (t->cat == C_INT)
+            wrap(t->kind);
+    }
     popReg(RCX);
     a.storeRcx(sizeOf(t));
     if (post)
@@ -2007,7 +2656,7 @@ int Gen::argCost(const NT &param, const cpp::ExprP &arg, const NT &argT)
     if (sameType(p, t))
         return 0;
     if (p->cat == C_INT && t->cat == C_INT)
-        return promote(t->kind) == p->kind ? 1 : 2;
+        return promote(t->kind) == p->kind || (t->kind == K_F32 && p->kind == K_F64) ? 1 : 2;
     if (p->cat == C_PTR && t->cat == C_PTR)
     {
         if (p->elem->cat == C_VOID)
@@ -2087,6 +2736,8 @@ Method *Gen::resolve(const std::vector<Method *> &cands, const std::vector<cpp::
 NT Gen::callMethod(Method *m, const ThisSrc &self, const std::vector<cpp::ExprP> &argsIn, bool virt, int line,
                    const ThisSrc *result)
 {
+    if (!m->ret)
+        deduceReturn(m);
     std::vector<cpp::ExprP> args = argsIn;
     for (size_t i = args.size(); i < m->params.size(); ++i)
         args.push_back(m->defaults[i]);
@@ -2102,7 +2753,7 @@ NT Gen::callMethod(Method *m, const ThisSrc &self, const std::vector<cpp::ExprP>
         place.kind = TH_LOCAL; // a temporary
         place.off = newSlot(m->ret);
         if (m->ret->cls->needsDtor)
-            temps_.push_back(Cleanup{place.off, m->ret->cls});
+            temps_.push_back(Cleanup{place.off, m->ret->cls, 0});
     }
     int n = (classRet ? 1 : 0) + (hasThis ? 1 : 0) + (int)args.size();
     int onStack = n > 4 ? n - 4 : 0;
@@ -2127,7 +2778,7 @@ NT Gen::callMethod(Method *m, const ThisSrc &self, const std::vector<cpp::ExprP>
             cs.off = slot;
             construct(cs, pt->cls, one, false, line);
             if (pt->cls->needsDtor)
-                temps_.push_back(Cleanup{slot, pt->cls});
+                temps_.push_back(Cleanup{slot, pt->cls, 0});
             a.lea(RAX, slot);
         }
         else
@@ -2226,16 +2877,61 @@ NT Gen::call(const cpp::ExprP &e, const ThisSrc *result)
             return callMethod(m, self, args, true, e->line, result);
         }
     }
-    auto it = funcs_.find(name);
-    if (it != funcs_.end() && !it->second.empty())
+    // a variable of class type: its operator()
+    if (lookup(name) || (cur_ && cur_->owner && !cur_->isStatic))
     {
-        Method *m = resolve(it->second, args, name, e->line);
+        int off = 0;
+        Var *v = lookup(name);
+        bool field = !v && cur_ && cur_->owner && findField(cur_->owner, name, off);
+        if (v || field)
+        {
+            std::vector<cpp::ExprP> kids = {callee};
+            kids.insert(kids.end(), args.begin(), args.end());
+            bool found = false;
+            NT r = operatorCall("()", kids, e->line, found);
+            if (found)
+                return r;
+            fail(name + " is not a function", e->line);
+        }
+    }
+    std::vector<Method *> cands = functionCands(name, args, callee, e->line);
+    if (!cands.empty())
+    {
+        Method *m = resolve(cands, args, name, e->line);
         return callMethod(m, ThisSrc(), args, false, e->line, result);
     }
     // the C library routines the runtime provides
     int label = -1;
     std::vector<NT> params;
     NT ret;
+    if (name == "sqrt" || name == "fabs" || name == "floor" || name == "ceil" || name == "trunc")
+    {
+        if (args.size() != 1)
+            fail(name + " takes 1 argument", e->line);
+        NT at = expr(args[0]);
+        convert(tInt(K_F64), at, e->line);
+        if (name == "fabs")
+        {
+            a.movImm(RCX, 0x7FFFFFFFFFFFFFFFLL);
+            a.alu(0x21, RAX, RCX);
+            return tInt(K_F64);
+        }
+        a.toXmm(0, RAX, true);
+        if (name == "sqrt")
+            a.sse(0xF2, 0x51, 0, 0);
+        else
+        {
+            // roundsd xmm0, xmm0, mode (SSE4.1): 1 down, 2 up, 3 toward zero
+            a.byte(0x66);
+            a.byte(0x0F);
+            a.byte(0x3A);
+            a.byte(0x0B);
+            a.byte(0xC0);
+            a.byte(name == "floor" ? 1 : name == "ceil" ? 2 : 3);
+        }
+        a.fromXmm(RAX, 0, true);
+        return tInt(K_F64);
+    }
     if (name == "putchar")
     {
         label = routine("putchar");
@@ -2270,6 +2966,485 @@ NT Gen::call(const cpp::ExprP &e, const ThisSrc *result)
     a.movRR(RCX, RAX);
     callRoutine(label);
     return ret;
+}
+
+// An operator on an object: a member operator<op> of the first operand's
+// class, or a free operator<op> function. `found` is false when neither
+// exists (the built-in operator applies).
+NT Gen::operatorCall(const std::string &op, const std::vector<cpp::ExprP> &kids, int line, bool &found)
+{
+    found = false;
+    std::vector<NT> types;
+    bool anyClass = false;
+    for (const cpp::ExprP &k : kids)
+    {
+        NT t = typeOfExpr(k);
+        if (t->cat == C_REF)
+            t = t->elem;
+        types.push_back(t);
+        if (t->cat == C_CLASS)
+            anyClass = true;
+    }
+    if (!anyClass)
+        return tVoid();
+    std::string name = "operator" + op;
+    if (types[0]->cat == C_CLASS)
+    {
+        std::vector<Method *> all, cands;
+        findMethod(types[0]->cls, name, all);
+        for (Method *m : all)
+            if (m->params.size() + 1 == kids.size() ||
+                (op == "()" || op == "[]"))
+                cands.push_back(m);
+        if (!cands.empty())
+        {
+            std::vector<cpp::ExprP> args(kids.begin() + 1, kids.end());
+            Method *m = resolve(cands, args, types[0]->cls->name + "::" + name, line);
+            ThisSrc self;
+            self.kind = TH_OBJ;
+            self.e = kids[0];
+            found = true;
+            return callMethod(m, self, args, false, line);
+        }
+    }
+    std::vector<Method *> cands = functionCands(name, kids, nullptr, line);
+    std::vector<Method *> fit;
+    for (Method *m : cands)
+        if (m->params.size() == kids.size())
+            fit.push_back(m);
+    if (fit.empty())
+        return tVoid();
+    Method *m = resolve(fit, kids, name, line);
+    found = true;
+    return callMethod(m, ThisSrc(), kids, false, line);
+}
+
+// The names an expression or statement uses (free-variable candidates)
+void collectNames(const cpp::ExprP &e, std::vector<std::string> &out);
+void collectNames(const cpp::StmtP &s, std::vector<std::string> &out)
+{
+    if (!s)
+        return;
+    collectNames(s->expr, out);
+    collectNames(s->cond2, out);
+    collectNames(s->step, out);
+    for (const cpp::VarDeclarator &d : s->decls)
+        for (const cpp::ExprP &x : d.args)
+            collectNames(x, out);
+    for (const cpp::StmtP &x : s->body)
+        collectNames(x, out);
+    collectNames(s->init, out);
+    collectNames(s->then, out);
+    collectNames(s->els, out);
+    collectNames(s->condDecl, out);
+    for (const cpp::Catch &c : s->catches)
+        collectNames(c.body, out);
+}
+void collectNames(const cpp::ExprP &e, std::vector<std::string> &out)
+{
+    if (!e)
+        return;
+    if (e->k == cpp::EK::Name && e->name.size() == 1)
+        out.push_back(e->name[0]);
+    for (const cpp::ExprP &k : e->kids)
+        collectNames(k, out);
+    if (e->lambda)
+        collectNames(e->lambda->body, out);
+}
+
+// A type's record for catch matching: 8 bytes in .data holding the .data
+// offset of its base class's record (-1: none)
+int Gen::typeInfo(const NT &tIn)
+{
+    NT t = tIn->cat == C_REF ? tIn->elem : tIn;
+    std::string key = typeKey(t);
+    auto it = typeInfo_.find(key);
+    if (it != typeInfo_.end())
+        return it->second;
+    int64_t base = -1;
+    if (t->cat == C_CLASS && t->cls->base)
+        base = typeInfo(tClass(t->cls->base));
+    while (data.size() % 8)
+        data.push_back('\0');
+    int off = (int)data.size();
+    for (int i = 0; i < 8; ++i)
+        data.push_back((char)((base >> (8 * i)) & 255));
+    typeInfo_[key] = off;
+    return off;
+}
+
+int Gen::pushHandler(int landing)
+{
+    int rec = newSlot(tArray(tInt(K_I64), 4)); // prev, rbp, rsp, landing address
+    a.leaData(RCX, ehTop_);
+    a.loadRcx(8, false);
+    a.store(rec, RAX);
+    a.store(rec + 8, RBP);
+    a.store(rec + 16, RSP);
+    a.leaLabel(RAX, landing);
+    a.store(rec + 24, RAX);
+    a.lea(RAX, rec);
+    a.leaData(RCX, ehTop_);
+    a.storeRcx(8);
+    return rec;
+}
+
+void Gen::popHandler(int rec)
+{
+    a.load(RAX, rec);
+    a.leaData(RCX, ehTop_);
+    a.storeRcx(8);
+}
+
+// An object with a destructor gets a handler that destroys it when an
+// exception passes, then lets the exception go on
+void Gen::protect(Cleanup &c)
+{
+    int landing = a.newLabel(), skip = a.newLabel();
+    c.ehRec = pushHandler(landing);
+    a.jmp(skip);
+    a.bind(landing);
+    ThisSrc s;
+    s.kind = TH_LOCAL;
+    s.off = c.off;
+    destroy(s, c.cls);
+    a.call(routine("throw"));
+    a.bind(skip);
+}
+
+void Gen::throwExpr(const cpp::ExprP &e)
+{
+    if (e->kids.empty())
+    {
+        // throw; : the exception the innermost handler is handling, again
+        if (catchSaves_.empty())
+            fail("throw; outside a catch", e->line);
+        int save = catchSaves_.back();
+        for (int i = 0; i < 3; ++i)
+        {
+            a.load(RAX, save + 8 * i);
+            a.leaData(RCX, ehObj_ + 8 * i);
+            a.storeRcx(8);
+        }
+        a.call(routine("throw"));
+        return;
+    }
+    NT t = typeOfExpr(e->kids[0]);
+    if (t->cat == C_REF)
+        t = t->elem;
+    if (t->cat == C_ARRAY)
+        t = tPtr(t->elem);
+    // the exception object, on the heap
+    a.movImm(RCX, sizeOf(t));
+    callRoutine(routine("alloc"));
+    int slot = newSlot(tPtr(tVoid()));
+    a.store(slot, RAX);
+    if (t->cat == C_CLASS)
+    {
+        ThisSrc s;
+        s.kind = TH_INDIRECT;
+        s.off = slot;
+        construct(s, t->cls, {e->kids[0]}, false, e->line);
+    }
+    else
+    {
+        NT v = expr(e->kids[0]);
+        if (!(t->cat == C_PTR && v->cat == C_PTR))
+            convert(t, v, e->line);
+        a.load(RCX, slot);
+        a.storeRcx(sizeOf(t));
+    }
+    endFullExpr();
+    a.load(RAX, slot);
+    a.leaData(RCX, ehObj_);
+    a.storeRcx(8);
+    a.movImm(RAX, typeInfo(t));
+    a.leaData(RCX, ehType_);
+    a.storeRcx(8);
+    if (t->cat == C_CLASS && t->cls->needsDtor)
+        a.leaLabel(RAX, t->cls->dtor->label);
+    else
+        a.movImm(RAX, 0);
+    a.leaData(RCX, ehDtor_);
+    a.storeRcx(8);
+    a.call(routine("throw"));
+}
+
+void Gen::tryStmt(const cpp::StmtP &s)
+{
+    int landing = a.newLabel(), end = a.newLabel();
+    int rec = pushHandler(landing);
+    scopes_.emplace_back();
+    scopes_.back().cleanups.push_back(Cleanup{rec, nullptr, rec});
+    stmt(s->then);
+    scopes_.back().cleanups.clear();
+    scopes_.pop_back();
+    popHandler(rec);
+    a.jmp(end);
+
+    // an exception arrived (the throw popped the record): find its handler
+    a.bind(landing);
+    int save = newSlot(tArray(tInt(K_I64), 3)); // object, type, destructor
+    for (int i = 0; i < 3; ++i)
+    {
+        a.leaData(RCX, ehObj_ + 8 * i);
+        a.loadRcx(8, false);
+        a.store(save + 8 * i, RAX);
+    }
+    for (const cpp::Catch &c : s->catches)
+    {
+        int next = a.newLabel();
+        NT ct;
+        if (c.type)
+        {
+            ct = typeOf(c.type, s->line);
+            NT want = ct->cat == C_REF ? ct->elem : ct;
+            // does the thrown type (or one of its bases) match?
+            int top = a.newLabel(), match = a.newLabel();
+            a.load(RAX, save + 8);
+            a.bind(top);
+            a.movImm(RCX, typeInfo(want));
+            a.alu(0x39, RAX, RCX);
+            a.jcc(CC_E, match);
+            a.leaData(RCX, 0);
+            a.alu(0x01, RCX, RAX);
+            a.loadInd(RAX, RCX); // the base's record
+            a.movImm(RCX, -1);
+            a.alu(0x39, RAX, RCX);
+            a.jcc(CC_E, next);
+            a.jmp(top);
+            a.bind(match);
+        }
+        scopes_.emplace_back();
+        if (c.type && !c.name.empty())
+        {
+            NT want = ct->cat == C_REF ? ct->elem : ct;
+            if (want->cat == C_CLASS || ct->cat == C_REF)
+            {
+                // the variable refers to the exception object itself
+                a.load(RAX, save);
+                int off = newSlot(tPtr(tVoid()));
+                a.store(off, RAX);
+                scopes_.back().vars[c.name] = Var{tRef(want, false), false, off};
+            }
+            else
+            {
+                int off = newSlot(want);
+                a.load(RCX, save);
+                a.loadRcx(sizeOf(want), want->cat == C_INT && !isUnsigned(want->kind) && !isFloat(want->kind));
+                a.lea(RCX, off);
+                a.storeRcx(sizeOf(want));
+                scopes_.back().vars[c.name] = Var{want, false, off};
+            }
+        }
+        catchSaves_.push_back(save);
+        stmt(c.body);
+        catchSaves_.pop_back();
+        destroyScopes(scopes_.size() - 1);
+        scopes_.pop_back();
+        // the exception is over: destroyed and freed
+        int noDtor = a.newLabel();
+        a.load(RAX, save + 16);
+        a.test(RAX, RAX);
+        a.jcc(CC_E, noDtor);
+        a.load(RCX, save);
+        int pad = (depth_ + 4) % 2;
+        if (pad)
+            a.subRsp(8);
+        a.subRsp(32);
+        a.callReg(RAX);
+        a.addRsp(32 + 8 * pad);
+        a.bind(noDtor);
+        a.load(RCX, save);
+        callRoutine(routine("free"));
+        a.jmp(end);
+        a.bind(next);
+    }
+    // no handler here: on to the next one out
+    for (int i = 0; i < 3; ++i)
+    {
+        a.load(RAX, save + 8 * i);
+        a.leaData(RCX, ehObj_ + 8 * i);
+        a.storeRcx(8);
+    }
+    a.call(routine("throw"));
+    a.bind(end);
+}
+
+// The closure class of a lambda: a field per capture, operator() for the body
+ClassInfo *Gen::closureClass(const cpp::ExprP &e, std::vector<std::pair<std::string, bool>> &caps)
+{
+    const cpp::Lambda &l = *e->lambda;
+    // what it captures: the explicit list, then (with = or &) every name its
+    // body uses that is a local of the enclosing function
+    for (const std::string &c : l.captures)
+    {
+        if (c == "this")
+            fail("capturing this (not yet)", e->line);
+        bool byRef = c[0] == '&';
+        caps.push_back({byRef ? c.substr(1) : c, byRef});
+    }
+    if (l.captureAllByRef || l.captureAllByValue)
+    {
+        std::vector<std::string> used;
+        collectNames(l.body, used);
+        std::vector<std::string> own;
+        for (const cpp::Param &pr : l.params)
+            own.push_back(pr.name);
+        for (const std::string &n : used)
+        {
+            bool skip = false;
+            for (const std::string &o : own)
+                if (o == n)
+                    skip = true;
+            for (const auto &c : caps)
+                if (c.first == n)
+                    skip = true;
+            if (skip)
+                continue;
+            bool local = false;
+            for (const Scope &sc : scopes_)
+                if (sc.vars.count(n))
+                    local = true;
+            if (local)
+                caps.push_back({n, l.captureAllByRef});
+        }
+    }
+    std::map<const Binding *, ClassInfo *> &known = closures_[e.get()];
+    auto it = known.find(bind_.get());
+    if (it != known.end())
+        return it->second;
+
+    auto info = std::make_unique<ClassInfo>();
+    info->name = "lambda#" + std::to_string(++lambdaCount_);
+    info->bind = bind_;
+    ClassInfo *c = info.get();
+    classes_[c->name] = std::move(info);
+    for (const auto &cap : caps)
+    {
+        Var *v = lookup(cap.first);
+        if (!v || v->global)
+            fail("capturing " + cap.first + " (not a local variable)", e->line);
+        NT t = v->type->cat == C_REF ? v->type->elem : v->type;
+        Field f;
+        f.name = cap.first;
+        f.type = cap.second ? tRef(t, false) : t;
+        if (!cap.second && t->cat == C_ARRAY)
+            fail("capturing an array by value (not yet)", e->line);
+        c->fields.push_back(f);
+    }
+    // operator(): the body, with its parameters
+    auto d = std::make_shared<cpp::Decl>();
+    d->k = cpp::DK::Func;
+    d->line = e->line;
+    d->name = {"operator()"};
+    d->params = l.params;
+    d->body = l.body;
+    d->ret = l.ret;
+    Method *m = newMethod();
+    m->name = "operator()";
+    m->owner = c;
+    m->decl = d;
+    m->bind = bind_;
+    for (const cpp::Param &pr : l.params)
+    {
+        if (pr.type && pr.type->isAuto())
+            fail("a generic lambda (auto parameter: not yet)", e->line);
+        NT pt = typeOf(pr.type, e->line);
+        if (pt->cat == C_ARRAY)
+            pt = tPtr(pt->elem);
+        m->params.push_back(pt);
+        m->defaults.push_back(pr.def);
+    }
+    if (l.ret)
+        m->ret = typeOf(l.ret, e->line); // else deduced from its returns when first called
+    c->methods["operator()"].push_back(m);
+    layoutClass(c);
+    known[bind_.get()] = c;
+    return c;
+}
+
+// A lambda expression: its closure object, a temporary
+NT Gen::lambda(const cpp::ExprP &e)
+{
+    std::vector<std::pair<std::string, bool>> caps;
+    ClassInfo *c = closureClass(e, caps);
+    NT t = tClass(c);
+    int slot = newSlot(t);
+    a.movImm(RAX, 0);
+    for (int k = 0; k < alignUp(sizeOf(t), 8); k += 8)
+        a.store(slot + k, RAX);
+    for (size_t i = 0; i < caps.size() && i < c->fields.size(); ++i)
+    {
+        const Field &f = c->fields[i];
+        auto name = std::make_shared<cpp::Expr>();
+        name->k = cpp::EK::Name;
+        name->line = e->line;
+        name->name = {caps[i].first};
+        if (f.type->cat == C_REF)
+        {
+            addr(name); // the variable's address
+            a.lea(RCX, slot + f.off);
+            a.storeRcx(8);
+            continue;
+        }
+        if (f.type->cat == C_CLASS)
+        {
+            ThisSrc fs;
+            fs.kind = TH_LOCAL;
+            fs.off = slot + f.off;
+            construct(fs, f.type->cls, {name}, false, e->line);
+            continue;
+        }
+        expr(name);
+        a.lea(RCX, slot + f.off);
+        a.storeRcx(sizeOf(f.type));
+    }
+    if (c->needsDtor)
+        temps_.push_back(Cleanup{slot, c, 0});
+    a.lea(RAX, slot);
+    return t;
+}
+
+// A function whose return type comes from its return statements (a lambda
+// without `-> T`): its body is generated once only to see them
+void Gen::deduceReturn(Method *m)
+{
+    Method *savedCur = cur_;
+    std::vector<Scope> savedScopes = scopes_;
+    std::vector<Loop> savedLoops = loops_;
+    std::vector<Cleanup> savedTemps = temps_;
+    int savedNext = nextOff_, savedDepth = depth_, savedRet = retLabel_, savedRetPtr = retPtrOff_,
+        savedThis = thisOff_;
+    NT savedRetType = retType_;
+    std::string savedNrvo = nrvoName_;
+    BindP savedBind = bind_;
+    bool savedDeducing = deducing_;
+    NT savedDeduced = deducedRet_;
+    Asm::Mark mark = a.mark();
+
+    deducing_ = true;
+    deducedRet_ = nullptr;
+    m->ret = tVoid();
+    function(*m);
+    NT found = deducedRet_ ? deducedRet_ : tVoid();
+
+    a.rewind(mark);
+    cur_ = savedCur;
+    scopes_ = savedScopes;
+    loops_ = savedLoops;
+    temps_ = savedTemps;
+    nextOff_ = savedNext;
+    depth_ = savedDepth;
+    retLabel_ = savedRet;
+    retPtrOff_ = savedRetPtr;
+    thisOff_ = savedThis;
+    retType_ = savedRetType;
+    nrvoName_ = savedNrvo;
+    bind_ = savedBind;
+    deducing_ = savedDeducing;
+    deducedRet_ = savedDeduced;
+    m->ret = found;
 }
 
 // Constructs an object of class c where `self` says
@@ -2414,10 +3589,15 @@ void Gen::destroyScopes(size_t downTo)
     for (size_t i = scopes_.size(); i-- > downTo;)
         for (size_t k = scopes_[i].cleanups.size(); k-- > 0;)
         {
+            const Cleanup &c = scopes_[i].cleanups[k];
+            if (c.ehRec)
+                popHandler(c.ehRec);
+            if (!c.cls)
+                continue;
             ThisSrc s;
             s.kind = TH_LOCAL;
-            s.off = scopes_[i].cleanups[k].off;
-            destroy(s, scopes_[i].cleanups[k].cls);
+            s.off = c.off;
+            destroy(s, c.cls);
         }
     popReg(RAX);
 }
@@ -2454,6 +3634,14 @@ NT Gen::expr(const cpp::ExprP &e)
     case cpp::EK::Char:
         a.movImm(RAX, (int64_t)(signed char)(int)e->num);
         return tInt(K_I8);
+    case cpp::EK::Float:
+        if (e->isFloatSuffix)
+        {
+            a.movImm(RAX, (int64_t)ieeeBits(e->num, 23, 127));
+            return tInt(K_F32);
+        }
+        a.movImm(RAX, (int64_t)ieeeBits(e->num, 52, 1023));
+        return tInt(K_F64);
     case cpp::EK::Bool:
         a.movImm(RAX, e->num != 0 ? 1 : 0);
         return tInt(K_BOOL);
@@ -2466,6 +3654,12 @@ NT Gen::expr(const cpp::ExprP &e)
         a.load(RAX, thisOff_);
         return tPtr(tClass(cur_->owner));
     case cpp::EK::Name:
+        if (e->name.size() == 1 && bind_ && bind_->values.count(e->name[0]) && !lookup(e->name[0]))
+        {
+            a.movImm(RAX, bind_->values[e->name[0]]); // a template's value parameter
+            return tInt(K_I32);
+        }
+        return valueAt(addr(e));
     case cpp::EK::Index:
     case cpp::EK::Member:
     case cpp::EK::Str:
@@ -2484,6 +3678,13 @@ NT Gen::expr(const cpp::ExprP &e)
     case cpp::EK::Unary:
     {
         const std::string &op = e->op;
+        if (op != "&")
+        {
+            bool found = false;
+            NT r = operatorCall(op, e->kids, e->line, found);
+            if (found)
+                return r->cat == C_REF ? valueAt(r->elem) : r;
+        }
         if (op == "++" || op == "--")
             return incDec(e, op == "++", false);
         if (op == "&")
@@ -2493,12 +3694,25 @@ NT Gen::expr(const cpp::ExprP &e)
         NT t = expr(e->kids[0]);
         if (op == "!")
         {
+            truth(t);
             a.test(RAX, RAX);
             a.setcc(CC_E);
             return tInt(K_BOOL);
         }
         if (t->cat != C_INT)
             fail("operator " + op + " on a non-integer", e->line);
+        if (isFloat(t->kind))
+        {
+            if (op == "-")
+            {
+                // flip the sign bit
+                a.movImm(RCX, t->kind == K_F64 ? (int64_t)0x8000000000000000ULL : 0x80000000LL);
+                a.alu(0x31, RAX, RCX);
+            }
+            else if (op != "+")
+                fail("operator " + op + " on floating point", e->line);
+            return t;
+        }
         Kind pk = promote(t->kind);
         if (op == "-")
             a.neg(RAX);
@@ -2513,21 +3727,28 @@ NT Gen::expr(const cpp::ExprP &e)
         return incDec(e, e->op == "++", true);
     case cpp::EK::Cond:
     {
+        NT s1 = typeOfExpr(e->kids[1]), s2 = typeOfExpr(e->kids[2]);
+        if (s1->cat == C_REF)
+            s1 = s1->elem;
+        if (s2->cat == C_REF)
+            s2 = s2->elem;
+        bool ints = s1->cat == C_INT && s2->cat == C_INT;
+        Kind k = ints ? (s1->kind == s2->kind ? s1->kind : common(s1->kind, s2->kind)) : K_VOID;
         int other = a.newLabel(), end = a.newLabel();
-        expr(e->kids[0]);
+        truth(expr(e->kids[0]));
         a.test(RAX, RAX);
         a.jcc(CC_E, other);
         NT t1 = expr(e->kids[1]);
+        if (ints)
+            convKind(valKind(t1->cat == C_REF ? t1->elem : t1), k);
         a.jmp(end);
         a.bind(other);
         NT t2 = expr(e->kids[2]);
+        if (ints)
+            convKind(valKind(t2->cat == C_REF ? t2->elem : t2), k);
         a.bind(end);
-        if (t1->cat == C_INT && t2->cat == C_INT)
-        {
-            Kind k = t1->kind == t2->kind ? t1->kind : common(t1->kind, t2->kind);
-            wrap(k);
+        if (ints)
             return tInt(k);
-        }
         return t1->cat == C_PTR ? t1 : t2;
     }
     case cpp::EK::Call:
@@ -2553,7 +3774,7 @@ NT Gen::expr(const cpp::ExprP &e)
             s.off = slot;
             construct(s, t->cls, e->kids, e->braced, e->line);
             if (t->cls->needsDtor)
-                temps_.push_back(Cleanup{slot, t->cls});
+                temps_.push_back(Cleanup{slot, t->cls, 0});
             a.lea(RAX, slot);
             return t;
         }
@@ -2579,6 +3800,11 @@ NT Gen::expr(const cpp::ExprP &e)
         convert(t, from, e->line);
         return t;
     }
+    case cpp::EK::Lambda:
+        return lambda(e);
+    case cpp::EK::Throw:
+        throwExpr(e);
+        return tVoid();
     case cpp::EK::SizeofT:
         a.movImm(RAX, sizeOf(typeOf(e->type, e->line)));
         return tInt(K_U64);
@@ -2692,6 +3918,7 @@ void Gen::cond(const cpp::ExprP &e, int falseLabel)
         t = t->elem;
     if (!isScalar(t))
         fail("an object as a condition", e->line);
+    truth(t);
     endFullExpr();
     a.test(RAX, RAX);
     a.jcc(CC_E, falseLabel);
@@ -2807,7 +4034,11 @@ void Gen::declare(const std::string &name, const NT &tIn, const cpp::ExprP &init
     endFullExpr();
     scopes_.back().vars[name] = Var{t, false, off};
     if (t->cat == C_CLASS && t->cls->needsDtor)
-        scopes_.back().cleanups.push_back(Cleanup{off, t->cls});
+    {
+        Cleanup c{off, t->cls, 0};
+        protect(c);
+        scopes_.back().cleanups.push_back(c);
+    }
 }
 
 void Gen::stmt(const cpp::StmtP &s)
@@ -2827,7 +4058,8 @@ void Gen::stmt(const cpp::StmtP &s)
         {
             if (!d.bindings.empty())
                 fail("structured binding", s->line);
-            NT t = typeOf(d.type, s->line);
+            cpp::ExprP first = d.args.empty() ? nullptr : d.args[0];
+            NT t = d.type && d.type->isAuto() ? autoType(d.type, first, s->line) : typeOf(d.type, s->line);
             cpp::ExprP init;
             bool braced = d.init == cpp::VarDeclarator::Brace;
             if (d.args.size() == 1 && !braced)
@@ -2979,6 +4211,9 @@ void Gen::stmt(const cpp::StmtP &s)
         a.bind(end);
         break;
     }
+    case cpp::SK::Try:
+        tryStmt(s);
+        break;
     case cpp::SK::Break:
         if (loops_.empty())
             fail("break outside a loop", s->line);
@@ -3000,6 +4235,20 @@ void Gen::stmt(const cpp::StmtP &s)
         break;
     }
     case cpp::SK::Return:
+        if (deducing_)
+        {
+            if (s->expr && !deducedRet_)
+            {
+                NT t = typeOfExpr(s->expr);
+                if (t->cat == C_REF)
+                    t = t->elem;
+                if (t->cat == C_ARRAY)
+                    t = tPtr(t->elem);
+                deducedRet_ = t;
+            }
+            a.jmp(retLabel_);
+            break;
+        }
         if (s->expr)
         {
             if (retType_->cat == C_CLASS && !nrvoName_.empty() && s->expr->k == cpp::EK::Name &&

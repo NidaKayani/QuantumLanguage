@@ -325,6 +325,19 @@ void Asm::movzx16(int r)
     byte(0xC0 | ((r & 7) << 3) | (r & 7));
 }
 
+void Asm::sse(int prefix, int op, int reg, int rm, bool w)
+{
+    if (prefix)
+        byte(prefix);
+    rex(w, reg, rm);
+    byte(0x0F);
+    byte(op);
+    byte(0xC0 | ((reg & 7) << 3) | (rm & 7));
+}
+
+void Asm::toXmm(int x, int r, bool is64) { sse(0x66, 0x6E, x, r, is64); }
+void Asm::fromXmm(int r, int x, bool is64) { sse(0x66, 0x7E, x, r, is64); }
+
 void Asm::subRsp(int n)
 {
     byte(0x48);
@@ -385,6 +398,32 @@ void Asm::callReg(int r)
     rex(false, 0, r);
     byte(0xFF);
     byte(0xD0 | (r & 7));
+}
+
+void Asm::jmpReg(int r)
+{
+    rex(false, 0, r);
+    byte(0xFF);
+    byte(0xE0 | (r & 7));
+}
+
+void Asm::leaLabel(int r, int label)
+{
+    rex(true, r, 0);
+    byte(0x8D);
+    byte(((r & 7) << 3) | 5); // [rip+disp32]
+    fixups_.push_back({size(), label});
+    dword(0);
+}
+
+void Asm::loadDisp(int r, int base, int disp8)
+{
+    rex(true, r, base);
+    byte(0x8B);
+    byte(0x40 | ((r & 7) << 3) | (base & 7));
+    if ((base & 7) == 4)
+        byte(0x24);
+    byte(disp8 & 255);
 }
 
 Asm::Mark Asm::mark() const

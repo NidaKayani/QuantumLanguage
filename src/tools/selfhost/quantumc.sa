@@ -78,6 +78,7 @@ QuantumValue VM::javaCallFunctional(const QuantumValue &, const std::string &, c
     return QuantumValue();
 }
 
+#ifndef QUANTUMC_NO_MAIN // (quantum.sa includes this file for the compiler and has its own main)
 // As cli/SelfHost.cpp's emitBytecodeFile; `--dump-cpp-ast <file>` as its dumpCppAst.
 int main(int argc, char **argv)
 {
@@ -138,3 +139,4 @@ int main(int argc, char **argv)
         return 1;
     }
 }
+#endif
