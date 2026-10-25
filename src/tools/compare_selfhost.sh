@@ -10,7 +10,9 @@
 #         (qbc, full: the bytecode files and any output must both match)
 # Mismatching files are listed in <outdir>/<mode>_mismatch.txt, with both
 # outputs kept as <outdir>/<mode>/<n>.gpp.txt and <n>.q.txt (qbc: also .qbc).
-# QRUN=path overrides the qrun used.
+# QRUN=path overrides the qrun used. NATIVE=exe (tokens, ast) runs that
+# executable instead of the driver on qrun: the driver compiled by
+#   qrun --native src/tools/selfhost/<driver>.sa <exe>
 cd "$(dirname "$0")/../.."
 MODE=${1:?usage: compare_selfhost.sh <tokens|ast|qbc|full> [dir] [outdir]}
 DIR=${2:-examples}
@@ -39,7 +41,11 @@ while IFS= read -r f; do
             { [ ! -e "$base.gpp.qbc" ] && [ ! -e "$base.q.qbc" ] || cmp -s "$base.gpp.qbc" "$base.q.qbc"; } && same=1
     else
         "$QRUN" $REF "$f" 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' > "$base.gpp.txt"
-        timeout 300 "$QRUN" "$DRIVER" "$f" 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' > "$base.q.txt"
+        if [ -n "$NATIVE" ]; then
+            timeout 300 "$NATIVE" "$f" 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' > "$base.q.txt"
+        else
+            timeout 300 "$QRUN" "$DRIVER" "$f" 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' > "$base.q.txt"
+        fi
         same=0
         cmp -s "$base.gpp.txt" "$base.q.txt" && same=1
     fi

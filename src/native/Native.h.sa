@@ -11,12 +11,18 @@
 // outside it is reported as cpp::Unsupported, with the line.
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace native
 {
 
 // The .exe bytes for the program at `path` (whose text is `source`).
 std::string compileExe(const std::string &path, const std::string &source);
+
+// The headers of the native standard library (lib/native/*, embedded by
+// src/tools/embed.sa into src/generated/NativeLibData.sa).
+const std::vector<std::pair<std::string, std::string>> &libraryHeaders();
 
 } // namespace native
 

@@ -7,6 +7,7 @@
 #include "X64.h.sa"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace native
@@ -21,6 +22,9 @@ struct Import
 // The bytes of a console .exe. `entry` is the code offset execution starts
 // at; each of `code.importRefs` names an entry of `imports`, and each of
 // `code.dataRefs` a byte of `data` (the writable .data section).
-std::string writePe(const Asm &code, int entry, const std::vector<Import> &imports, const std::string &data);
+// `dataPtrs` are pointers inside .data to other .data bytes: (where the
+// 8-byte pointer is, the offset it points at), filled with absolute addresses.
+std::string writePe(const Asm &code, int entry, const std::vector<Import> &imports, const std::string &data,
+                    const std::vector<std::pair<int, int>> &dataPtrs);
 
 } // namespace native

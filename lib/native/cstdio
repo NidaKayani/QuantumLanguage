@@ -1,0 +1,169 @@
+// <cstdio> for Quantum's native backend. printf, fprintf, sprintf and
+// snprintf are built into the compiler: it packs the arguments (8 bytes each,
+// with their kinds) and calls __printf_to / __snprintf_to here.
+#pragma once
+#include <fstream>
+#include <windows.h>
+
+struct FILE
+{
+    int fd;        // 1 / 2: the console; 0: a file
+    HANDLE handle; // a file
+    bool eof;
+    std::string *in; // a file open for reading: its bytes
+    size_t pos;
+};
+
+FILE __stdin_file = {0, nullptr, false, nullptr, 0};
+FILE __stdout_file = {1, nullptr, false, nullptr, 0};
+FILE __stderr_file = {2, nullptr, false, nullptr, 0};
+FILE *stdin = &__stdin_file;
+FILE *stdout = &__stdout_file;
+FILE *stderr = &__stderr_file;
+
+namespace std
+{
+
+inline void __fileWrite(FILE *f, const char *s, long long n)
+{
+    if (f->fd == 1)
+        cout.write(s, n);
+    else if (f->fd == 2)
+        cerr.write(s, n);
+    else if (f->handle)
+    {
+        DWORD done = 0;
+        WriteFile(f->handle, s, (DWORD)n, &done, nullptr);
+    }
+}
+
+inline int __printf_to(FILE *f, const char *fmt, const unsigned long long *args, const char *kinds)
+{
+    string out = __vformat(fmt, args, kinds);
+    __fileWrite(f, out.c_str(), (long long)out.size());
+    return (int)out.size();
+}
+
+inline int __snprintf_to(char *buf, long long cap, const char *fmt, const unsigned long long *args, const char *kinds)
+{
+    string out = __vformat(fmt, args, kinds);
+    if (cap > 0)
+    {
+        long long n = (long long)out.size() < cap - 1 ? (long long)out.size() : cap - 1;
+        for (long long i = 0; i < n; ++i)
+            buf[i] = out[i];
+        buf[n] = 0;
+    }
+    return (int)out.size();
+}
+
+} // namespace std
+
+inline FILE *fopen(const char *path, const char *mode)
+{
+    bool write = mode[0] == 'w' || mode[0] == 'a';
+    wchar_t *w = std::__widePath(std::string(path));
+    HANDLE h;
+    if (write)
+        h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ, nullptr, mode[0] == 'a' ? OPEN_ALWAYS : CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    else
+        h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    delete[] w;
+    if (h == (HANDLE)(long long)-1)
+        return nullptr;
+    FILE *f = new FILE();
+    f->fd = 0;
+    f->handle = h;
+    f->eof = false;
+    f->in = nullptr;
+    f->pos = 0;
+    if (mode[0] == 'a')
+        SetFilePointerEx(h, 0, nullptr, 2);
+    if (!write)
+    {
+        long long size = 0;
+        GetFileSizeEx(h, &size);
+        f->in = new std::string((size_t)size, (char)0);
+        DWORD got = 0;
+        if (size > 0)
+            ReadFile(h, &(*f->in)[0], (DWORD)size, &got, nullptr);
+    }
+    return f;
+}
+
+inline int fclose(FILE *f)
+{
+    if (!f || f->fd != 0)
+        return 0;
+    CloseHandle(f->handle);
+    delete f->in;
+    delete f;
+    return 0;
+}
+
+inline int fputs(const char *s, FILE *f)
+{
+    std::__fileWrite(f, s, (long long)std::__strlen(s));
+    return 1;
+}
+
+inline int fputc(int c, FILE *f)
+{
+    char ch = (char)c;
+    std::__fileWrite(f, &ch, 1);
+    return c;
+}
+
+inline size_t fwrite(const void *p, size_t size, size_t count, FILE *f)
+{
+    std::__fileWrite(f, (const char *)p, (long long)(size * count));
+    return count;
+}
+
+inline int fgetc(FILE *f)
+{
+    if (!f->in || f->pos >= f->in->size())
+    {
+        f->eof = true;
+        return -1;
+    }
+    return (unsigned char)(*f->in)[f->pos++];
+}
+
+inline size_t fread(void *p, size_t size, size_t count, FILE *f)
+{
+    char *out = (char *)p;
+    size_t want = size * count, got = 0;
+    while (got < want)
+    {
+        int c = fgetc(f);
+        if (c == -1)
+            break;
+        out[got++] = (char)c;
+    }
+    return size ? got / size : 0;
+}
+
+inline char *fgets(char *buf, int n, FILE *f)
+{
+    int i = 0;
+    while (i < n - 1)
+    {
+        int c = fgetc(f);
+        if (c == -1)
+            break;
+        buf[i++] = (char)c;
+        if (c == '\n')
+            break;
+    }
+    if (i == 0)
+        return nullptr;
+    buf[i] = 0;
+    return buf;
+}
+
+inline int feof(FILE *f) { return f->eof ? 1 : 0; }
+inline int fflush(FILE *) { return 0; }
+inline int getchar() { return std::cin.get(); }

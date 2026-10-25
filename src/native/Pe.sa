@@ -50,7 +50,8 @@ void set32(std::string &s, int pos, uint32_t v)
 
 } // namespace
 
-std::string writePe(const Asm &code, int entry, const std::vector<Import> &imports, const std::string &dataIn)
+std::string writePe(const Asm &code, int entry, const std::vector<Import> &imports, const std::string &dataIn,
+                    const std::vector<std::pair<int, int>> &dataPtrs)
 {
     // ── Layout ──────────────────────────────────────────────────────────
     const int textRva = kSectionAlign;
@@ -109,6 +110,13 @@ std::string writePe(const Asm &code, int entry, const std::vector<Import> &impor
         set32(text, r.pos, (uint32_t)(slotRva[r.import] - (textRva + r.pos + 4)));
     for (const Asm::DataRef &r : code.dataRefs)
         set32(text, r.pos, (uint32_t)(dataRva + r.dataOff - (textRva + r.pos + 4)));
+    // pointers in .data: the image is not relocated, so absolute addresses
+    for (const auto &dp : dataPtrs)
+    {
+        uint64_t va = kImageBase + (uint64_t)dataRva + (uint64_t)dp.second;
+        for (int i = 0; i < 8; ++i)
+            data[dp.first + i] = (char)((va >> (8 * i)) & 255);
+    }
 
     // ── .idata ──────────────────────────────────────────────────────────
     std::string idata;

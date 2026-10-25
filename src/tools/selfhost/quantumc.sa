@@ -59,8 +59,9 @@
 #include "../../native/X64.sa"
 #include "../../native/Pe.sa"
 #include "../../native/Codegen.sa"
-#include "../../../build/generated/CppLibData.cpp"
-#include "../../../build/generated/JavaPreludeData.cpp"
+#include "../../generated/CppLibData.sa"
+#include "../../generated/JavaPreludeData.sa"
+#include "../../generated/NativeLibData.sa"
 
 #include <fstream>
 #include <iostream>

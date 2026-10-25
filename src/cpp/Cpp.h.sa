@@ -104,6 +104,10 @@ Preprocessed preprocess(const std::string &path, const std::string &source);
 // `#include <filesystem>` splices in the one of that name.
 const std::vector<std::pair<std::string, std::string>> &libraryHeaders();
 
+// While set, `#include <name>` splices from these instead (the native
+// backend's own library, lib/native/*, embedded the same way).
+extern const std::vector<std::pair<std::string, std::string>> *g_libraryOverride;
+
 // ─── Syntax ────────────────────────────────────────────────────────────────
 
 struct Expr;
@@ -198,6 +202,8 @@ struct Expr
     std::vector<std::string> name;        // EK::Name / member: qualified parts
     std::vector<TArg> targs;              // template args on the last name component
     bool hasTargs = false;
+    bool global = false;       // EK::Name written ::name
+    std::vector<std::vector<TArg>> scopeTargs; // EK::Name: template args per name component
     std::vector<ExprP> kids;
     TypeNameP type;            // casts, new, sizeof, construct
     bool arrow = false;        // Member via ->
@@ -308,6 +314,7 @@ struct Decl
     int tu = 0;
     std::vector<std::string> name; // qualified (out-of-class: {"Parser","peek"})
     std::vector<std::string> templateParams; // template<typename T, ...>
+    std::vector<TArg> templateDefaults;      // per parameter (empty TArg: no default)
     bool isTemplate = false;
     // Func
     TypeNameP ret;

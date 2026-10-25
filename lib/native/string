@@ -1,0 +1,527 @@
+// <string> for Quantum's native backend: std::string over a heap buffer
+// (always NUL-terminated, so c_str() is the buffer itself).
+#pragma once
+
+namespace std
+{
+
+inline size_t __strlen(const char *s)
+{
+    size_t n = 0;
+    while (s[n])
+        ++n;
+    return n;
+}
+
+class string
+{
+  public:
+    static const size_t npos = (size_t)-1;
+
+    string() { init(0); }
+    string(const char *s)
+    {
+        size_t n = __strlen(s);
+        init(n);
+        for (size_t i = 0; i < n; ++i)
+            data_[i] = s[i];
+    }
+    string(const char *s, size_t n)
+    {
+        init(n);
+        for (size_t i = 0; i < n; ++i)
+            data_[i] = s[i];
+    }
+    string(size_t n, char c)
+    {
+        init(n);
+        for (size_t i = 0; i < n; ++i)
+            data_[i] = c;
+    }
+    string(const string &o)
+    {
+        init(o.size_);
+        for (size_t i = 0; i < o.size_; ++i)
+            data_[i] = o.data_[i];
+    }
+    string(string &&o)
+    {
+        data_ = o.data_;
+        size_ = o.size_;
+        cap_ = o.cap_;
+        o.init(0);
+    }
+    ~string() { delete[] data_; }
+
+    string &operator=(const string &o)
+    {
+        if (this != &o)
+        {
+            resize(0);
+            append(o.data_, o.size_);
+        }
+        return *this;
+    }
+    string &operator=(string &&o)
+    {
+        if (this != &o)
+        {
+            delete[] data_;
+            data_ = o.data_;
+            size_ = o.size_;
+            cap_ = o.cap_;
+            o.init(0);
+        }
+        return *this;
+    }
+    string &operator=(const char *s)
+    {
+        resize(0);
+        append(s, __strlen(s));
+        return *this;
+    }
+
+    size_t size() const { return size_; }
+    size_t length() const { return size_; }
+    size_t capacity() const { return cap_; }
+    bool empty() const { return size_ == 0; }
+    const char *c_str() const { return data_; }
+    const char *data() const { return data_; }
+    char *begin() { return data_; }
+    char *end() { return data_ + size_; }
+    const char *begin() const { return data_; }
+    const char *end() const { return data_ + size_; }
+    char &operator[](size_t i) { return data_[i]; }
+    const char &operator[](size_t i) const { return data_[i]; }
+    char &at(size_t i) { return data_[i]; }
+    char &front() { return data_[0]; }
+    char &back() { return data_[size_ - 1]; }
+
+    void reserve(size_t n)
+    {
+        if (n <= cap_)
+            return;
+        char *d = new char[n + 1];
+        for (size_t i = 0; i < size_; ++i)
+            d[i] = data_[i];
+        d[size_] = 0;
+        delete[] data_;
+        data_ = d;
+        cap_ = n;
+    }
+    void resize(size_t n, char c = 0)
+    {
+        if (n > cap_)
+            reserve(n > cap_ * 2 ? n : cap_ * 2);
+        for (size_t i = size_; i < n; ++i)
+            data_[i] = c;
+        size_ = n;
+        data_[size_] = 0;
+    }
+    void clear() { resize(0); }
+    void push_back(char c)
+    {
+        if (size_ == cap_)
+            reserve(cap_ < 8 ? 16 : cap_ * 2);
+        data_[size_++] = c;
+        data_[size_] = 0;
+    }
+    void pop_back()
+    {
+        if (size_)
+            data_[--size_] = 0;
+    }
+    string &append(const char *s, size_t n)
+    {
+        if (size_ + n > cap_)
+            reserve(size_ + n > cap_ * 2 ? size_ + n : cap_ * 2);
+        for (size_t i = 0; i < n; ++i)
+            data_[size_ + i] = s[i];
+        size_ += n;
+        data_[size_] = 0;
+        return *this;
+    }
+    string &append(const string &s) { return append(s.data_, s.size_); }
+    string &append(const char *s) { return append(s, __strlen(s)); }
+    string &append(size_t n, char c)
+    {
+        for (size_t i = 0; i < n; ++i)
+            push_back(c);
+        return *this;
+    }
+    string &operator+=(const string &s) { return append(s.data_, s.size_); }
+    string &operator+=(const char *s) { return append(s, __strlen(s)); }
+    string &operator+=(char c)
+    {
+        push_back(c);
+        return *this;
+    }
+
+    string substr(size_t pos, size_t n = npos) const
+    {
+        if (pos > size_)
+            pos = size_;
+        if (n > size_ - pos)
+            n = size_ - pos;
+        return string(data_ + pos, n);
+    }
+    int compare(const string &o) const { return compareBytes(o.data_, o.size_); }
+    int compare(const char *s) const { return compareBytes(s, __strlen(s)); }
+
+    size_t find(const char *s, size_t pos, size_t n) const
+    {
+        if (n == 0)
+            return pos <= size_ ? pos : npos;
+        for (size_t i = pos; i + n <= size_; ++i)
+        {
+            size_t k = 0;
+            while (k < n && data_[i + k] == s[k])
+                ++k;
+            if (k == n)
+                return i;
+        }
+        return npos;
+    }
+    size_t find(const string &s, size_t pos = 0) const { return find(s.data_, pos, s.size_); }
+    size_t find(const char *s, size_t pos = 0) const { return find(s, pos, __strlen(s)); }
+    size_t find(char c, size_t pos = 0) const
+    {
+        for (size_t i = pos; i < size_; ++i)
+            if (data_[i] == c)
+                return i;
+        return npos;
+    }
+    size_t rfind(char c, size_t pos = npos) const
+    {
+        if (size_ == 0)
+            return npos;
+        size_t i = pos < size_ ? pos : size_ - 1;
+        while (true)
+        {
+            if (data_[i] == c)
+                return i;
+            if (i == 0)
+                return npos;
+            --i;
+        }
+    }
+    size_t rfind(const string &s, size_t pos = npos) const
+    {
+        if (s.size_ > size_)
+            return npos;
+        size_t i = size_ - s.size_;
+        if (pos < i)
+            i = pos;
+        while (true)
+        {
+            size_t k = 0;
+            while (k < s.size_ && data_[i + k] == s.data_[k])
+                ++k;
+            if (k == s.size_)
+                return i;
+            if (i == 0)
+                return npos;
+            --i;
+        }
+    }
+
+    // ── editing ──
+    string &erase(size_t pos = 0, size_t n = npos)
+    {
+        if (pos > size_)
+            pos = size_;
+        if (n > size_ - pos)
+            n = size_ - pos;
+        for (size_t i = pos; i + n < size_; ++i)
+            data_[i] = data_[i + n];
+        size_ -= n;
+        data_[size_] = 0;
+        return *this;
+    }
+    char *erase(char *p)
+    {
+        size_t i = (size_t)(p - data_);
+        erase(i, 1);
+        return data_ + i;
+    }
+    char *erase(char *first, char *last)
+    {
+        size_t i = (size_t)(first - data_);
+        erase(i, (size_t)(last - first));
+        return data_ + i;
+    }
+    string &insert(size_t pos, const char *s, size_t n)
+    {
+        if (pos > size_)
+            pos = size_;
+        string tail(data_ + pos, size_ - pos);
+        resize(pos);
+        append(s, n);
+        append(tail.data_, tail.size_);
+        return *this;
+    }
+    string &insert(size_t pos, const string &s) { return insert(pos, s.data_, s.size_); }
+    string &insert(size_t pos, const char *s) { return insert(pos, s, __strlen(s)); }
+    string &insert(size_t pos, size_t n, char c)
+    {
+        string fill(n, c);
+        return insert(pos, fill.data_, n);
+    }
+    char *insert(char *p, char c)
+    {
+        size_t i = (size_t)(p - data_);
+        insert(i, &c, 1);
+        return data_ + i;
+    }
+    string &replace(size_t pos, size_t n, const char *s, size_t m)
+    {
+        if (pos > size_)
+            pos = size_;
+        if (n > size_ - pos)
+            n = size_ - pos;
+        string tail(data_ + pos + n, size_ - pos - n);
+        resize(pos);
+        append(s, m);
+        append(tail.data_, tail.size_);
+        return *this;
+    }
+    string &replace(size_t pos, size_t n, const string &s) { return replace(pos, n, s.data_, s.size_); }
+    string &replace(size_t pos, size_t n, const char *s) { return replace(pos, n, s, __strlen(s)); }
+    string &replace(size_t pos, size_t n, size_t count, char c)
+    {
+        string fill(count, c);
+        return replace(pos, n, fill.data_, count);
+    }
+    string &replace(char *first, char *last, const string &s)
+    {
+        return replace((size_t)(first - data_), (size_t)(last - first), s.data_, s.size_);
+    }
+    string &assign(const string &s)
+    {
+        *this = s;
+        return *this;
+    }
+    string &assign(const char *s, size_t n)
+    {
+        resize(0);
+        return append(s, n);
+    }
+    string &assign(const char *s) { return assign(s, __strlen(s)); }
+    string &assign(size_t n, char c)
+    {
+        resize(0);
+        return append(n, c);
+    }
+    template <typename It>
+    string(It first, It last)
+    {
+        init(0);
+        for (; first != last; ++first)
+            push_back((char)*first);
+    }
+    string(const string &o, size_t pos, size_t n = npos)
+    {
+        if (pos > o.size_)
+            pos = o.size_;
+        if (n > o.size_ - pos)
+            n = o.size_ - pos;
+        init(n);
+        for (size_t i = 0; i < n; ++i)
+            data_[i] = o.data_[pos + i];
+    }
+    void swap(string &o)
+    {
+        char *d = data_;
+        size_t s = size_, c = cap_;
+        data_ = o.data_;
+        size_ = o.size_;
+        cap_ = o.cap_;
+        o.data_ = d;
+        o.size_ = s;
+        o.cap_ = c;
+    }
+    void shrink_to_fit() {}
+    size_t max_size() const { return 0x7FFFFFFFFFFFFFFFULL; }
+    const char &back() const { return data_[size_ - 1]; }
+    const char &front() const { return data_[0]; }
+    size_t copy(char *out, size_t n, size_t pos = 0) const
+    {
+        if (pos > size_)
+            pos = size_;
+        if (n > size_ - pos)
+            n = size_ - pos;
+        for (size_t i = 0; i < n; ++i)
+            out[i] = data_[pos + i];
+        return n;
+    }
+
+    // ── searching ──
+    bool __in(const char *set, size_t n, char c) const
+    {
+        for (size_t k = 0; k < n; ++k)
+            if (set[k] == c)
+                return true;
+        return false;
+    }
+    size_t __firstOf(const char *set, size_t n, size_t pos, bool in) const
+    {
+        for (size_t i = pos; i < size_; ++i)
+            if (__in(set, n, data_[i]) == in)
+                return i;
+        return npos;
+    }
+    size_t __lastOf(const char *set, size_t n, size_t pos, bool in) const
+    {
+        if (size_ == 0)
+            return npos;
+        size_t i = pos < size_ ? pos : size_ - 1;
+        while (true)
+        {
+            if (__in(set, n, data_[i]) == in)
+                return i;
+            if (i == 0)
+                return npos;
+            --i;
+        }
+    }
+    size_t find_first_of(const string &s, size_t pos = 0) const { return __firstOf(s.data_, s.size_, pos, true); }
+    size_t find_first_of(const char *s, size_t pos = 0) const { return __firstOf(s, __strlen(s), pos, true); }
+    size_t find_first_of(char c, size_t pos = 0) const { return __firstOf(&c, 1, pos, true); }
+    size_t find_first_not_of(const string &s, size_t pos = 0) const { return __firstOf(s.data_, s.size_, pos, false); }
+    size_t find_first_not_of(const char *s, size_t pos = 0) const { return __firstOf(s, __strlen(s), pos, false); }
+    size_t find_first_not_of(char c, size_t pos = 0) const { return __firstOf(&c, 1, pos, false); }
+    size_t find_last_of(const string &s, size_t pos = npos) const { return __lastOf(s.data_, s.size_, pos, true); }
+    size_t find_last_of(const char *s, size_t pos = npos) const { return __lastOf(s, __strlen(s), pos, true); }
+    size_t find_last_of(char c, size_t pos = npos) const { return __lastOf(&c, 1, pos, true); }
+    size_t find_last_not_of(const string &s, size_t pos = npos) const { return __lastOf(s.data_, s.size_, pos, false); }
+    size_t find_last_not_of(const char *s, size_t pos = npos) const { return __lastOf(s, __strlen(s), pos, false); }
+    size_t find_last_not_of(char c, size_t pos = npos) const { return __lastOf(&c, 1, pos, false); }
+    size_t rfind(const char *s, size_t pos = npos) const { return rfind(string(s), pos); }
+    int compare(size_t pos, size_t n, const string &o) const { return substr(pos, n).compare(o); }
+    int compare(size_t pos, size_t n, const char *o) const { return substr(pos, n).compare(o); }
+    int compare(size_t pos, size_t n, const string &o, size_t pos2, size_t n2 = npos) const
+    {
+        return substr(pos, n).compare(o.substr(pos2, n2));
+    }
+    bool starts_with(const string &p) const { return size_ >= p.size_ && compare(0, p.size_, p) == 0; }
+    bool starts_with(const char *p) const { return starts_with(string(p)); }
+    bool starts_with(char c) const { return size_ && data_[0] == c; }
+    bool ends_with(const string &p) const { return size_ >= p.size_ && compare(size_ - p.size_, p.size_, p) == 0; }
+    bool ends_with(const char *p) const { return ends_with(string(p)); }
+    bool ends_with(char c) const { return size_ && data_[size_ - 1] == c; }
+
+    int compareBytes(const char *s, size_t n) const
+    {
+        size_t m = size_ < n ? size_ : n;
+        for (size_t i = 0; i < m; ++i)
+        {
+            unsigned char a = (unsigned char)data_[i], b = (unsigned char)s[i];
+            if (a != b)
+                return a < b ? -1 : 1;
+        }
+        if (size_ == n)
+            return 0;
+        return size_ < n ? -1 : 1;
+    }
+
+  private:
+    char *data_;
+    size_t size_;
+    size_t cap_;
+
+    void init(size_t n)
+    {
+        cap_ = n < 15 ? 15 : n;
+        data_ = new char[cap_ + 1];
+        size_ = n;
+        data_[n] = 0;
+    }
+};
+
+inline bool operator==(const string &a, const string &b) { return a.compare(b) == 0; }
+inline bool operator==(const string &a, const char *b) { return a.compare(b) == 0; }
+inline bool operator==(const char *a, const string &b) { return b.compare(a) == 0; }
+inline bool operator!=(const string &a, const string &b) { return a.compare(b) != 0; }
+inline bool operator!=(const string &a, const char *b) { return a.compare(b) != 0; }
+inline bool operator!=(const char *a, const string &b) { return b.compare(a) != 0; }
+inline bool operator<(const string &a, const string &b) { return a.compare(b) < 0; }
+inline bool operator<(const string &a, const char *b) { return a.compare(b) < 0; }
+inline bool operator>(const string &a, const string &b) { return a.compare(b) > 0; }
+inline bool operator>(const string &a, const char *b) { return a.compare(b) > 0; }
+inline bool operator<=(const string &a, const string &b) { return a.compare(b) <= 0; }
+inline bool operator>=(const string &a, const string &b) { return a.compare(b) >= 0; }
+inline bool operator<(const char *a, const string &b) { return b.compare(a) > 0; }
+inline bool operator>(const char *a, const string &b) { return b.compare(a) < 0; }
+inline bool operator<=(const string &a, const char *b) { return a.compare(b) <= 0; }
+inline bool operator>=(const string &a, const char *b) { return a.compare(b) >= 0; }
+inline void swap(string &a, string &b) { a.swap(b); }
+
+inline string operator+(const string &a, const string &b)
+{
+    string r(a);
+    r += b;
+    return r;
+}
+inline string operator+(const string &a, const char *b)
+{
+    string r(a);
+    r += b;
+    return r;
+}
+inline string operator+(const char *a, const string &b)
+{
+    string r(a);
+    r += b;
+    return r;
+}
+inline string operator+(const string &a, char c)
+{
+    string r(a);
+    r += c;
+    return r;
+}
+inline string operator+(char c, const string &b)
+{
+    string r(1, c);
+    r += b;
+    return r;
+}
+
+inline string to_string(long long v)
+{
+    char buf[24];
+    int n = 0;
+    unsigned long long u = v < 0 ? (unsigned long long)0 - (unsigned long long)v : (unsigned long long)v;
+    do
+    {
+        buf[n++] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    } while (u);
+    string r;
+    if (v < 0)
+        r += '-';
+    while (n > 0)
+        r += buf[--n];
+    return r;
+}
+inline string to_string(int v) { return to_string((long long)v); }
+inline string to_string(unsigned long long v)
+{
+    char buf[24];
+    int n = 0;
+    do
+    {
+        buf[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    } while (v);
+    string r;
+    while (n > 0)
+        r += buf[--n];
+    return r;
+}
+inline string to_string(unsigned v) { return to_string((unsigned long long)v); }
+
+} // namespace std
+
+// stoi, stod, to_string(double) ...
+#include <cstdlib>

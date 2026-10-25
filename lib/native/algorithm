@@ -1,0 +1,307 @@
+// <algorithm> for Quantum's native backend: the algorithms over pointer
+// ranges (vector and string iterators are pointers).
+#pragma once
+#include <utility>
+
+namespace std
+{
+
+template <typename T>
+const T &min(const T &a, const T &b)
+{
+    return b < a ? b : a;
+}
+
+template <typename T>
+const T &max(const T &a, const T &b)
+{
+    return a < b ? b : a;
+}
+
+template <typename T>
+void reverse(T *first, T *last)
+{
+    while (first < last)
+    {
+        --last;
+        T t = std::move(*first);
+        *first = std::move(*last);
+        *last = std::move(t);
+        ++first;
+    }
+}
+
+template <typename T, typename V>
+T *find(T *first, T *last, const V &value)
+{
+    for (; first != last; ++first)
+        if (*first == value)
+            return first;
+    return last;
+}
+
+template <typename T, typename V>
+long long count(T *first, T *last, const V &value)
+{
+    long long n = 0;
+    for (; first != last; ++first)
+        if (*first == value)
+            ++n;
+    return n;
+}
+
+// a stable merge sort (std::sort's order on equal keys is unspecified)
+template <typename T, typename Less>
+void __mergeSort(T *a, T *tmp, long long n, Less less)
+{
+    if (n < 2)
+        return;
+    long long mid = n / 2;
+    __mergeSort(a, tmp, mid, less);
+    __mergeSort(a + mid, tmp, n - mid, less);
+    long long i = 0, j = mid, k = 0;
+    while (i < mid && j < n)
+    {
+        if (less(a[j], a[i]))
+            tmp[k++] = std::move(a[j++]);
+        else
+            tmp[k++] = std::move(a[i++]);
+    }
+    while (i < mid)
+        tmp[k++] = std::move(a[i++]);
+    while (j < n)
+        tmp[k++] = std::move(a[j++]);
+    for (long long x = 0; x < n; ++x)
+        a[x] = std::move(tmp[x]);
+}
+
+template <typename T, typename Less>
+void stable_sort(T *first, T *last, Less less)
+{
+    long long n = last - first;
+    if (n < 2)
+        return;
+    T *tmp = new T[n];
+    __mergeSort(first, tmp, n, less);
+    delete[] tmp;
+}
+
+template <typename T>
+struct __less
+{
+    bool operator()(const T &a, const T &b) const { return a < b; }
+};
+
+template <typename T>
+void stable_sort(T *first, T *last)
+{
+    stable_sort(first, last, __less<T>());
+}
+
+template <typename T, typename Less>
+void sort(T *first, T *last, Less less)
+{
+    stable_sort(first, last, less);
+}
+
+template <typename T>
+void sort(T *first, T *last)
+{
+    stable_sort(first, last, __less<T>());
+}
+
+// predicates over any iterators
+template <typename It, typename P>
+It find_if(It first, It last, P p)
+{
+    for (; first != last; ++first)
+        if (p(*first))
+            return first;
+    return last;
+}
+template <typename It, typename P>
+It find_if_not(It first, It last, P p)
+{
+    for (; first != last; ++first)
+        if (!p(*first))
+            return first;
+    return last;
+}
+template <typename It, typename P>
+bool any_of(It first, It last, P p)
+{
+    for (; first != last; ++first)
+        if (p(*first))
+            return true;
+    return false;
+}
+template <typename It, typename P>
+bool all_of(It first, It last, P p)
+{
+    for (; first != last; ++first)
+        if (!p(*first))
+            return false;
+    return true;
+}
+template <typename It, typename P>
+bool none_of(It first, It last, P p)
+{
+    for (; first != last; ++first)
+        if (p(*first))
+            return false;
+    return true;
+}
+template <typename It, typename P>
+long long count_if(It first, It last, P p)
+{
+    long long n = 0;
+    for (; first != last; ++first)
+        if (p(*first))
+            ++n;
+    return n;
+}
+template <typename It, typename F>
+F for_each(It first, It last, F f)
+{
+    for (; first != last; ++first)
+        f(*first);
+    return f;
+}
+
+// over contiguous elements
+template <typename T, typename P>
+T *remove_if(T *first, T *last, P p)
+{
+    T *out = first;
+    for (; first != last; ++first)
+        if (!p(*first))
+        {
+            if (out != first)
+                *out = std::move(*first);
+            ++out;
+        }
+    return out;
+}
+template <typename T, typename V>
+T *remove(T *first, T *last, const V &value)
+{
+    T *out = first;
+    for (; first != last; ++first)
+        if (!(*first == value))
+        {
+            if (out != first)
+                *out = std::move(*first);
+            ++out;
+        }
+    return out;
+}
+template <typename T>
+T *unique(T *first, T *last)
+{
+    if (first == last)
+        return last;
+    T *out = first;
+    for (T *p = first + 1; p != last; ++p)
+        if (!(*p == *out))
+        {
+            ++out;
+            if (out != p)
+                *out = std::move(*p);
+        }
+    return out + 1;
+}
+template <typename T, typename V>
+T *lower_bound(T *first, T *last, const V &value)
+{
+    long long n = last - first;
+    while (n > 0)
+    {
+        long long h = n / 2;
+        if (first[h] < value)
+        {
+            first += h + 1;
+            n -= h + 1;
+        }
+        else
+            n = h;
+    }
+    return first;
+}
+template <typename T, typename V>
+T *upper_bound(T *first, T *last, const V &value)
+{
+    long long n = last - first;
+    while (n > 0)
+    {
+        long long h = n / 2;
+        if (!(value < first[h]))
+        {
+            first += h + 1;
+            n -= h + 1;
+        }
+        else
+            n = h;
+    }
+    return first;
+}
+template <typename T, typename V>
+bool binary_search(T *first, T *last, const V &value)
+{
+    T *p = lower_bound(first, last, value);
+    return p != last && !(value < *p);
+}
+template <typename T>
+T *max_element(T *first, T *last)
+{
+    T *best = first;
+    for (T *p = first; p != last; ++p)
+        if (*best < *p)
+            best = p;
+    return best;
+}
+template <typename T>
+T *min_element(T *first, T *last)
+{
+    T *best = first;
+    for (T *p = first; p != last; ++p)
+        if (*p < *best)
+            best = p;
+    return best;
+}
+template <typename T, typename V>
+void fill(T *first, T *last, const V &value)
+{
+    for (; first != last; ++first)
+        *first = value;
+}
+template <typename T, typename V>
+void replace(T *first, T *last, const V &from, const V &to)
+{
+    for (; first != last; ++first)
+        if (*first == from)
+            *first = to;
+}
+template <typename It, typename Out>
+Out copy(It first, It last, Out out)
+{
+    for (; first != last; ++first, ++out)
+        *out = *first;
+    return out;
+}
+template <typename It, typename Out, typename F>
+Out transform(It first, It last, Out out, F f)
+{
+    for (; first != last; ++first, ++out)
+        *out = f(*first);
+    return out;
+}
+template <typename A, typename B>
+bool equal(A first, A last, B other)
+{
+    for (; first != last; ++first, ++other)
+        if (!(*first == *other))
+            return false;
+    return true;
+}
+
+} // namespace std

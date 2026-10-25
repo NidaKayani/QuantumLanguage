@@ -1,0 +1,136 @@
+// <ctime> for Quantum's native backend.
+#pragma once
+#include <windows.h>
+
+typedef long long time_t;
+typedef long clock_t;
+#define CLOCKS_PER_SEC 1000
+
+struct tm
+{
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+};
+
+inline time_t time(time_t *out)
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    long long t = ((long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    time_t s = (t - 116444736000000000LL) / 10000000LL;
+    if (out)
+        *out = s;
+    return s;
+}
+inline unsigned long long __clock_start = GetTickCount64();
+inline clock_t clock() { return (clock_t)(GetTickCount64() - __clock_start); }
+
+inline int __tm_of(const time_t *t, struct tm *out, bool local)
+{
+    static const int before[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    long long ft = *t * 10000000LL + 116444736000000000LL;
+    FILETIME u, l;
+    u.dwLowDateTime = (DWORD)ft;
+    u.dwHighDateTime = (DWORD)(ft >> 32);
+    if (local)
+        FileTimeToLocalFileTime(&u, &l);
+    else
+        l = u;
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&l, &st);
+    out->tm_sec = st.wSecond;
+    out->tm_min = st.wMinute;
+    out->tm_hour = st.wHour;
+    out->tm_mday = st.wDay;
+    out->tm_mon = st.wMonth - 1;
+    out->tm_year = st.wYear - 1900;
+    out->tm_wday = st.wDayOfWeek;
+    int y = st.wYear;
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    out->tm_yday = before[st.wMonth - 1] + st.wDay - 1 + (leap && st.wMonth > 2 ? 1 : 0);
+    out->tm_isdst = 0;
+    return 0;
+}
+inline int localtime_s(struct tm *out, const time_t *t) { return __tm_of(t, out, true); }
+inline int gmtime_s(struct tm *out, const time_t *t) { return __tm_of(t, out, false); }
+inline struct tm __tm_buf;
+inline struct tm *localtime(const time_t *t)
+{
+    __tm_of(t, &__tm_buf, true);
+    return &__tm_buf;
+}
+inline struct tm *gmtime(const time_t *t)
+{
+    __tm_of(t, &__tm_buf, false);
+    return &__tm_buf;
+}
+
+inline void __tm_put(char *buf, size_t size, size_t &n, int v, int width)
+{
+    char d[12];
+    int k = 0;
+    do
+    {
+        d[k++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v || k < width);
+    while (k > 0 && n + 1 < size)
+        buf[n++] = d[--k];
+}
+
+// %Y %y %m %d %H %M %S %j %%: the fields the programs use
+inline size_t strftime(char *buf, size_t size, const char *fmt, const struct tm *t)
+{
+    size_t n = 0;
+    for (const char *p = fmt; *p && n + 1 < size; ++p)
+    {
+        if (*p != '%' || !p[1])
+        {
+            buf[n++] = *p;
+            continue;
+        }
+        ++p;
+        if (*p == 'Y')
+            __tm_put(buf, size, n, t->tm_year + 1900, 4);
+        else if (*p == 'y')
+            __tm_put(buf, size, n, (t->tm_year + 1900) % 100, 2);
+        else if (*p == 'm')
+            __tm_put(buf, size, n, t->tm_mon + 1, 2);
+        else if (*p == 'd')
+            __tm_put(buf, size, n, t->tm_mday, 2);
+        else if (*p == 'H')
+            __tm_put(buf, size, n, t->tm_hour, 2);
+        else if (*p == 'M')
+            __tm_put(buf, size, n, t->tm_min, 2);
+        else if (*p == 'S')
+            __tm_put(buf, size, n, t->tm_sec, 2);
+        else if (*p == 'j')
+            __tm_put(buf, size, n, t->tm_yday + 1, 3);
+        else if (*p == '%')
+            buf[n++] = '%';
+        else
+        {
+            buf[n++] = '%';
+            if (n + 1 < size)
+                buf[n++] = *p;
+        }
+    }
+    buf[n] = 0;
+    return n;
+}
+
+namespace std
+{
+using ::clock;
+using ::gmtime;
+using ::localtime;
+using ::strftime;
+using ::time;
+} // namespace std

@@ -43,35 +43,11 @@ list(APPEND QUANTUM_SOURCES
     "${CMAKE_SOURCE_DIR}/src/qpm/QpmManifest.sa"
     "${CMAKE_SOURCE_DIR}/src/qpm/QpmSemver.sa")
 
-# ── Java standard library: src/java/prelude/**/*.jpl, embedded as C++ ────────
-file(GLOB_RECURSE JAVA_PRELUDE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/java/prelude/*.jpl")
-set(JAVA_PRELUDE_CPP "${CMAKE_BINARY_DIR}/generated/JavaPreludeData.cpp")
-add_custom_command(
-    OUTPUT ${JAVA_PRELUDE_CPP}
-    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_SOURCE_DIR}/src/java/prelude -DOUT=${JAVA_PRELUDE_CPP}
-            -P ${CMAKE_SOURCE_DIR}/cmake/EmbedJavaPrelude.cmake
-    DEPENDS ${JAVA_PRELUDE_SOURCES} ${CMAKE_SOURCE_DIR}/cmake/EmbedJavaPrelude.cmake
-    COMMENT "Embedding the Java prelude")
-# one target owns the generation, so parallel builds of the executables share it
-add_custom_target(java_prelude DEPENDS ${JAVA_PRELUDE_CPP})
-list(APPEND QUANTUM_SOURCES ${JAVA_PRELUDE_CPP})
-
-# ── C/C++ library headers: lib/cpp/* (<filesystem>, <regex>, ...), embedded as C++ ─
-file(GLOB_RECURSE CPP_LIB_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/lib/cpp/*")
-set(CPP_LIB_CPP "${CMAKE_BINARY_DIR}/generated/CppLibData.cpp")
-add_custom_command(
-    OUTPUT ${CPP_LIB_CPP}
-    COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_SOURCE_DIR}/lib/cpp -DOUT=${CPP_LIB_CPP}
-            -P ${CMAKE_SOURCE_DIR}/cmake/EmbedCppLib.cmake
-    DEPENDS ${CPP_LIB_HEADERS} ${CMAKE_SOURCE_DIR}/cmake/EmbedCppLib.cmake
-    COMMENT "Embedding the C/C++ library headers")
-add_dependencies(java_prelude cpp_lib)
-add_custom_target(cpp_lib DEPENDS ${CPP_LIB_CPP})
-list(APPEND QUANTUM_SOURCES ${CPP_LIB_CPP})
+# The Java prelude and the library headers (lib/cpp, lib/native) are carried as
+# source: src/generated/*.sa, written by src/tools/embed.sa (picked up above).
 
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})
-add_dependencies(quantum java_prelude)
 target_compile_definitions(quantum PRIVATE QUANTUM_MODE_COMPILER=1)
 if(WIN32)
     target_link_libraries(quantum advapi32)
@@ -79,7 +55,6 @@ endif()
 
 # ── qrun  — pure interpreter ──────────────────────────────────────────────────
 add_executable(qrun ${QUANTUM_SOURCES})
-add_dependencies(qrun java_prelude)
 target_compile_definitions(qrun PRIVATE QRUN_MODE=1)
 if(WIN32)
     target_link_libraries(qrun advapi32)
@@ -87,7 +62,6 @@ endif()
 
 # ── quantum_stub  — standalone runtime template ───────────────────────────────
 add_executable(quantum_stub ${QUANTUM_SOURCES})
-add_dependencies(quantum_stub java_prelude)
 if(WIN32)
     target_link_libraries(quantum_stub advapi32)
 endif()

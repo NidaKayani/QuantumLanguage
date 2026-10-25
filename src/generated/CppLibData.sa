@@ -1,0 +1,476 @@
+// quantum: cpp
+// Generated from lib/cpp by src/tools/embed.sa. Do not edit.
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace cpp
+{
+const std::vector<std::pair<std::string, std::string>> &libraryHeaders()
+{
+    static const std::vector<std::pair<std::string, std::string>> items = {
+        {"filesystem", R"QCPPLIB(// <filesystem> for Quantum's C/C++ front-end. Paths are kept as their native
+// string; decomposition and the file-system queries are the VM's __q_fs_*
+// natives, so results match the host's std::filesystem exactly.
+#pragma once
+#include <string>
+#include <vector>
+#include <system_error>
+
+std::string __q_fs_part(const std::string &op, const std::string &p);
+std::string __q_fs_join(const std::string &a, const std::string &b);
+std::string __q_fs_replace_ext(const std::string &p, const std::string &ext);
+std::string __q_fs_relative_lex(const std::string &p, const std::string &base);
+std::string __q_fs_query(const std::string &op, const std::string &p);
+int __q_fs_kind(const std::string &p);
+std::vector<std::string> __q_fs_list(const std::string &p, bool recursive);
+bool __q_fs_mkdirs(const std::string &p);
+int __q_fs_remove(const std::string &p, bool all);
+bool __q_fs_copy(const std::string &from, const std::string &to, bool overwrite);
+double __q_fs_mtime(const std::string &p);
+
+namespace std
+{
+namespace filesystem
+{
+class path
+{
+  public:
+    path() {}
+    path(const std::string &s) : s_(s) {}
+    path(const char *s) : s_(s) {}
+
+    const std::string &string() const { return s_; }
+    std::string u8string() const { return s_; }
+    std::string generic_string() const { return __q_fs_part("generic", s_); }
+    const char *c_str() const { return s_.c_str(); }
+    bool empty() const { return s_.empty(); }
+
+    path parent_path() const { return path(__q_fs_part("parent", s_)); }
+    path filename() const { return path(__q_fs_part("filename", s_)); }
+    path stem() const { return path(__q_fs_part("stem", s_)); }
+    path extension() const { return path(__q_fs_part("extension", s_)); }
+    path root_path() const { return path(__q_fs_part("root", s_)); }
+    path lexically_normal() const { return path(__q_fs_part("normal", s_)); }
+    path lexically_relative(const path &base) const { return path(__q_fs_relative_lex(s_, base.s_)); }
+    bool has_parent_path() const { return !__q_fs_part("parent", s_).empty(); }
+    bool has_filename() const { return !__q_fs_part("filename", s_).empty(); }
+    bool has_extension() const { return !__q_fs_part("extension", s_).empty(); }
+    bool is_absolute() const { return __q_fs_part("absolute?", s_) == "1"; }
+    bool is_relative() const { return !is_absolute(); }
+
+    path &replace_extension(const path &ext = path())
+    {
+        s_ = __q_fs_replace_ext(s_, ext.s_);
+        return *this;
+    }
+    path &operator/=(const path &o)
+    {
+        s_ = __q_fs_join(s_, o.s_);
+        return *this;
+    }
+    path &operator+=(const std::string &o)
+    {
+        s_ += o;
+        return *this;
+    }
+    path operator/(const path &o) const { return path(__q_fs_join(s_, o.s_)); }
+    bool operator==(const path &o) const { return s_ == o.s_; }
+    bool operator!=(const path &o) const { return s_ != o.s_; }
+    bool operator<(const path &o) const { return s_ < o.s_; }
+
+  private:
+    std::string s_;
+};
+
+inline path u8path(const std::string &s) { return path(s); }
+
+class filesystem_error : public std::runtime_error
+{
+  public:
+    filesystem_error(const std::string &what) : std::runtime_error(what) {}
+};
+
+enum class directory_options
+{
+    none,
+    skip_permission_denied
+};
+enum class copy_options
+{
+    none,
+    skip_existing,
+    overwrite_existing
+};
+
+// 0 none, 1 regular file, 2 directory, 3 other
+inline bool exists(const path &p) { return __q_fs_kind(p.string()) != 0; }
+inline bool exists(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return exists(p);
+}
+inline bool is_regular_file(const path &p) { return __q_fs_kind(p.string()) == 1; }
+inline bool is_regular_file(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return is_regular_file(p);
+}
+inline bool is_directory(const path &p) { return __q_fs_kind(p.string()) == 2; }
+inline bool is_directory(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return is_directory(p);
+}
+inline bool is_empty(const path &p) { return __q_fs_query("empty?", p.string()) == "1"; }
+inline bool is_empty(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return is_empty(p);
+}
+inline path absolute(const path &p) { return path(__q_fs_query("absolute", p.string())); }
+inline path absolute(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return absolute(p);
+}
+inline path weakly_canonical(const path &p) { return path(__q_fs_query("weakly_canonical", p.string())); }
+inline path weakly_canonical(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return weakly_canonical(p);
+}
+inline path canonical(const path &p) { return path(__q_fs_query("canonical", p.string())); }
+inline path relative(const path &p, const path &base) { return path(__q_fs_relative_lex(absolute(p).string(), absolute(base).string())); }
+inline path relative(const path &p) { return relative(p, path(__q_fs_query("cwd", ""))); }
+inline path relative(const path &p, const path &base, std::error_code &ec)
+{
+    ec.clear();
+    return relative(p, base);
+}
+inline path current_path() { return path(__q_fs_query("cwd", "")); }
+inline bool create_directories(const path &p) { return __q_fs_mkdirs(p.string()); }
+inline bool create_directories(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return create_directories(p);
+}
+inline bool remove(const path &p) { return __q_fs_remove(p.string(), false) > 0; }
+inline bool remove(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return remove(p);
+}
+inline int remove_all(const path &p) { return __q_fs_remove(p.string(), true); }
+inline int remove_all(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return remove_all(p);
+}
+inline bool copy_file(const path &from, const path &to, copy_options o = copy_options::none)
+{
+    return __q_fs_copy(from.string(), to.string(), o == copy_options::overwrite_existing);
+}
+inline bool copy_file(const path &from, const path &to, copy_options o, std::error_code &ec)
+{
+    ec.clear();
+    return copy_file(from, to, o);
+}
+
+// file_time_type: ticks since the epoch; only compared and printed
+class file_time_type
+{
+  public:
+    file_time_type() {}
+    file_time_type(long long t) : t_(t) {}
+    static file_time_type min() { return file_time_type(-9223372036854775807LL); }
+    long long count() const { return t_; }
+    bool operator<(const file_time_type &o) const { return t_ < o.t_; }
+    bool operator>(const file_time_type &o) const { return t_ > o.t_; }
+    bool operator==(const file_time_type &o) const { return t_ == o.t_; }
+
+  private:
+    long long t_ = 0;
+};
+inline file_time_type last_write_time(const path &p) { return file_time_type((long long)__q_fs_mtime(p.string())); }
+inline file_time_type last_write_time(const path &p, std::error_code &ec)
+{
+    ec.clear();
+    return last_write_time(p);
+}
+
+class directory_entry
+{
+  public:
+    directory_entry() {}
+    directory_entry(const path &p) : p_(p) {}
+    const filesystem::path &path() const { return p_; }
+    bool is_regular_file() const { return filesystem::is_regular_file(p_); }
+    bool is_directory() const { return filesystem::is_directory(p_); }
+    bool exists() const { return filesystem::exists(p_); }
+
+  private:
+    filesystem::path p_;
+};
+
+// The listing is taken when the iterator is made; iteration walks it.
+class directory_iterator
+{
+  public:
+    directory_iterator() {}
+    directory_iterator(const path &p) { load(p, false); }
+    directory_iterator(const path &p, std::error_code &ec)
+    {
+        ec.clear();
+        load(p, false);
+    }
+    directory_iterator(const path &p, directory_options, std::error_code &ec)
+    {
+        ec.clear();
+        load(p, false);
+    }
+    std::vector<directory_entry>::const_iterator begin() const { return entries_.begin(); }
+    std::vector<directory_entry>::const_iterator end() const { return entries_.end(); }
+
+  protected:
+    void load(const path &p, bool recursive)
+    {
+        for (const std::string &s : __q_fs_list(p.string(), recursive))
+            entries_.push_back(directory_entry(filesystem::path(s)));
+    }
+    std::vector<directory_entry> entries_;
+};
+
+class recursive_directory_iterator : public directory_iterator
+{
+  public:
+    recursive_directory_iterator() {}
+    recursive_directory_iterator(const path &p) { load(p, true); }
+    recursive_directory_iterator(const path &p, std::error_code &ec)
+    {
+        ec.clear();
+        load(p, true);
+    }
+    recursive_directory_iterator(const path &p, directory_options, std::error_code &ec)
+    {
+        ec.clear();
+        load(p, true);
+    }
+};
+} // namespace filesystem
+} // namespace std
+)QCPPLIB"},
+        {"regex", R"QCPPLIB(// <regex> for Quantum's C/C++ front-end. A regex is a handle to a pattern
+// compiled by the VM (__q_re_* natives, ECMAScript syntax as std::regex); a
+// match records each group's position and length in the searched string.
+#pragma once
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+int __q_re_compile(const std::string &pattern, int flags);
+std::vector<int> __q_re_exec(int handle, const std::string &s, int start, int mode);
+std::string __q_re_replace(int handle, const std::string &s, const std::string &fmt, bool firstOnly);
+
+namespace std
+{
+class regex_error : public std::runtime_error
+{
+  public:
+    regex_error(const std::string &what) : std::runtime_error(what) {}
+};
+
+namespace regex_constants
+{
+// syntax options (bits passed to __q_re_compile)
+const int ECMAScript = 0;
+const int icase = 1;
+const int multiline = 2;
+const int nosubs = 4;
+const int optimize = 0;
+// match / format flags
+const int match_default = 0;
+const int match_continuous = 1;
+const int match_prev_avail = 0;
+const int format_default = 0;
+const int format_first_only = 2;
+} // namespace regex_constants
+
+class regex
+{
+  public:
+    typedef int flag_type;
+    static const int ECMAScript = 0;
+    static const int icase = 1;
+    static const int multiline = 2;
+    static const int nosubs = 4;
+    static const int optimize = 0;
+
+    regex() {}
+    regex(const std::string &pattern, int flags = 0) : h_(compile(pattern, flags)) {}
+    regex(const char *pattern, int flags = 0) : h_(compile(std::string(pattern), flags)) {}
+    int handle() const { return h_; }
+
+  private:
+    static int compile(const std::string &pattern, int flags)
+    {
+        int h = __q_re_compile(pattern, flags);
+        if (h < 0)
+            throw regex_error("Invalid regular expression: " + pattern);
+        return h;
+    }
+    int h_ = -1;
+};
+
+class ssub_match
+{
+  public:
+    ssub_match() {}
+    ssub_match(const std::string &text, bool matched) : text_(text), matched(matched) {}
+    std::string str() const { return text_; }
+    size_t length() const { return text_.size(); }
+    operator std::string() const { return text_; }
+    bool operator==(const std::string &o) const { return text_ == o; }
+    bool operator!=(const std::string &o) const { return text_ != o; }
+    bool matched = false;
+
+  private:
+    std::string text_;
+};
+
+class smatch
+{
+  public:
+    smatch() {}
+    bool empty() const { return pos_.empty(); }
+    bool ready() const { return true; }
+    size_t size() const { return pos_.size(); }
+    long position(size_t i = 0) const { return i < pos_.size() ? pos_[i] : -1; }
+    long length(size_t i = 0) const { return i < len_.size() && pos_[i] >= 0 ? len_[i] : 0; }
+    std::string str(size_t i = 0) const
+    {
+        return i < pos_.size() && pos_[i] >= 0 ? subject_.substr(pos_[i], len_[i]) : std::string();
+    }
+    ssub_match operator[](size_t i) const { return ssub_match(str(i), i < pos_.size() && pos_[i] >= 0); }
+    ssub_match prefix() const { return ssub_match(pos_.empty() ? subject_ : subject_.substr(0, pos_[0]), true); }
+    ssub_match suffix() const
+    {
+        return ssub_match(pos_.empty() ? std::string() : subject_.substr(pos_[0] + len_[0]), true);
+    }
+
+    // [pos0, len0, pos1, len1, ...] from __q_re_exec, -1 for a group that didn't take part
+    void assign(const std::string &subject, const std::vector<int> &groups)
+    {
+        subject_ = subject;
+        pos_.clear();
+        len_.clear();
+        for (size_t i = 0; i + 1 < groups.size(); i += 2)
+        {
+            pos_.push_back(groups[i]);
+            len_.push_back(groups[i + 1]);
+        }
+    }
+
+  private:
+    std::string subject_;
+    std::vector<long> pos_;
+    std::vector<long> len_;
+};
+
+// mode 0: search, 1: the whole string must match
+inline bool regex_search(const std::string &s, smatch &m, const regex &re, int flags = 0)
+{
+    std::vector<int> g = __q_re_exec(re.handle(), s, 0, (flags & regex_constants::match_continuous) ? 2 : 0);
+    m.assign(s, g);
+    return !g.empty();
+}
+inline bool regex_search(const std::string &s, const regex &re, int flags = 0)
+{
+    return !__q_re_exec(re.handle(), s, 0, (flags & regex_constants::match_continuous) ? 2 : 0).empty();
+}
+inline bool regex_match(const std::string &s, smatch &m, const regex &re, int flags = 0)
+{
+    std::vector<int> g = __q_re_exec(re.handle(), s, 0, 1);
+    m.assign(s, g);
+    return !g.empty();
+}
+inline bool regex_match(const std::string &s, const regex &re, int flags = 0)
+{
+    return !__q_re_exec(re.handle(), s, 0, 1).empty();
+}
+inline std::string regex_replace(const std::string &s, const regex &re, const std::string &fmt, int flags = 0)
+{
+    return __q_re_replace(re.handle(), s, fmt, (flags & regex_constants::format_first_only) != 0);
+}
+
+// Every match in [b, e) in turn; the default-constructed one is the end.
+class sregex_iterator
+{
+  public:
+    sregex_iterator() {}
+    sregex_iterator(std::string::const_iterator b, std::string::const_iterator e, const regex &re)
+        : subject_(b, e), h_(re.handle()), done_(false)
+    {
+        find(0);
+    }
+    const smatch &operator*() const { return m_; }
+    const smatch *operator->() const { return &m_; }
+    sregex_iterator &operator++()
+    {
+        long next = m_.position(0) + m_.length(0);
+        find(m_.length(0) == 0 ? next + 1 : next);
+        return *this;
+    }
+    bool operator==(const sregex_iterator &o) const { return done_ && o.done_; }
+    bool operator!=(const sregex_iterator &o) const { return !(*this == o); }
+
+  private:
+    void find(long start)
+    {
+        if (done_ || start > (long)subject_.size())
+        {
+            done_ = true;
+            return;
+        }
+        std::vector<int> g = __q_re_exec(h_, subject_, (int)start, 0);
+        if (g.empty())
+        {
+            done_ = true;
+            return;
+        }
+        m_.assign(subject_, g);
+    }
+    std::string subject_;
+    int h_ = -1;
+    bool done_ = true;
+    smatch m_;
+};
+} // namespace std
+)QCPPLIB"},
+        {"system_error", R"QCPPLIB(// <system_error> for Quantum's C/C++ front-end: the error_code the
+// <filesystem> overloads fill in. Operations here report failure through
+// their result, so a code is always clear.
+#pragma once
+#include <string>
+
+namespace std
+{
+class error_code
+{
+  public:
+    error_code() {}
+    error_code(int v) : v_(v) {}
+    void clear() { v_ = 0; }
+    int value() const { return v_; }
+    std::string message() const { return v_ ? "error " + std::to_string(v_) : "success"; }
+    explicit operator bool() const { return v_ != 0; }
+
+  private:
+    int v_ = 0;
+};
+} // namespace std
+)QCPPLIB"},
+    };
+    return items;
+}
+} // namespace cpp

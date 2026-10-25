@@ -724,9 +724,11 @@ public:
 
     // ─── Declarations ──────────────────────────────────────────────────────
 
+    std::vector<TArg> lastTemplateDefaults_; // parseTemplateHeader's defaults (empty TArg: none)
     std::vector<std::string> parseTemplateHeader(bool &isTemplate)
     {
         std::vector<std::string> params;
+        lastTemplateDefaults_.clear();
         isTemplate = false;
         while (is("template"))
         {
@@ -745,8 +747,12 @@ public:
                         params.push_back(n);
                         types_.insert(n);
                     }
+                    TArg dflt;
                     if (accept("="))
-                        parseTypeId();
+                        dflt.type = parseTypeId();
+                    lastTemplateDefaults_.resize(params.size());
+                    if (!params.empty())
+                        lastTemplateDefaults_.back() = dflt;
                 }
                 else
                 {
@@ -756,8 +762,12 @@ public:
                     accept("...");
                     if (at(TK::Ident))
                         params.push_back(ident());
+                    TArg dflt;
                     if (accept("="))
-                        parseCondExpr(true);
+                        dflt.expr = parseCondExpr(true);
+                    lastTemplateDefaults_.resize(params.size());
+                    if (!params.empty())
+                        lastTemplateDefaults_.back() = dflt;
                 }
                 if (!accept(","))
                     break;
@@ -792,6 +802,8 @@ public:
         }
         bool isTemplate = false;
         auto tparams = parseTemplateHeader(isTemplate);
+        std::vector<TArg> tdefaults = lastTemplateDefaults_;
+        tdefaults.resize(tparams.size());
         if (is("namespace"))
         {
             ++p_;
@@ -871,6 +883,7 @@ public:
                 addType(d->name[0], cur().file);
                 d->isTemplate = isTemplate;
                 d->templateParams = tparams;
+                d->templateDefaults = tdefaults;
                 if (isTemplate)
                     templates_.insert(d->name[0]);
                 return {d};
@@ -983,6 +996,7 @@ public:
             auto d = parseClassOrEnum(inClass, mk);
             d->isTemplate = isTemplate;
             d->templateParams = tparams;
+                d->templateDefaults = tdefaults;
             if (isTemplate)
                 templates_.insert(d->name.back());
             std::vector<DeclP> out = {d};
@@ -1140,6 +1154,7 @@ public:
             d->noreturn = noreturn;
             d->isTemplate = isTemplate;
             d->templateParams = tparams;
+                d->templateDefaults = tdefaults;
             if (isTemplate)
                 templates_.insert(qname.back());
             std::string owner = inClass ? cls : (qname.size() >= 2 ? qname[qname.size() - 2] : "");
@@ -2238,9 +2253,14 @@ public:
         if (is("delete"))
         {
             ++p_;
+            bool array = false;
             if (is("[") && isAt(1, "]"))
+            {
                 p_ += 2;
+                array = true;
+            }
             auto e = mk(EK::Delete, line);
+            e->newArray = array; // delete[]
             e->kids.push_back(parseUnary());
             return e;
         }
@@ -2578,7 +2598,10 @@ public:
             if (tk.text == "::")
             {
                 ++p_;
-                return parsePrimary();
+                auto g = parsePrimary();
+                if (g->k == EK::Name)
+                    g->global = true; // ::name
+                return g;
             }
             fail("unexpected '" + tk.text + "'");
         case TK::Ident:
@@ -2695,6 +2718,7 @@ public:
             allTargs.insert(allTargs.begin(), e->name.size() - before, std::vector<TArg>());
         }
         e->targs = allTargs.back();
+        e->scopeTargs = allTargs; // per component: X<T>::f keeps X's
         // A type used as a value: T(args) / T{args}
         bool isType = e->name.size() > 1 ? qualifiedType(e->name.back()) : unqualType(t_[p_ - 1]);
         if (isType && (is("(") || is("{")))
