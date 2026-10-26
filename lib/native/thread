@@ -45,6 +45,12 @@ class thread
         h_ = nullptr;
     }
     bool joinable() const { return h_ != nullptr; }
+    static unsigned hardware_concurrency()
+    {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return info.dwNumberOfProcessors;
+    }
 
   private:
     HANDLE h_;

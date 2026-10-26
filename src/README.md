@@ -28,17 +28,17 @@ Checks:
 
 ## Building without a C++ compiler
 
-`../build-quantum.bat` builds `quantum.exe` from this directory with no C++
-compiler, using `tools/selfhost/quantum.sa`, the compiler's command-line
-driver:
-- `../seed/quantum.exe` (the VM plus that driver as bytecode) compiles it;
-- the result compiles itself again.
+`../build-quantum.bat` builds every tool from this directory with no C++
+compiler. `../seed/qrun.exe` is qrun compiled to x86-64 by `native/`:
+- it compiles `tools/selfhost/qrun_all.sa` (all of qrun: compiler and VM) to a
+  new native qrun;
+- that qrun compiles itself again, then `quantum_all.sa`, `stub_all.sa` and
+  `qpm_all.sa` (quantum.exe, quantum_stub.exe, qpm.exe).
 
-`--verify` checks the fixed point.
-
-The VM runtime (`vm/`, `Value.sa`) runs as native code inside the seed, so
-an edit to it needs the VM recompiled. Until `native/` can compile the VM, that
-step uses CMake and g++ (`../CMakeLists.txt`).
+The drivers include every source as its own translation unit
+(`#pragma quantum_tu`), the files CMake builds for each target. `--verify`
+checks the fixed point; `tools/native_bootstrap.sh` checks that qrun built by
+g++, by itself and by that build are all byte-identical.
 
 ## The native backend
 
@@ -48,6 +48,9 @@ assembler, linker or C++ compiler (`quantum --native prog.cpp prog.exe`).
 - integers, floating point, pointers, arrays
 - classes with constructors, destructors, inheritance and virtual functions
 - references, operator overloading, function and class templates
-- lambdas, exceptions
+- lambdas, exceptions, threads and atomics
+- the standard library in `../lib/native/` (strings, containers, streams,
+  filesystem, regex, random, chrono, zlib, the Windows API), written in C++
+  and carried inside the compiler (`tools/embed.sa` writes `generated/`)
 
-The standard library comes next, then the VM itself.
+It compiles the whole of Quantum: qrun, quantum, quantum_stub and qpm.

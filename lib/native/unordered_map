@@ -131,7 +131,59 @@ class unordered_map
         n->kv.second = kv.second;
         return pair<iterator, bool>(iterator(n), true);
     }
-    pair<iterator, bool> emplace(const K &key, const V &value) { return insert(pair<K, V>(key, value)); }
+    pair<iterator, bool> insert(pair<K, V> &&kv)
+    {
+        __hnode<K, V> *n = lookup(kv.first);
+        if (n)
+            return pair<iterator, bool>(iterator(n), false);
+        n = add(kv.first);
+        n->kv.second = std::move(kv.second);
+        return pair<iterator, bool>(iterator(n), true);
+    }
+    template <typename A, typename B>
+    pair<iterator, bool> emplace(A &&key, B &&value)
+    {
+        K k(std::forward<A>(key));
+        __hnode<K, V> *n = lookup(k);
+        if (n)
+            return pair<iterator, bool>(iterator(n), false);
+        n = add(k);
+        n->kv.second = V(std::forward<B>(value));
+        return pair<iterator, bool>(iterator(n), true);
+    }
+    template <typename A>
+    pair<iterator, bool> try_emplace(const K &key, A &&value)
+    {
+        __hnode<K, V> *n = lookup(key);
+        if (n)
+            return pair<iterator, bool>(iterator(n), false);
+        n = add(key);
+        n->kv.second = V(std::forward<A>(value));
+        return pair<iterator, bool>(iterator(n), true);
+    }
+    pair<iterator, bool> insert_or_assign(const K &key, const V &value)
+    {
+        __hnode<K, V> *n = lookup(key);
+        bool added = !n;
+        if (!n)
+            n = add(key);
+        n->kv.second = value;
+        return pair<iterator, bool>(iterator(n), added);
+    }
+    void swap(unordered_map &o)
+    {
+        std::swap(buckets_, o.buckets_);
+        std::swap(nbuckets_, o.nbuckets_);
+        std::swap(size_, o.size_);
+        std::swap(head_, o.head_);
+        std::swap(tail_, o.tail_);
+    }
+    template <typename __InputIt>
+    void insert(__InputIt first, __InputIt last)
+    {
+        for (; first != last; ++first)
+            insert(*first);
+    }
     size_t erase(const K &key)
     {
         __hnode<K, V> *n = lookup(key);

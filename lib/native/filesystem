@@ -17,28 +17,23 @@ namespace filesystem
 
 inline bool __is_sep(char c) { return c == '/' || c == '\\'; }
 
-// a NUL-terminated UTF-16 string for the wide Win32 calls
-class wstring
+// UTF-8 to the UTF-16 the wide Win32 calls take, and back
+inline std::wstring __wide(const string &s)
 {
-  public:
-    void resize(size_t n) { v_.resize(n + 1); }
-    wchar_t &operator[](size_t i) { return v_[i]; }
-    const wchar_t *c_str() const { return v_.empty() ? L"" : v_.data(); }
-    bool empty() const { return v_.size() <= 1; }
-
-  private:
-    vector<wchar_t> v_;
-};
-
-inline wstring __wide(const string &s)
-{
-    wstring w;
+    std::wstring w;
     if (s.empty())
         return w;
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
     w.resize((size_t)n);
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
     return w;
+}
+inline int __wlen(const wchar_t *w)
+{
+    int n = 0;
+    while (w && w[n])
+        ++n;
+    return n;
 }
 inline string __narrow(const wchar_t *w, int len)
 {
@@ -58,6 +53,8 @@ class path
     path() {}
     path(const string &s) : s_(s) {}
     path(const char *s) : s_(s) {}
+    path(const std::wstring &w) : s_(__narrow(w.c_str(), (int)w.size())) {}
+    path(const wchar_t *w) : s_(__narrow(w, __wlen(w))) {}
 
     const string &native() const { return s_; }
     const string &string() const { return s_; }
@@ -70,6 +67,10 @@ class path
                 g[i] = '/';
         return g;
     }
+    std::string generic_u8string() const { return generic_string(); }
+    std::wstring wstring() const { return __wide(s_); }
+    std::wstring generic_wstring() const { return __wide(generic_string()); }
+    std::string u8string_() const { return s_; }
     const char *c_str() const { return s_.c_str(); }
     operator std::string() const { return s_; }
     bool empty() const { return s_.empty(); }
@@ -531,7 +532,9 @@ inline path absolute(const path &p, error_code &ec)
     ec.clear();
     if (p.empty())
         return path();
-    wstring w = __wide(p.string());
+    if (p.is_absolute())
+        return p; // as it is: no . or .. resolved (libstdc++ does the same)
+    std::wstring w = __wide(p.string());
     wchar_t buf[2048];
     DWORD n = GetFullPathNameW(w.c_str(), 2048, buf, nullptr);
     if (n == 0)
@@ -643,6 +646,11 @@ class directory_entry
     bool exists() const { return filesystem::exists(p_); }
     bool is_regular_file() const { return filesystem::is_regular_file(p_); }
     bool is_directory() const { return filesystem::is_directory(p_); }
+    bool is_directory(error_code &ec) const { return filesystem::is_directory(p_, ec); }
+    bool is_regular_file(error_code &ec) const { return filesystem::is_regular_file(p_, ec); }
+    bool exists(error_code &ec) const { return filesystem::exists(p_, ec); }
+    bool is_symlink() const { return false; }
+    unsigned long long file_size() const { return filesystem::file_size(p_); }
     file_status status() const { return filesystem::status(p_); }
 
   private:
@@ -654,7 +662,7 @@ inline vector<string> __list(const path &dir, bool &ok)
 {
     vector<string> out;
     WIN32_FIND_DATAW fd;
-    wstring pattern = __wide((dir / path("*")).string());
+    std::wstring pattern = __wide((dir / path("*")).string());
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
     ok = h != (HANDLE)(long long)-1;
     if (!ok)
@@ -686,6 +694,11 @@ class directory_iterator
     }
     directory_iterator(const path &p, error_code &ec) : i_(0) { __load(p, false, ec); }
     directory_iterator(const path &p, directory_options, error_code &ec) : i_(0) { __load(p, false, ec); }
+    directory_iterator(const path &p, directory_options) : i_(0)
+    {
+        error_code ec;
+        __load(p, false, ec);
+    }
     const directory_entry &operator*() const { return (*e_)[i_]; }
     const directory_entry *operator->() const { return &(*e_)[i_]; }
     directory_iterator &operator++()
@@ -741,32 +754,136 @@ class directory_iterator
     }
 };
 
-class recursive_directory_iterator : public directory_iterator
+// walks the tree as it goes (pre-order): a stack of directory listings
+class recursive_directory_iterator
 {
   public:
     recursive_directory_iterator() {}
     explicit recursive_directory_iterator(const path &p)
     {
         error_code ec;
-        __load(p, true, ec);
+        __start(p, ec);
         if (ec)
             throw filesystem_error("recursive directory iterator cannot open directory", p, ec);
     }
-    recursive_directory_iterator(const path &p, error_code &ec) { __load(p, true, ec); }
-    recursive_directory_iterator(const path &p, directory_options, error_code &ec) { __load(p, true, ec); }
+    recursive_directory_iterator(const path &p, error_code &ec) { __start(p, ec); }
+    recursive_directory_iterator(const path &p, directory_options, error_code &ec) { __start(p, ec); }
+    recursive_directory_iterator(const path &p, directory_options)
+    {
+        error_code ec;
+        __start(p, ec);
+    }
+    const directory_entry &operator*() const { return st_->cur; }
+    const directory_entry *operator->() const { return &st_->cur; }
     recursive_directory_iterator &operator++()
     {
-        ++i_;
+        __advance();
         return *this;
     }
     recursive_directory_iterator &increment(error_code &ec)
     {
         ec.clear();
-        ++i_;
+        __advance();
         return *this;
     }
+    void disable_recursion_pending()
+    {
+        if (st_)
+            st_->skip = true;
+    }
+    void pop()
+    {
+        if (!st_ || st_->levels.empty())
+            return;
+        st_->levels.pop_back();
+        st_->skip = true;
+        __advance();
+    }
+    int depth() const { return st_ ? (int)st_->levels.size() - 1 : 0; }
+    bool __atEnd() const { return !st_ || st_->levels.empty(); }
+    bool operator==(const recursive_directory_iterator &o) const
+    {
+        if (__atEnd() || o.__atEnd())
+            return __atEnd() == o.__atEnd();
+        return st_ == o.st_;
+    }
+    bool operator!=(const recursive_directory_iterator &o) const { return !(*this == o); }
     recursive_directory_iterator begin() const { return *this; }
     recursive_directory_iterator end() const { return recursive_directory_iterator(); }
+
+  private:
+    struct Level
+    {
+        path dir;
+        vector<string> names;
+        size_t i = 0;
+    };
+    struct State
+    {
+        vector<Level> levels;
+        directory_entry cur;
+        bool skip = false;
+    };
+    shared_ptr<State> st_;
+
+    void __start(const path &p, error_code &ec)
+    {
+        ec.clear();
+        bool ok = true;
+        Level top;
+        top.dir = p;
+        top.names = __list(p, ok);
+        if (!ok)
+        {
+            ec = __last_error();
+            return;
+        }
+        st_ = make_shared<State>();
+        if (top.names.empty())
+        {
+            st_.reset();
+            return;
+        }
+        st_->levels.push_back(top);
+        __settle();
+    }
+    // the current entry from the top listing
+    void __settle()
+    {
+        Level &l = st_->levels.back();
+        st_->cur = directory_entry(l.dir / path(l.names[l.i]));
+        st_->skip = false;
+    }
+    void __advance()
+    {
+        if (__atEnd())
+            return;
+        // into the current directory, unless told not to
+        if (!st_->skip && st_->cur.is_directory())
+        {
+            bool ok = true;
+            Level sub;
+            sub.dir = st_->cur.path();
+            sub.names = __list(sub.dir, ok);
+            if (ok && !sub.names.empty())
+            {
+                st_->levels.push_back(sub);
+                __settle();
+                return;
+            }
+        }
+        // on to the next name, climbing out of finished listings
+        while (!st_->levels.empty())
+        {
+            Level &l = st_->levels.back();
+            if (++l.i < l.names.size())
+            {
+                __settle();
+                return;
+            }
+            st_->levels.pop_back();
+        }
+    }
 };
 
 inline bool is_empty(const path &p, error_code &ec)
@@ -836,7 +953,7 @@ inline bool remove(const path &p, error_code &ec)
     file_status s = status(p);
     if (!exists(s))
         return false;
-    wstring w = __wide(p.string());
+    std::wstring w = __wide(p.string());
     bool ok = is_directory(s) ? RemoveDirectoryW(w.c_str()) != 0 : DeleteFileW(w.c_str()) != 0;
     if (!ok)
         ec = __last_error();

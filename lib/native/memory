@@ -119,6 +119,13 @@ class shared_ptr
         if (c_)
             c_->__addRef();
     }
+    // aliasing: shares r's ownership, points at p
+    template <typename U>
+    shared_ptr(const shared_ptr<U> &r, T *p) : p_(p), c_(r.__count())
+    {
+        if (c_)
+            c_->__addRef();
+    }
     shared_ptr(const shared_ptr &o) : p_(o.p_), c_(o.c_)
     {
         if (c_)

@@ -20,23 +20,14 @@ struct __endl_t
 struct __flush_t
 {
 };
-struct __fixed_t
+// manipulators of one type each (so `c ? std::hex : std::oct` works)
+struct __base_t
 {
+    int base;
 };
-struct __scientific_t
+struct __floatfmt_t
 {
-};
-struct __defaultfloat_t
-{
-};
-struct __hex_t
-{
-};
-struct __dec_t
-{
-};
-struct __oct_t
-{
+    int mode; // 0 %g, 1 fixed, 2 scientific
 };
 struct __boolalpha_t
 {
@@ -54,6 +45,12 @@ struct __showpoint_t
 {
 };
 struct __uppercase_t
+{
+};
+struct __nouppercase_t
+{
+};
+struct __noshowpoint_t
 {
 };
 struct __setprecision_t
@@ -86,6 +83,10 @@ class ios_base
     static const int cur = 1;
     static const int end = 2;
 };
+typedef ios_base ios;
+typedef long long streamsize;
+typedef long long streamoff;
+typedef long long streampos;
 
 class __stream;
 
@@ -99,7 +100,7 @@ class __stream : public ios_base
   public:
     __stream()
         : prec_(6), float_(0), base_(10), width_(0), fill_(' '), boolalpha_(false), left_(false), showpoint_(false),
-          upper_(false), fail_(false), eof_(false)
+          upper_(false), fail_(false), eof_(false), gcount_(0)
     {
     }
     virtual ~__stream() {}
@@ -115,6 +116,45 @@ class __stream : public ios_base
         while ((c = __getc()) != -1)
             r += (char)c;
         return r;
+    }
+    // positions, for the streams that have them (-1 / false: none)
+    virtual long long __tell(bool put) { return -1; }
+    virtual bool __seek(bool put, long long off, int dir) { return false; }
+
+    // ── unformatted input, positions ──
+    __stream &read(char *s, long long n)
+    {
+        gcount_ = 0;
+        while (gcount_ < n)
+        {
+            int c = __getc();
+            if (c == -1)
+            {
+                eof_ = true;
+                fail_ = true;
+                break;
+            }
+            s[gcount_++] = (char)c;
+        }
+        return *this;
+    }
+    long long gcount() const { return gcount_; }
+    long long tellg() { return fail_ ? -1 : __tell(false); }
+    long long tellp() { return fail_ ? -1 : __tell(true); }
+    __stream &seekg(long long pos) { return seekg(pos, beg); }
+    __stream &seekg(long long off, int dir)
+    {
+        eof_ = false;
+        if (fail_ || !__seek(false, off, dir))
+            fail_ = true;
+        return *this;
+    }
+    __stream &seekp(long long pos) { return seekp(pos, beg); }
+    __stream &seekp(long long off, int dir)
+    {
+        if (fail_ || !__seek(true, off, dir))
+            fail_ = true;
+        return *this;
     }
 
     // ── output ──
@@ -244,34 +284,14 @@ class __stream : public ios_base
         return *this;
     }
     __stream &operator<<(const __flush_t &) { return *this; }
-    __stream &operator<<(const __fixed_t &)
+    __stream &operator<<(const __floatfmt_t &f)
     {
-        float_ = 1;
+        float_ = f.mode;
         return *this;
     }
-    __stream &operator<<(const __scientific_t &)
+    __stream &operator<<(const __base_t &b)
     {
-        float_ = 2;
-        return *this;
-    }
-    __stream &operator<<(const __defaultfloat_t &)
-    {
-        float_ = 0;
-        return *this;
-    }
-    __stream &operator<<(const __hex_t &)
-    {
-        base_ = 16;
-        return *this;
-    }
-    __stream &operator<<(const __dec_t &)
-    {
-        base_ = 10;
-        return *this;
-    }
-    __stream &operator<<(const __oct_t &)
-    {
-        base_ = 8;
+        base_ = b.base;
         return *this;
     }
     __stream &operator<<(const __boolalpha_t &)
@@ -302,6 +322,16 @@ class __stream : public ios_base
     __stream &operator<<(const __uppercase_t &)
     {
         upper_ = true;
+        return *this;
+    }
+    __stream &operator<<(const __nouppercase_t &)
+    {
+        upper_ = false;
+        return *this;
+    }
+    __stream &operator<<(const __noshowpoint_t &)
+    {
+        showpoint_ = false;
         return *this;
     }
     __stream &operator<<(const __setprecision_t &m)
@@ -450,11 +480,33 @@ class __stream : public ios_base
     char fill_;
     bool boolalpha_, left_, showpoint_, upper_;
     bool fail_, eof_;
+    long long gcount_;
 };
 
 typedef __stream ostream;
 typedef __stream istream;
 typedef __stream iostream;
+
+// a stream's remaining characters, one by one (end: the default one)
+template <typename C>
+class istreambuf_iterator
+{
+  public:
+    istreambuf_iterator() : s_(nullptr) {}
+    istreambuf_iterator(__stream &s) : s_(&s) {}
+    C operator*() const { return (C)s_->__peekc(); }
+    istreambuf_iterator &operator++()
+    {
+        s_->__getc();
+        return *this;
+    }
+    bool __end() const { return !s_ || s_->__peekc() == -1; }
+    bool operator==(const istreambuf_iterator &o) const { return __end() == o.__end(); }
+    bool operator!=(const istreambuf_iterator &o) const { return __end() != o.__end(); }
+
+  private:
+    __stream *s_;
+};
 
 // std::getline(stream, line [, delimiter])
 inline __stream &getline(__stream &in, string &line, char delim = '\n')
@@ -531,18 +583,20 @@ __console clog(2);
 __console cin(0);
 __endl_t endl;
 __flush_t flush;
-__fixed_t fixed;
-__scientific_t scientific;
-__defaultfloat_t defaultfloat;
-__hex_t hex;
-__dec_t dec;
-__oct_t oct;
+__floatfmt_t fixed = {1};
+__floatfmt_t scientific = {2};
+__floatfmt_t defaultfloat = {0};
+__base_t hex = {16};
+__base_t dec = {10};
+__base_t oct = {8};
 __boolalpha_t boolalpha;
 __noboolalpha_t noboolalpha;
 __left_t left;
 __right_t right;
 __showpoint_t showpoint;
 __uppercase_t uppercase;
+__nouppercase_t nouppercase;
+__noshowpoint_t noshowpoint;
 
 inline __setprecision_t setprecision(int n)
 {

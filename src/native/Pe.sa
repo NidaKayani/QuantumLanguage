@@ -196,7 +196,7 @@ std::string writePe(const Asm &code, int entry, const std::vector<Import> &impor
     put32(pe, 0);           // CheckSum
     put16(pe, 3);           // Subsystem: console
     put16(pe, 0x8100);      // NX_COMPAT | TERMINAL_SERVER_AWARE (fixed base: no relocations)
-    put64(pe, 0x100000);    // stack reserve
+    put64(pe, 0x4000000);   // stack reserve: 64 MB (frames are plain stack slots)
     put64(pe, 0x1000);      // stack commit
     put64(pe, 0x100000);    // heap reserve
     put64(pe, 0x1000);      // heap commit

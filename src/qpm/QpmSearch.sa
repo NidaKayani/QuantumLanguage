@@ -215,12 +215,13 @@ namespace qpm
             if (!parseIsoUtc(iso, then))
                 return "";
             double secs = std::max(0.0, std::difftime(std::time(nullptr), then));
-            static const struct
+            struct Unit
             {
                 double seconds;
                 const char *unit;
-            } units[] = {{31536000, "year"}, {2592000, "month"}, {604800, "week"},
-                         {86400, "day"},     {3600, "hour"},     {60, "minute"}};
+            };
+            static const Unit units[] = {{31536000, "year"}, {2592000, "month"}, {604800, "week"},
+                                         {86400, "day"},     {3600, "hour"},     {60, "minute"}};
             for (const auto &u : units)
             {
                 if (secs >= u.seconds)

@@ -259,6 +259,8 @@ private:
                         return;
                     }
                     quoted(t, s_[i_]);
+                    if (pre == "u" || pre == "U" || pre == "L")
+                        t.text = pre + t.text; // a wide literal: the parser reads the prefix
                     return;
                 }
             }
@@ -726,6 +728,11 @@ private:
         }
         if (name == "error")
             fail("#error in source", hash);
+        if (name == "pragma" && d.size() > 1 && d[1].text == "quantum_tu")
+        {
+            ++tu_; // a unity build's next file: its own translation unit
+            return;
+        }
         // pragma, line, warning, ident: nothing to do
     }
 

@@ -883,22 +883,23 @@ int64_t parseJavaLong(const QV &v, int radix, bool isInt)
         if (s.size() == 1)
             bad();
     }
-    unsigned __int128 v128 = 0;
+    // past 64 bits is past every limit: an overflow is a bad number
+    uint64_t acc = 0;
     for (; i < s.size(); ++i)
     {
         char c = s[i];
         int d = std::isdigit((unsigned char)c) ? c - '0' : std::isalpha((unsigned char)c) ? std::tolower(c) - 'a' + 10 : 99;
         if (d >= radix)
             bad();
-        v128 = v128 * radix + d;
-        if (v128 > ((unsigned __int128)1 << 64))
+        if (acc > (UINT64_MAX - (uint64_t)d) / (uint64_t)radix)
             bad();
+        acc = acc * (uint64_t)radix + (uint64_t)d;
     }
-    unsigned __int128 lim = isInt ? (neg ? ((unsigned __int128)1 << 31) : (((unsigned __int128)1 << 31) - 1))
-                                  : (neg ? ((unsigned __int128)1 << 63) : (((unsigned __int128)1 << 63) - 1));
-    if (v128 > lim)
+    uint64_t lim = isInt ? (neg ? ((uint64_t)1 << 31) : (((uint64_t)1 << 31) - 1))
+                         : (neg ? ((uint64_t)1 << 63) : (((uint64_t)1 << 63) - 1));
+    if (acc > lim)
         bad();
-    return neg ? (int64_t)(0 - (uint64_t)v128) : (int64_t)(uint64_t)v128;
+    return neg ? (int64_t)(0 - acc) : (int64_t)acc;
 }
 
 double parseJavaDouble(const QV &v)

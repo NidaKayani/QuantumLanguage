@@ -65,6 +65,25 @@ class __diter
     size_t i_;
 };
 
+// in reverse: i_ is one past the current index
+template <typename T>
+class __drev
+{
+  public:
+    __drev(const deque<T> *d, size_t i) : d_(d), i_(i) {}
+    T &operator*() const { return d_->__at(i_ - 1); }
+    T *operator->() const { return &d_->__at(i_ - 1); }
+    __drev &operator++()
+    {
+        --i_;
+        return *this;
+    }
+    bool operator==(const __drev &o) const { return i_ == o.i_; }
+    bool operator!=(const __drev &o) const { return i_ != o.i_; }
+    const deque<T> *d_;
+    size_t i_;
+};
+
 template <typename T>
 class deque
 {
@@ -129,6 +148,10 @@ class deque
     iterator end() const { return iterator(this, size_); }
     iterator cbegin() const { return iterator(this, 0); }
     iterator cend() const { return iterator(this, size_); }
+    __drev<T> rbegin() const { return __drev<T>(this, size_); }
+    __drev<T> rend() const { return __drev<T>(this, 0); }
+    const T &front() const { return __at(0); }
+    const T &back() const { return __at(size_ - 1); }
 
     void push_back(const T &v)
     {

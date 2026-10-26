@@ -482,13 +482,14 @@ Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp`
 ### Building without a C++ compiler
 
 ```bat
-build-quantum.bat            :: build\selfhost\quantum.exe
-build-quantum.bat --verify   :: and check it rebuilds itself byte for byte
+build-quantum.bat            :: build\selfhost\{qrun,quantum,quantum_stub,qpm}.exe
+build-quantum.bat --verify   :: and check the new qrun rebuilds itself byte for byte
+build-quantum.bat --seed     :: and make the new qrun the seed
 ```
 
-No g++, CMake or MSYS2 is involved, only Windows' `cmd`. `seed\quantum.exe` is a Quantum VM carrying the compiler as bytecode. It compiles the compiler's source in `src\` (`--build-self`), and the result compiles itself again. Each step takes about 3 minutes. The new `quantum.exe` runs programs, writes bytecode (`--emit-qbc`), bundles standalone executables (`--bundle`), and compiles C++ to native x86-64 code (`--native`).
+No g++, CMake or MSYS2 is involved, only Windows' `cmd`. `seed\qrun.exe` is qrun compiled to x86-64 machine code by Quantum's own native backend (`src/native/`). It compiles `src\` (`--native src\tools\selfhost\qrun_all.sa`) into a new qrun, which compiles itself again; that one builds `quantum.exe`, `quantum_stub.exe` and `qpm.exe`. Every tool, the VM included, is native code Quantum generated: there is no C++ compiler, assembler or linker anywhere in the chain, and the C runtime functions used are Windows' own (`ucrtbase.dll`). A qrun build takes about 30 seconds.
 
-Edits to the compiler (front-ends, dialects, bytecode compiler, native backend) take effect through this build. The VM inside the seed is native code, so an edit to the VM runtime itself (`src/vm/`, `src/Value.sa`) needs that VM recompiled. Until the native backend (`src/native/`) can compile the VM, that one step uses the CMake/g++ build below. After it, the new `quantum_stub.exe` plus a `--build-self` gives a new seed.
+The build is a fixed point: the qrun built by g++ (below), by the seed and by itself are byte-identical (`bash src/tools/native_bootstrap.sh` checks all three). Any edit under `src\`, the VM runtime included, takes effect through this build; `--seed` then makes it the new seed.
 
 ### Building with CMake and g++
 

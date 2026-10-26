@@ -35,7 +35,11 @@ int Asm::newLabel()
     return (int)labels_.size() - 1;
 }
 
-void Asm::bind(int label) { labels_[label] = size(); }
+void Asm::bind(int label)
+{
+    labels_[label] = size();
+    leaEnd_ = -1; // code can arrive here from elsewhere
+}
 
 void Asm::resolve()
 {
@@ -57,9 +61,15 @@ void Asm::rex(bool w, int reg, int rm)
         byte(b);
 }
 
-// ModRM for [rbp+disp32] with `reg` in the reg field
+// ModRM for [rbp+disp] with `reg` in the reg field
 void Asm::modrmRbp(int reg, int disp)
 {
+    if (disp >= -128 && disp <= 127)
+    {
+        byte(0x40 | ((reg & 7) << 3) | 5);
+        byte(disp & 255);
+        return;
+    }
     byte(0x80 | ((reg & 7) << 3) | 5);
     dword(disp);
 }
@@ -114,8 +124,48 @@ void Asm::store(int disp, int r)
 
 void Asm::lea(int r, int disp)
 {
+    int start = size();
     rex(true, r, RBP);
     byte(0x8D);
+    modrmRbp(r, disp);
+    if (r == RAX)
+    {
+        leaStart_ = start;
+        leaEnd_ = size();
+        leaDisp_ = disp;
+    }
+}
+
+bool Asm::takeLeaRax(int &disp)
+{
+    if (leaEnd_ < 0 || leaEnd_ != size())
+        return false;
+    code.resize(leaStart_);
+    leaEnd_ = -1;
+    disp = leaDisp_;
+    return true;
+}
+
+// r = the size-byte value at [rbp+disp], sign- or zero-extended
+void Asm::loadRbp(int r, int disp, int size, bool isSigned)
+{
+    switch (size)
+    {
+    case 1:
+    case 2:
+        rex(isSigned, r, RBP);
+        byte(0x0F);
+        byte(size == 1 ? (isSigned ? 0xBE : 0xB6) : (isSigned ? 0xBF : 0xB7));
+        break;
+    case 4:
+        rex(isSigned, r, RBP);
+        byte(isSigned ? 0x63 : 0x8B);
+        break;
+    default:
+        rex(true, r, RBP);
+        byte(0x8B);
+        break;
+    }
     modrmRbp(r, disp);
 }
 
@@ -416,6 +466,28 @@ void Asm::leaLabel(int r, int label)
     dword(0);
 }
 
+// rcx = &table[rax]; each entry holds its target relative to its own end
+void Asm::tableJump(int table)
+{
+    leaLabel(RCX, table);
+    byte(0x48); // lea rcx, [rcx+rax*4]
+    byte(0x8D);
+    byte(0x0C);
+    byte(0x81);
+    byte(0x48); // movsxd rax, dword [rcx]
+    byte(0x63);
+    byte(0x01);
+    alu(0x01, RAX, RCX);
+    addImm(RAX, 4);
+    jmpReg(RAX);
+}
+
+void Asm::tableEntry(int label)
+{
+    fixups_.push_back({size(), label});
+    dword(0);
+}
+
 void Asm::loadDisp(int r, int base, int disp8)
 {
     rex(true, r, base);
@@ -434,6 +506,7 @@ Asm::Mark Asm::mark() const
 void Asm::rewind(const Mark &m)
 {
     code.resize(m.code);
+    leaEnd_ = -1;
     fixups_.resize(m.fixups);
     importRefs.resize(m.imports);
     dataRefs.resize(m.data);

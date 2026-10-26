@@ -16,7 +16,7 @@ struct __tnode
     __tnode *right;
     __tnode *parent;
     int height;
-    explicit __tnode(const pair<K, V> &x) : kv(x), left(nullptr), right(nullptr), parent(nullptr), height(1) {}
+    explicit __tnode(pair<K, V> &&x) : kv(std::move(x)), left(nullptr), right(nullptr), parent(nullptr), height(1) {}
 };
 
 template <typename K, typename V>
@@ -44,6 +44,15 @@ class __tree
             bool added = false;
             insert(n->kv, added);
         }
+    }
+    void swap(__tree &o)
+    {
+        Node *r = root_;
+        size_t n = size_;
+        root_ = o.root_;
+        size_ = o.size_;
+        o.root_ = r;
+        o.size_ = n;
     }
     void takeFrom(__tree &o)
     {
@@ -148,7 +157,7 @@ class __tree
     }
 
     // the node with kv's key: the one there, or kv added
-    Node *insert(const pair<K, V> &kv, bool &added)
+    Node *insert(pair<K, V> kv, bool &added)
     {
         Node *p = nullptr, *n = root_;
         bool left = false;
@@ -171,7 +180,7 @@ class __tree
                 return n;
             }
         }
-        Node *x = new Node(kv);
+        Node *x = new Node(std::move(kv));
         x->parent = p;
         if (!p)
             root_ = x;
@@ -181,6 +190,30 @@ class __tree
             p->right = x;
         ++size_;
         added = true;
+        rebalance(p);
+        return x;
+    }
+
+    // a node for kv even when its key is there: after the equal ones
+    Node *insertMulti(pair<K, V> kv)
+    {
+        Node *p = nullptr, *n = root_;
+        bool left = false;
+        while (n)
+        {
+            p = n;
+            left = kv.first < n->kv.first;
+            n = left ? n->left : n->right;
+        }
+        Node *x = new Node(std::move(kv));
+        x->parent = p;
+        if (!p)
+            root_ = x;
+        else if (left)
+            p->left = x;
+        else
+            p->right = x;
+        ++size_;
         rebalance(p);
         return x;
     }
@@ -335,6 +368,26 @@ class __titer
     bool operator==(const __titer &o) const { return n_ == o.n_; }
     bool operator!=(const __titer &o) const { return n_ != o.n_; }
     __tnode<K, V> *n_;
+    const __tree<K, V> *t_;
+};
+
+// in reverse: base_ is the node after the current one (null: the end)
+template <typename K, typename V>
+class __rtiter
+{
+  public:
+    __rtiter(__tnode<K, V> *base, const __tree<K, V> *t) : base_(base), t_(t) {}
+    __tnode<K, V> *__cur() const { return base_ ? __tree<K, V>::prev(base_) : t_->last(); }
+    pair<K, V> &operator*() const { return __cur()->kv; }
+    pair<K, V> *operator->() const { return &__cur()->kv; }
+    __rtiter &operator++()
+    {
+        base_ = __cur();
+        return *this;
+    }
+    bool operator==(const __rtiter &o) const { return base_ == o.base_; }
+    bool operator!=(const __rtiter &o) const { return base_ != o.base_; }
+    __tnode<K, V> *base_;
     const __tree<K, V> *t_;
 };
 
