@@ -63,6 +63,53 @@ move_iterator<T> make_move_iterator(T *p)
     return move_iterator<T>(p);
 }
 
+// function objects
+template <typename T = void>
+struct less
+{
+    bool operator()(const T &a, const T &b) const { return a < b; }
+};
+template <typename T = void>
+struct greater
+{
+    bool operator()(const T &a, const T &b) const { return b < a; }
+};
+template <typename T = void>
+struct less_equal
+{
+    bool operator()(const T &a, const T &b) const { return !(b < a); }
+};
+template <typename T = void>
+struct greater_equal
+{
+    bool operator()(const T &a, const T &b) const { return !(a < b); }
+};
+template <typename T = void>
+struct equal_to
+{
+    bool operator()(const T &a, const T &b) const { return a == b; }
+};
+template <typename T = void>
+struct not_equal_to
+{
+    bool operator()(const T &a, const T &b) const { return !(a == b); }
+};
+template <typename T = void>
+struct plus
+{
+    T operator()(const T &a, const T &b) const { return a + b; }
+};
+template <typename T = void>
+struct minus
+{
+    T operator()(const T &a, const T &b) const { return a - b; }
+};
+template <typename T = void>
+struct multiplies
+{
+    T operator()(const T &a, const T &b) const { return a * b; }
+};
+
 template <typename T>
 void swap(T &a, T &b)
 {

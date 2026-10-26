@@ -2,42 +2,12 @@
 // storage; elements are built and destroyed in place (__native_construct /
 // __native_destroy, compiler builtins), so T needs no default constructor.
 #pragma once
+#include <string>
 #include <utility>
 #include <initializer_list>
 
 namespace std
 {
-
-// a reverse iterator over contiguous elements: p_ is one past the current one
-template <typename T>
-class __rptr
-{
-  public:
-    __rptr() : p_(nullptr) {}
-    explicit __rptr(T *p) : p_(p) {}
-    T &operator*() const { return *(p_ - 1); }
-    T *operator->() const { return p_ - 1; }
-    __rptr &operator++()
-    {
-        --p_;
-        return *this;
-    }
-    __rptr operator++(int)
-    {
-        __rptr old = *this;
-        --p_;
-        return old;
-    }
-    __rptr &operator--()
-    {
-        ++p_;
-        return *this;
-    }
-    bool operator==(const __rptr &o) const { return p_ == o.p_; }
-    bool operator!=(const __rptr &o) const { return p_ != o.p_; }
-    T *base() const { return p_; }
-    T *p_;
-};
 
 template <typename T>
 class vector
@@ -64,11 +34,11 @@ class vector
         for (const T &v : items)
             __native_construct(data_ + size_++, v);
     }
-    vector(const T *first, const T *last) : data_(nullptr), size_(0), cap_(0)
+    template <typename __InputIt>
+    vector(__InputIt first, __InputIt last) : data_(nullptr), size_(0), cap_(0)
     {
-        reserve((size_t)(last - first));
-        for (const T *p = first; p != last; ++p)
-            __native_construct(data_ + size_++, *p);
+        for (; first != last; ++first)
+            this->emplace_back(*first);
     }
     vector(const vector &o) : data_(nullptr), size_(0), cap_(0)
     {
@@ -148,6 +118,22 @@ class vector
         data_ = d;
         cap_ = n;
     }
+    void resize(size_t n, const T &v)
+    {
+        if (n > cap_)
+            reserve(n);
+        while (size_ > n)
+            __native_destroy(data_ + --size_);
+        while (size_ < n)
+            __native_construct(data_ + size_++, v);
+    }
+    void shrink_to_fit() {}
+    size_t max_size() const { return 0x7FFFFFFFFFFFFFFFULL / sizeof(T); }
+    const T *cbegin() const { return data_; }
+    const T *cend() const { return data_ + size_; }
+    const T *data() const { return data_; }
+    const T &at(size_t i) const { return data_[i]; }
+    const T &front() const { return data_[0]; }
     void resize(size_t n)
     {
         if (n > cap_)
@@ -205,6 +191,18 @@ class vector
         return data_ + i;
     }
 
+    T *insert(T *pos, size_t n, const T &v)
+    {
+        size_t i = (size_t)(pos - data_);
+        vector tmp(n, v);
+        return insert(data_ + i, tmp.data_, tmp.data_ + n);
+    }
+    T *insert(T *pos, initializer_list<T> items)
+    {
+        size_t i = (size_t)(pos - data_);
+        vector tmp(items);
+        return insert(data_ + i, tmp.data_, tmp.data_ + tmp.size_);
+    }
     T *insert(T *pos, T &&v)
     {
         size_t i = (size_t)(pos - data_);
@@ -233,8 +231,8 @@ class vector
         return data_ + i;
     }
     // any other iterators (move iterators, other containers')
-    template <typename It>
-    T *insert(T *pos, It first, It last)
+    template <typename __InputIt>
+    T *insert(T *pos, __InputIt first, __InputIt last)
     {
         size_t i = (size_t)(pos - data_);
         vector tmp;
@@ -292,6 +290,13 @@ class vector
         o.data_ = d;
         o.size_ = s;
         o.cap_ = c;
+    }
+    template <typename __InputIt>
+    void assign(__InputIt first, __InputIt last)
+    {
+        clear();
+        for (; first != last; ++first)
+            this->emplace_back(*first);
     }
     void assign(size_t n, const T &v)
     {

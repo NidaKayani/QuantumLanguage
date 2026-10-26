@@ -20,6 +20,17 @@ class stringstream : public __stream
         pos_ = buf_.size();
         return r;
     }
+    long long __tell(bool put) override { return put ? (long long)buf_.size() : (long long)pos_; }
+    bool __seek(bool put, long long off, int dir) override
+    {
+        if (put)
+            return false;
+        long long base = dir == beg ? 0 : dir == cur ? (long long)pos_ : (long long)buf_.size();
+        if (base + off < 0 || base + off > (long long)buf_.size())
+            return false;
+        pos_ = (size_t)(base + off);
+        return true;
+    }
     string str() const { return buf_; }
     void str(const string &s)
     {

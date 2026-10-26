@@ -44,8 +44,8 @@ class unordered_set
         for (const K &k : items)
             m_[k] = 0;
     }
-    template <typename It>
-    unordered_set(It first, It last)
+    template <typename __InputIt>
+    unordered_set(__InputIt first, __InputIt last)
     {
         for (; first != last; ++first)
             m_[*first] = 0;
@@ -64,8 +64,8 @@ class unordered_set
         pair<__hiter<K, char>, bool> r = m_.insert(pair<K, char>(k, 0));
         return pair<iterator, bool>(iterator(r.first.n_), r.second);
     }
-    template <typename It>
-    void insert(It first, It last)
+    template <typename __InputIt>
+    void insert(__InputIt first, __InputIt last)
     {
         for (; first != last; ++first)
             m_[*first] = 0;

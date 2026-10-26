@@ -92,6 +92,9 @@ class Asm
     void load(int r, int disp);  // r = [rbp+disp]
     void store(int disp, int r); // [rbp+disp] = r
     void lea(int r, int disp);   // r = rbp+disp
+    // the code ends with lea rax, [rbp+disp]: drop it (to address the slot directly)
+    bool takeLeaRax(int &disp);
+    void loadRbp(int r, int disp, int size, bool isSigned); // r = [rbp+disp], extended
     void loadInd(int r, int addr);  // r = [addr]
     void storeInd(int addr, int r); // [addr] = r
     void leaData(int r, int dataOff); // r = address of the data section's byte dataOff
@@ -132,6 +135,9 @@ class Asm
     void callReg(int r); // call r
     void jmpReg(int r);  // jmp r
     void leaLabel(int r, int label);              // r = the address of a code label
+    // a jump table: tableJump(t) goes to entry rax of the tableEntry() list bound at t
+    void tableJump(int table);
+    void tableEntry(int label);
     void loadDisp(int r, int base, int disp8);    // r = [base+disp8]
     void leave();
     void ret();
@@ -140,6 +146,7 @@ class Asm
     void rex(bool w, int reg, int rm);
     void modrmRbp(int reg, int disp);
     std::vector<int> labels_; // offset, -1 until bound
+    int leaStart_ = 0, leaEnd_ = -1, leaDisp_ = 0; // the last lea rax, [rbp+disp]
     struct Fixup
     {
         int pos;

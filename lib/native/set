@@ -24,8 +24,8 @@ class set
     }
     set(const set &o) { t_.copyFrom(o.t_); }
     set(set &&o) { t_.takeFrom(o.t_); }
-    template <typename It>
-    set(It first, It last)
+    template <typename __InputIt>
+    set(__InputIt first, __InputIt last)
     {
         for (; first != last; ++first)
             insert(*first);
@@ -65,8 +65,8 @@ class set
         __tnode<K, char> *n = t_.insert(pair<K, char>(k, 0), added);
         return pair<iterator, bool>(iterator(n, &t_), added);
     }
-    template <typename It>
-    void insert(It first, It last)
+    template <typename __InputIt>
+    void insert(__InputIt first, __InputIt last)
     {
         for (; first != last; ++first)
             insert(*first);
@@ -87,6 +87,13 @@ class set
         return iterator(next, &t_);
     }
     void clear() { t_.clear(); }
+    void swap(set &o) { t_.swap(o.t_); }
+    iterator erase(iterator first, iterator last)
+    {
+        while (first != last)
+            first = erase(first);
+        return last;
+    }
     bool operator==(const set &o) const
     {
         if (size() != o.size())

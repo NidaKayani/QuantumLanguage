@@ -151,10 +151,13 @@ private:
     // ordinary name in a program that never says fs::path
     std::set<std::string> qualTypes_;
 
+    int nsDepth_ = 0; // namespaces open around the declaration being parsed
     void addType(const std::string &n, int file)
     {
+        // a library type in a namespace (std::filesystem::path) is a type only
+        // where written qualified; one at global scope (windows.h's DWORD) everywhere
         bool lib = file >= 0 && file < (int)files_.size() && files_[file].rfind("<lib>/", 0) == 0;
-        (lib ? qualTypes_ : types_).insert(n);
+        (lib && nsDepth_ > 0 ? qualTypes_ : types_).insert(n);
     }
     bool qualifiedType(const std::string &n) const { return types_.count(n) || qualTypes_.count(n); }
     // an unqualified name written at `tok`: library types count inside the library's own headers
@@ -614,11 +617,13 @@ public:
             size_t save = p_;
             try
             {
+                bool pointer = false;
                 if (isAt(1, "*"))
                 {
                     expect("(");
                     expect("*");
                     expect(")");
+                    pointer = true;
                 }
                 auto fn = std::make_shared<TypeName>();
                 fn->isFunction = true;
@@ -630,6 +635,8 @@ public:
                     ++p_;
                 accept("noexcept");
                 parsePtrOps(*fn);
+                if (pointer)
+                    ++fn->pointers; // R(*)(Args): a pointer to the function type
                 return fn;
             }
             catch (ParseFail &)
@@ -835,11 +842,13 @@ public:
                 return {};
             }
             expect("{");
+            ++nsDepth_;
             while (!is("}") && !at(TK::End))
             {
                 auto ds = parseDecl(false, "");
                 d->decls.insert(d->decls.end(), ds.begin(), ds.end());
             }
+            --nsDepth_;
             expect("}");
             return {d};
         }
@@ -2567,6 +2576,11 @@ public:
         case TK::String:
         {
             auto e = mk(EK::Str, line);
+            {
+                const std::string &sp = t_[p_].text;
+                if (!sp.empty() && (sp[0] == 'u' || sp[0] == 'U' || sp[0] == 'L') && sp.size() > 1 && sp[1] == '"')
+                    e->op = sp.substr(0, 1); // u"..": char16_t, U"..": char32_t, L"..": wchar_t
+            }
             while (at(TK::String))
                 e->str += t_[p_++].value; // adjacent literals concatenate
             if (at(TK::Ident) && cur().text == "s" && !cur().spaceBefore)
