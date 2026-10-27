@@ -482,7 +482,7 @@ Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp`
 ### Building without a C++ compiler
 
 ```bat
-build-quantum.bat            :: build\selfhost\{qrun,quantum,quantum_stub,qpm}.exe
+build-quantum.bat            :: build\{qrun,quantum,quantum_stub,qpm}.exe
 build-quantum.bat --verify   :: and check the new qrun rebuilds itself byte for byte
 build-quantum.bat --seed     :: and make the new qrun the seed
 ```

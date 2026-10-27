@@ -4,13 +4,13 @@ rem CMake, no MSYS2. seed\qrun.exe (qrun compiled to x86-64 by Quantum's own
 rem native backend) compiles qrun from src\; that compiler compiles itself
 rem again, and the result builds quantum.exe, quantum_stub.exe and qpm.exe.
 rem
-rem   build-quantum.bat            build\selfhost\{qrun,quantum,quantum_stub,qpm}.exe
+rem   build-quantum.bat            build\{qrun,quantum,quantum_stub,qpm}.exe
 rem   build-quantum.bat --verify   also check the fixed point: the new qrun
 rem                                rebuilds itself byte for byte
 rem   build-quantum.bat --seed     then make the new qrun the seed
 setlocal
 cd /d "%~dp0"
-set OUT=build\selfhost
+set OUT=build
 set SH=src\tools\selfhost
 rem the library headers come from inside the compiler, never from disk
 set QUANTUM_NATIVE_LIB=
