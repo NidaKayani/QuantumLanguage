@@ -65,3 +65,7 @@ CLAUDE.md
 /test_copy.txt
 /test_output.txt
 /test_output.txt.backup.*
+
+!seed/*
+!seed/qrun.exe
+!seed/quantum.exe
