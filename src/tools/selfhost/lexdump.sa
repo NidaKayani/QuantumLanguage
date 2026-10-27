@@ -1,0 +1,71 @@
+// quantum: cpp
+// The bootstrap C++ lexer, compiled by Quantum's own C/C++ front-end:
+//   qrun src/tools/selfhost/lexdump.cpp <file>
+// prints the same token dump as `qrun --dump-tokens <file>` (cli/SelfHost.cpp).
+#include "../../include/Error.h.sa"
+#include "../../include/Lexer.h.sa"
+#include "../../Token.sa"
+#include "../../lexer/LexerCore.sa"
+#include "../../lexer/LexerReaders.sa"
+#include "../../lexer/LexerTokenize.sa"
+
+#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+static std::string escaped(const std::string &s)
+{
+    std::string out;
+    for (unsigned char c : s)
+    {
+        if (c == '\\')
+            out += "\\\\";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\t')
+            out += "\\t";
+        else if (c == '\r')
+            out += "\\r";
+        else if (c < 32 || c == 127)
+        {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\x%02X", c);
+            out += buf;
+        }
+        else
+            out += (char)c;
+    }
+    return out;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        std::cerr << "usage: lexdump.cpp <file>\n";
+        return 1;
+    }
+    std::ifstream in(argv[1]);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open file: " << argv[1] << "\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    try
+    {
+        Lexer lexer(ss.str());
+        for (const Token &t : lexer.tokenize())
+            std::cout << static_cast<int>(t.type) << "\t" << t.line << "\t" << t.col << "\t" << escaped(t.value)
+                      << "\n";
+    }
+    catch (const QuantumError &e)
+    {
+        std::cout << "ERROR\t" << e.kind << ": " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}

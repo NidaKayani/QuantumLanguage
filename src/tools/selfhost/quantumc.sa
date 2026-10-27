@@ -1,0 +1,143 @@
+// quantum: cpp
+// The whole bootstrap compiler (dialect passes, module resolution, the C/C++
+// and Java front-ends, lexer, parser, bytecode compiler, serializer),
+// compiled by Quantum's own C/C++ front-end:
+//   qrun src/tools/selfhost/quantumc.cpp <file> <out.qbc>
+// writes the same bytes as `qrun --emit-qbc <file> <out.qbc>`.
+#include "../../include/AstDump.h.sa"
+#include "../../include/Dialect.h.sa"
+#include "../../include/Error.h.sa"
+#include "../../include/Parser.h.sa"
+#include "../../include/Pipeline.h.sa"
+#include "../../include/Serializer.h.sa"
+
+#include "../../Token.sa"
+#include "../../lexer/LexerCore.sa"
+#include "../../lexer/LexerReaders.sa"
+#include "../../lexer/LexerTokenize.sa"
+#include "../../parser/ParserCore.sa"
+#include "../../parser/ParserExpressions.sa"
+#include "../../parser/ParserLiterals.sa"
+#include "../../parser/ParserStatements.sa"
+#include "../../compiler/CompilerCore.sa"
+#include "../../compiler/CompilerExpressions.sa"
+#include "../../compiler/CompilerFunctions.sa"
+#include "../../compiler/CompilerStatements.sa"
+#include "../../Serializer.sa"
+#include "../../cli/AstDump.sa"
+#include "../../Value.sa"
+#include "../../Disassembler.sa"
+#include "../../Diagnostics.sa"
+#include "../../TypeChecker.sa"
+#include "../../ModuleResolver.sa"
+#include "../../Pipeline.sa"
+#include "../../qpm/QpmJson.sa"
+#include "../../qpm/QpmManifest.sa"
+#include "../../qpm/QpmSemver.sa"
+#include "../../dialect/Dialect.sa"
+#include "../../dialect/DialectScan.sa"
+#include "../../dialect/CDialect.sa"
+#include "../../dialect/CppDialect.sa"
+#include "../../dialect/RubyDialect.sa"
+#include "../../dialect/RubyStdlib.sa"
+#include "../../cpp/CppLex.sa"
+#include "../../cpp/CppParse.sa"
+#include "../../cpp/CppLower.sa"
+#include "../../cpp/CppExpr.sa"
+#include "../../cpp/CppLib.sa"
+#include "../../java/JavaLex.sa"
+#include "../../java/JavaParse.sa"
+#include "../../java/JavaEnter.sa"
+#include "../../java/JavaTypes.sa"
+#include "../../java/JavaExpr.sa"
+#include "../../java/JavaStmt.sa"
+#include "../../java/JavaCall.sa"
+#include "../../java/JavaLib.sa"
+#include "../../java/JavaEmit.sa"
+#include "../../java/JavaMain.sa"
+#include "../../java/JavaNumberFormat.sa"
+#include "../../native/X64.sa"
+#include "../../native/Pe.sa"
+#include "../../native/Codegen.sa"
+#include "../../generated/CppLibData.sa"
+#include "../../generated/JavaPreludeData.sa"
+#include "../../generated/NativeLibData.sa"
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+// Value.cpp / Vm.h refer to these VM functions, which compiling never calls.
+std::string jsDisplayString(const std::shared_ptr<Dict> &, bool &handled)
+{
+    handled = false;
+    return "";
+}
+QuantumValue VM::javaCallFunctional(const QuantumValue &, const std::string &, const std::vector<QuantumValue> &)
+{
+    return QuantumValue();
+}
+
+#ifndef QUANTUMC_NO_MAIN // (quantum.sa includes this file for the compiler and has its own main)
+// As cli/SelfHost.cpp's emitBytecodeFile; `--dump-cpp-ast <file>` as its dumpCppAst.
+int main(int argc, char **argv)
+{
+    if (argc < 3)
+    {
+        std::cerr << "usage: quantumc.sa <file> <out.qbc> | --dump-cpp-ast <file> | --native <file> <out.exe>\n";
+        return 1;
+    }
+    if (std::string(argv[1]) == "--native" && argc >= 4)
+        return nativeCompileFile(argv[2], argv[3]);
+    if (std::string(argv[1]) == "--dump-cpp-ast")
+    {
+        std::ifstream src(argv[2], std::ios::binary);
+        std::ostringstream text;
+        text << src.rdbuf();
+        try
+        {
+            ASTNodePtr program = cpp::compileProgram(argv[2], text.str());
+            dumpAstTree(std::cout, program.get());
+            return 0;
+        }
+        catch (const cpp::Unsupported &u)
+        {
+            std::cout << "UNSUPPORTED\t" << u.what() << " (line " << u.line << ")\n";
+            return 1;
+        }
+        catch (const std::exception &e)
+        {
+            std::cout << "ERROR\t" << e.what() << "\n";
+            return 1;
+        }
+    }
+    const std::string path = argv[1];
+    std::ifstream in(path);
+    if (!in)
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return 1;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    try
+    {
+        auto chunk = compileSource(applyDialect(ss.str(), path), path, false);
+        std::vector<uint8_t> bytes = Serializer::serialize(chunk);
+        std::ofstream out(argv[2], std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        return out ? 0 : 1;
+    }
+    catch (const ParseError &e)
+    {
+        std::cerr << path << ":" << e.line << ": ParseError: " << e.what() << "\n";
+        return 1;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Error] " << e.what() << "\n";
+        return 1;
+    }
+}
+#endif

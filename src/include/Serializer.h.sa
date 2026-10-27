@@ -1,0 +1,34 @@
+// quantum: cpp
+#pragma once
+
+#include "Vm.h.sa"
+#include <vector>
+#include <string>
+#include <cstdint>
+
+class Serializer {
+public:
+    static std::vector<uint8_t> serialize(std::shared_ptr<Chunk> chunk);
+    static std::shared_ptr<Chunk> deserialize(const std::vector<uint8_t>& data);
+
+private:
+    static void writeChunk(std::vector<uint8_t>& out, std::shared_ptr<Chunk> chunk);
+    static std::shared_ptr<Chunk> readChunk(const std::vector<uint8_t>& data, size_t& offset);
+
+    static void writeValue(std::vector<uint8_t>& out, const QuantumValue& val);
+    static QuantumValue readValue(const std::vector<uint8_t>& data, size_t& offset);
+
+    static void writeString(std::vector<uint8_t>& out, const std::string& s);
+    static std::string readString(const std::vector<uint8_t>& data, size_t& offset);
+
+    // Fixed-width little-endian fields, written byte by byte (no type
+    // punning, so the same code runs compiled by Quantum's front-end).
+    static void writeU8(std::vector<uint8_t>& out, uint32_t v);
+    static void writeU32(std::vector<uint8_t>& out, uint32_t v);
+    static void writeU64(std::vector<uint8_t>& out, uint64_t v);
+    static void writeF64(std::vector<uint8_t>& out, double d);
+    static uint32_t readU8(const std::vector<uint8_t>& data, size_t& offset);
+    static uint32_t readU32(const std::vector<uint8_t>& data, size_t& offset);
+    static uint64_t readU64(const std::vector<uint8_t>& data, size_t& offset);
+    static double readF64(const std::vector<uint8_t>& data, size_t& offset);
+};

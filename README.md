@@ -9,9 +9,9 @@
  ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 ```
 
-**A multi-paradigm scripting language with a bytecode compiler and VM — written in C++17**
+**A multi-paradigm scripting language with a bytecode compiler and VM — written in Quantum itself**
 
-[![Language](https://img.shields.io/badge/language-C%2B%2B17-blue?style=flat-square&logo=cplusplus)](https://isocpp.org/)
+[![Language](https://img.shields.io/badge/language-Quantum-blue?style=flat-square)](#the-compiler-is-written-in-quantum)
 [![Version](https://img.shields.io/badge/version-2.0.0-brightgreen?style=flat-square)](https://github.com/SENODROOM/Quantum-Language)
 [![Extension](https://img.shields.io/badge/scripts-.sa-orange?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-MIT-purple?style=flat-square)](LICENSE)
@@ -23,7 +23,7 @@
 
 ## What is Quantum?
 
-Quantum is a dynamically typed, multi-paradigm scripting language that compiles `.sa` source files to bytecode and runs them on a custom register-stack VM. It accepts **Python-style**, **JavaScript-style**, and **C/C++-style** syntax — all valid in the same file.
+Quantum is a dynamically typed, multi-paradigm scripting language that compiles `.sa` source files to bytecode and runs them on a custom register-stack VM. It accepts **Python-style**, **JavaScript-style**, and **C-style** syntax — all valid in the same file.
 
 The build produces **three binaries** with distinct roles:
 
@@ -118,7 +118,7 @@ Key instruction categories:
 
 The VM (`src/vm/`) is a stack-based bytecode interpreter built around a `CallFrame` stack. Each frame holds a `Closure` (the compiled chunk + captured upvalues), an instruction pointer, and a stack base offset for locals.
 
-```cpp
+```
 struct CallFrame {
     std::shared_ptr<Closure> closure;
     size_t ip;         // instruction pointer into closure->chunk->code
@@ -143,7 +143,7 @@ Pointers (`&var`, `*ptr`, `ptr->member`) are first-class values backed by `share
 
 ### Serializer
 
-`src/Serializer.cpp` converts a `Chunk` tree to a flat binary payload and back. It walks the chunk recursively — opcodes, operands, line info, and constants (including nested sub-chunks for functions) — writing everything to a `vector<uint8_t>`. This is the payload appended to `quantum_stub.exe` to create `hello.exe`.
+`src/Serializer.sa` converts a `Chunk` tree to a flat binary payload and back. It walks the chunk recursively — opcodes, operands, line info, and constants (including nested sub-chunks for functions) — writing everything to a `vector<uint8_t>`. This is the payload appended to `quantum_stub.exe` to create `hello.exe`.
 
 The trailer format is:
 
@@ -475,53 +475,21 @@ Runs every `.sa` file in the directory, prints `PASS` / `FAIL` per file with err
 
 ## Build
 
-### Prerequisites
+### The compiler is written in Quantum
 
-| Tool                    | Minimum version                       |
-| ----------------------- | ------------------------------------- |
-| C++ compiler            | C++17 — MSVC 2019+, GCC 9+, Clang 10+ |
-| CMake                   | 3.16+                                 |
-| MinGW / MSYS2 (Windows) | ucrt64 or mingw64 toolchain           |
+Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp` is written in Quantum's C-style syntax; `X.h.sa` declares and `X.sa` defines. Quantum compiles these itself: `qrun src/tools/selfhost/quantumc.sa <file> <out.qbc>` is the whole compiler, compiled by Quantum and running on the Quantum VM. Fed its own source, it reproduces itself byte for byte (`src/tools/bootstrap.sh`).
 
-### Windows
-
-**Full clean build:**
+### Building
 
 ```bat
-build.bat
+build-quantum.bat            :: build\{qrun,quantum,quantum_stub,qpm}.exe
+build-quantum.bat --verify   :: and check the new qrun rebuilds itself byte for byte
+build-quantum.bat --seed     :: and make the new qrun the seed
 ```
 
-**Incremental build** (only recompiles changed files):
+No external compiler or toolchain is involved, only Windows' `cmd`. `seed\qrun.exe` is qrun compiled to x86-64 machine code by Quantum's own native backend (`src/native/`). It compiles `src\` (`--native src\tools\selfhost\qrun_all.sa`) into a new qrun, which compiles itself again; that one builds `quantum.exe`, `quantum_stub.exe` and `qpm.exe`. Every tool, the VM included, is native code Quantum generated: there is no outside compiler, assembler or linker anywhere in the chain, and the C runtime functions used are Windows' own (`ucrtbase.dll`). A qrun build takes about 30 seconds.
 
-```bat
-build-fast.bat
-```
-
-Both scripts configure CMake with MinGW Makefiles, build in Release mode, and copy all three binaries to the project root:
-
-```
-quantum.exe        ← compiler + bundler
-qrun.exe           ← direct interpreter
-quantum_stub.exe   ← standalone runtime template
-```
-
-### Linux / macOS
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build .
-```
-
-On non-MSVC targets, CMake passes `-static -static-libgcc -static-libstdc++` so produced executables have no external runtime dependencies.
-
-### CMake targets
-
-| Target         | Compile define            | Behaviour                                                 |
-| -------------- | ------------------------- | --------------------------------------------------------- |
-| `quantum`      | `QUANTUM_MODE_COMPILER=1` | compile + bundle + launch                                 |
-| `qrun`         | `QRUN_MODE=1`             | interpret directly, no bundling                           |
-| `quantum_stub` | _(none)_                  | bare VM — loads embedded bytecode from its own PE trailer |
+The build is a fixed point: the qrun built by the seed and the qrun built by itself are byte-identical (`bash src/tools/native_bootstrap.sh` checks this). Any edit under `src\`, the VM runtime included, takes effect through this build; `--seed` then makes it the new seed.
 
 ---
 
@@ -529,47 +497,23 @@ On non-MSVC targets, CMake passes `-static -static-libgcc -static-libstdc++` so 
 
 ```
 Quantum-Language/
-├── src/
-│   ├── main.cpp                  # Entry point — mode dispatch, REPL, bundler, test runner
-│   ├── lexer/
-│   │   ├── LexerCore.cpp
-│   │   ├── LexerReaders.cpp      # readNumber, readString, readIdentifier
-│   │   └── LexerTokenize.cpp
-│   ├── parser/
-│   │   ├── ParserCore.cpp
-│   │   ├── ParserStatements.cpp
-│   │   ├── ParserExpressions.cpp # Pratt precedence climbing
-│   │   └── ParserLiterals.cpp
-│   ├── compiler/
-│   │   ├── CompilerCore.cpp
-│   │   ├── CompilerStatements.cpp
-│   │   ├── CompilerExpressions.cpp
-│   │   └── CompilerFunctions.cpp # closure + upvalue compilation
-│   ├── vm/
-│   │   ├── VmCore.cpp
-│   │   ├── VmRun.cpp             # main dispatch loop
-│   │   ├── VmNatives.cpp         # all built-in function registrations
-│   │   ├── VmArrayMethods.cpp
-│   │   ├── VmDictMethods.cpp
-│   │   └── VmStringMethods.cpp
-│   ├── Serializer.cpp            # Chunk ↔ binary payload
-│   ├── Disassembler.cpp          # bytecode pretty-printer
-│   ├── TypeChecker.cpp           # static type warnings
-│   ├── Token.cpp
-│   └── Value.cpp
-├── include/
-│   ├── AST.h                     # variant-based AST node definitions
-│   ├── Compiler.h
-│   ├── Disassembler.h
-│   ├── Error.h                   # ParseError, RuntimeError, TypeError, …
-│   ├── Lexer.h
-│   ├── Opcode.h                  # Op enum + Instruction + Chunk
-│   ├── Parser.h
-│   ├── Serializer.h
-│   ├── Token.h
-│   ├── TypeChecker.h
-│   ├── Value.h                   # QuantumValue variant + all heap types
-│   └── Vm.h                      # VM, CallFrame, Closure, ExceptionHandler
+├── src/                          # The compiler's source — Quantum
+│   ├── main.sa                   # Entry point — mode dispatch, REPL, bundler, test runner
+│   ├── include/                  # Declarations (X.h.sa): AST, Token, Value, Vm, Opcode, ...
+│   ├── lexer/  parser/           # Lexer and Pratt parser
+│   ├── compiler/                 # AST → bytecode (closures, upvalues)
+│   ├── vm/                       # Bytecode VM, natives, dialect runtimes
+│   ├── cpp/                      # Typed C-family front-end
+│   ├── java/                     # Java front-end (+ prelude/*.jpl standard library)
+│   ├── dialect/                  # Python / JS / Ruby / C dialect passes
+│   ├── cli/                      # CLI, bundler, test runner, self-host hooks
+│   ├── qpm/                      # qpm package manager
+│   ├── Serializer.sa  Disassembler.sa  TypeChecker.sa  Pipeline.sa  ...
+│   ├── lexer.sa  parser*.sa  ast.sa   # an independent port in Quantum's own syntax
+│   └── tools/
+│       ├── selfhost/quantumc.sa  # the whole compiler as one program (self-compile driver)
+│       ├── bootstrap.sh          # fixed point: q1 == q2 == q3
+│       └── compare_selfhost.sh   # self-hosted output check on every example
 ├── examples/                     # Runnable .sa programs
 │   ├── hello.sa
 │   ├── features.sa               # Full feature showcase
@@ -591,9 +535,8 @@ Quantum-Language/
 │   ├── SETUP.md                  # Installation guide
 │   ├── CONTRIBUTING.md
 │   └── SECURITY.md
-├── CMakeLists.txt
-├── build.bat                     # Full clean rebuild
-├── build-fast.bat                # Incremental rebuild
+├── seed/qrun.exe                 # The seed compiler that starts the self-hosted build
+├── build-quantum.bat             # Builds every tool with Quantum itself
 ├── quantum.bat                   # Launcher wrapper (locates quantum.exe)
 └── qrun.bat                      # Launcher wrapper (locates qrun.exe)
 ```
@@ -614,7 +557,7 @@ Quantum-Language/
 
 <div align="center">
 
-**Built in C++17 · Bytecode VM edition**
+**Built in Quantum · Self-hosted · Bytecode VM edition**
 
 [⭐ Star this repo](https://github.com/SENODROOM/Quantum-Language) · [🐛 Report a bug](https://github.com/SENODROOM/Quantum-Language/issues)
 

@@ -1,0 +1,158 @@
+// quantum: cpp
+#pragma once
+// x86-64 machine code: the instructions the native backend (src/native/)
+// emits, labels with rel32 fix-ups, and RIP-relative references to imported
+// functions (their IAT slots, placed by the PE writer).
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace native
+{
+
+enum Reg
+{
+    RAX = 0,
+    RCX = 1,
+    RDX = 2,
+    RBX = 3,
+    RSP = 4,
+    RBP = 5,
+    RSI = 6,
+    RDI = 7,
+    R8 = 8,
+    R9 = 9,
+};
+
+// Condition codes (the low nibble of Jcc / SETcc).
+enum Cond
+{
+    CC_B = 0x2,  // below (unsigned <)
+    CC_AE = 0x3, // above or equal
+    CC_E = 0x4,
+    CC_NE = 0x5,
+    CC_BE = 0x6,
+    CC_A = 0x7,
+    CC_L = 0xC, // less (signed <)
+    CC_GE = 0xD,
+    CC_LE = 0xE,
+    CC_G = 0xF,
+};
+
+class Asm
+{
+  public:
+    std::string code; // the machine code bytes
+
+    // Imported functions referenced through `call [rip+disp32]`: the offset
+    // of each disp32 and the import it names (index into the import list).
+    struct ImportRef
+    {
+        int pos;
+        int import;
+    };
+    std::vector<ImportRef> importRefs;
+    // References into the data section through `lea r, [rip+disp32]`: the
+    // offset of each disp32 and the data offset it points at.
+    struct DataRef
+    {
+        int pos;
+        int dataOff;
+    };
+    std::vector<DataRef> dataRefs;
+
+    int size() const { return (int)code.size(); }
+    void byte(int b);
+    void dword(int32_t v);
+    void qword(int64_t v);
+    void patch32(int pos, int32_t v);
+
+    // Labels: a label is bound to a code offset; jumps to it are patched once
+    // every label is bound (resolve()).
+    int newLabel();
+    void bind(int label);
+    void resolve();
+    int labelPos(int label) const { return labels_[label]; }
+
+    // A point to come back to: code emitted after mark() is dropped by
+    // rewind() (generating an expression only to learn its type).
+    struct Mark
+    {
+        int code, fixups, imports, data;
+    };
+    Mark mark() const;
+    void rewind(const Mark &m);
+
+    // Instructions (64-bit operands)
+    void push(int r);
+    void pop(int r);
+    void movRR(int dst, int src);
+    void movImm(int r, int64_t v);
+    void load(int r, int disp);  // r = [rbp+disp]
+    void store(int disp, int r); // [rbp+disp] = r
+    void lea(int r, int disp);   // r = rbp+disp
+    // the code ends with lea rax, [rbp+disp]: drop it (to address the slot directly)
+    bool takeLeaRax(int &disp);
+    void loadRbp(int r, int disp, int size, bool isSigned); // r = [rbp+disp], extended
+    void loadInd(int r, int addr);  // r = [addr]
+    void storeInd(int addr, int r); // [addr] = r
+    void leaData(int r, int dataOff); // r = address of the data section's byte dataOff
+    // rax = the `size`-byte value at [rcx], sign- or zero-extended
+    void loadRcx(int size, bool isSigned);
+    // the low `size` bytes of rax to [rcx]
+    void storeRcx(int size);
+    void addImm(int r, int32_t v);
+    void imulImm(int r, int32_t v); // r = r * v
+    void alu(int opcode, int dst, int src); // add/sub/and/or/xor/cmp dst, src (the /r opcode)
+    void imul(int dst, int src);
+    void cqo();
+    void idiv(int r);
+    void div(int r);
+    void neg(int r);
+    void notr(int r);
+    void shiftCl(int ext, int r); // ext: 4 shl, 5 shr, 7 sar
+    void test(int a, int b);
+    void setcc(int cc);            // al = cc, then rax = zero-extended al
+    void movsxd(int r);            // r = sign-extend low 32 bits
+    void movzx32(int r);           // r = zero-extend low 32 bits
+    void movsx8(int r);            // r = sign-extend low 8 bits
+    void movzx8(int r);            // r = zero-extend low 8 bits
+    void movsx16(int r);           // r = sign-extend low 16 bits
+    void movzx16(int r);           // r = zero-extend low 16 bits
+    // SSE: `prefix` 0F `op` with xmm/general registers in the ModRM fields
+    // (prefix 0 = none; w = REX.W for a 64-bit general register operand)
+    void sse(int prefix, int op, int reg, int rm, bool w = false);
+    void toXmm(int x, int r, bool is64);   // movq/movd xmm, r
+    void fromXmm(int r, int x, bool is64); // movq/movd r, xmm
+    void subRsp(int n);
+    void addRsp(int n);
+    void storeRsp(int disp, int r); // [rsp+disp] = r
+    void jmp(int label);
+    void jcc(int cc, int label);
+    void call(int label);
+    void callImport(int import);
+    void callReg(int r); // call r
+    void jmpReg(int r);  // jmp r
+    void leaLabel(int r, int label);              // r = the address of a code label
+    // a jump table: tableJump(t) goes to entry rax of the tableEntry() list bound at t
+    void tableJump(int table);
+    void tableEntry(int label);
+    void loadDisp(int r, int base, int disp8);    // r = [base+disp8]
+    void leave();
+    void ret();
+
+  private:
+    void rex(bool w, int reg, int rm);
+    void modrmRbp(int reg, int disp);
+    std::vector<int> labels_; // offset, -1 until bound
+    int leaStart_ = 0, leaEnd_ = -1, leaDisp_ = 0; // the last lea rax, [rbp+disp]
+    struct Fixup
+    {
+        int pos;
+        int label;
+    };
+    std::vector<Fixup> fixups_;
+};
+
+} // namespace native

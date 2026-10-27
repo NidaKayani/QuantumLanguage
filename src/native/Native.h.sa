@@ -1,0 +1,31 @@
+// quantum: cpp
+#pragma once
+// The native backend: a C/C++ program (Quantum's C++ syntax) compiled straight
+// to an x86-64 Windows executable — no assembler, linker or C++ compiler.
+//
+//   X64.sa      machine code encoder
+//   Pe.sa       PE32+ image writer (imports from system DLLs only)
+//   Codegen.sa  the typed C++ AST (src/cpp/) to machine code
+//
+// The subset grows milestone by milestone (see src/README.md); anything
+// outside it is reported as cpp::Unsupported, with the line.
+
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace native
+{
+
+// The .exe bytes for the program at `path` (whose text is `source`).
+std::string compileExe(const std::string &path, const std::string &source);
+
+// The headers of the native standard library (lib/native/*, embedded by
+// src/tools/embed.sa into src/generated/NativeLibData.sa).
+const std::vector<std::pair<std::string, std::string>> &libraryHeaders();
+
+} // namespace native
+
+// --native <file> <out.exe>: writes the executable; prints why when the
+// program is outside the native subset.
+int nativeCompileFile(const std::string &path, const std::string &outPath);

@@ -1,0 +1,222 @@
+// quantum: cpp
+// Natives behind the C/C++ front-end's library headers (lib/cpp/*): the
+// __q_* functions those headers declare. Each is a thin call into the host
+// library, so <filesystem> behaves exactly like the g++ build's.
+#include "Vm.h.sa"
+#include "Cli.h.sa"
+#include "Error.h.sa"
+#include "Pipeline.h.sa"
+#include "Serializer.h.sa"
+
+#include <filesystem>
+#include <iostream>
+#include <regex>
+#include <string>
+#include <system_error>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+using QV = QuantumValue;
+
+QV arg(const std::vector<QV> &a, size_t i) { return i < a.size() ? a[i] : QV(); }
+std::string str(const QV &v) { return v.isString() ? v.asString() : v.toString(); }
+double num(const QV &v) { return v.isLong() ? (double)v.asLong() : v.isNumber() ? v.asNumber() : 0.0; }
+fs::path p(const QV &v) { return fs::u8path(str(v)); }
+QV S(const fs::path &x) { return QV(x.string()); }
+
+// <regex>: patterns compiled once, referred to by index
+std::vector<std::regex> &regexes()
+{
+    static std::vector<std::regex> all;
+    return all;
+}
+} // namespace
+
+void VM::registerCppLibNatives()
+{
+    auto reg = [this](const std::string &name, QuantumNativeFunc fn)
+    {
+        auto n = std::make_shared<QuantumNative>();
+        n->name = name;
+        n->fn = std::move(fn);
+        globals->define(name, QuantumValue(n));
+    };
+
+    // ── Quantum itself, compiled by Quantum (src/tools/selfhost/quantum.sa) ──
+    // the running executable's path
+    reg("__q_self_exe", [](std::vector<QV>) -> QV { return QV(getExecutablePath()); });
+    // runs serialized bytecode (a string of its bytes) in a fresh VM with
+    // `args` as its command line; the exit status
+    reg("__q_run_qbc", [](std::vector<QV> a) -> QV
+        {
+        const std::string bytes = str(arg(a, 0));
+        std::vector<std::string> argv;
+        if (arg(a, 1).isArray())
+            for (const QV &x : *arg(a, 1).asArray())
+                argv.push_back(str(x));
+        std::vector<std::string> saved = g_scriptArgv;
+        g_scriptArgv = argv;
+        int status = 0;
+        try
+        {
+            auto chunk = Serializer::deserialize(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+            VM vm;
+            vm.run(chunk);
+        }
+        catch (const QuantumError &e)
+        {
+            std::cerr << "\n  X " << e.kind;
+            if (e.line > 0)
+                std::cerr << " at line " << e.line;
+            std::cerr << "\n    " << e.what() << "\n\n";
+            status = 1;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[Fatal] " << e.what() << "\n";
+            status = 1;
+        }
+        g_scriptArgv = saved;
+        return QV((double)status); });
+
+    // ── <filesystem> ──
+    // path decomposition: op is parent, filename, stem, extension, root,
+    // normal, generic, absolute? ("1"/"0")
+    reg("__q_fs_part", [](std::vector<QV> a) -> QV
+        {
+        const std::string op = str(arg(a, 0));
+        const fs::path x = p(arg(a, 1));
+        if (op == "parent") return S(x.parent_path());
+        if (op == "filename") return S(x.filename());
+        if (op == "stem") return S(x.stem());
+        if (op == "extension") return S(x.extension());
+        if (op == "root") return S(x.root_path());
+        if (op == "normal") return S(x.lexically_normal());
+        if (op == "generic") return QV(x.generic_string());
+        if (op == "absolute?") return QV(std::string(x.is_absolute() ? "1" : "0"));
+        return QV(std::string()); });
+    reg("__q_fs_join", [](std::vector<QV> a) -> QV { return S(p(arg(a, 0)) / p(arg(a, 1))); });
+    reg("__q_fs_replace_ext", [](std::vector<QV> a) -> QV
+        { return S(p(arg(a, 0)).replace_extension(p(arg(a, 1)))); });
+    reg("__q_fs_relative_lex", [](std::vector<QV> a) -> QV
+        { return S(p(arg(a, 0)).lexically_relative(p(arg(a, 1)))); });
+    // queries touching the file system: absolute, weakly_canonical,
+    // canonical, cwd, empty? ("1"/"0")
+    reg("__q_fs_query", [](std::vector<QV> a) -> QV
+        {
+        const std::string op = str(arg(a, 0));
+        std::error_code ec;
+        if (op == "cwd") return S(fs::current_path(ec));
+        const fs::path x = p(arg(a, 1));
+        if (op == "absolute") return S(fs::absolute(x, ec));
+        if (op == "weakly_canonical")
+        {
+            fs::path r = fs::weakly_canonical(x, ec);
+            return S(ec ? fs::absolute(x, ec) : r);
+        }
+        if (op == "canonical") return S(fs::canonical(x, ec));
+        if (op == "empty?") return QV(std::string(fs::is_empty(x, ec) ? "1" : "0"));
+        return QV(std::string()); });
+    // 0 none, 1 regular file, 2 directory, 3 other
+    reg("__q_fs_kind", [](std::vector<QV> a) -> QV
+        {
+        std::error_code ec;
+        fs::file_status s = fs::status(p(arg(a, 0)), ec);
+        if (ec || !fs::exists(s)) return QV(0.0);
+        if (fs::is_regular_file(s)) return QV(1.0);
+        if (fs::is_directory(s)) return QV(2.0);
+        return QV(3.0); });
+    reg("__q_fs_list", [](std::vector<QV> a) -> QV
+        {
+        auto out = std::make_shared<Array>();
+        std::error_code ec;
+        const fs::path dir = p(arg(a, 0));
+        if (arg(a, 1).isTruthy())
+        {
+            for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+                 !ec && it != end; it.increment(ec))
+                out->push_back(S(it->path()));
+        }
+        else
+            for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+                out->push_back(S(it->path()));
+        return QV(out); });
+    reg("__q_fs_mkdirs", [](std::vector<QV> a) -> QV
+        {
+        std::error_code ec;
+        return QV(fs::create_directories(p(arg(a, 0)), ec)); });
+    reg("__q_fs_remove", [](std::vector<QV> a) -> QV
+        {
+        std::error_code ec;
+        if (arg(a, 1).isTruthy())
+        {
+            auto n = fs::remove_all(p(arg(a, 0)), ec);
+            return QV(ec ? 0.0 : (double)n);
+        }
+        return QV(fs::remove(p(arg(a, 0)), ec) ? 1.0 : 0.0); });
+    reg("__q_fs_copy", [](std::vector<QV> a) -> QV
+        {
+        std::error_code ec;
+        auto opt = arg(a, 2).isTruthy() ? fs::copy_options::overwrite_existing : fs::copy_options::none;
+        return QV(fs::copy_file(p(arg(a, 0)), p(arg(a, 1)), opt, ec)); });
+    reg("__q_fs_mtime", [](std::vector<QV> a) -> QV
+        {
+        std::error_code ec;
+        auto t = fs::last_write_time(p(arg(a, 0)), ec);
+        return QV(ec ? 0.0 : (double)t.time_since_epoch().count()); });
+
+    // ── <regex> ──
+    // flags: 1 icase, 2 multiline, 4 nosubs; the handle, or -1 for a bad pattern
+    reg("__q_re_compile", [](std::vector<QV> a) -> QV
+        {
+        const int f = (int)num(arg(a, 1));
+        auto syntax = std::regex::ECMAScript;
+        if (f & 1) syntax |= std::regex::icase;
+        if (f & 2) syntax |= std::regex::multiline;
+        if (f & 4) syntax |= std::regex::nosubs;
+        try
+        {
+            regexes().emplace_back(str(arg(a, 0)), syntax);
+        }
+        catch (const std::regex_error &)
+        {
+            return QV(-1.0);
+        }
+        return QV((double)(regexes().size() - 1)); });
+    // mode 0 search from `start`, 1 the whole string, 2 a match at `start`.
+    // [pos0, len0, pos1, len1, ...] in the whole string (-1, 0 for a group
+    // that didn't take part); empty when there is no match.
+    reg("__q_re_exec", [](std::vector<QV> a) -> QV
+        {
+        const std::regex &re = regexes().at((size_t)num(arg(a, 0)));
+        const std::string s = str(arg(a, 1));
+        const size_t start = std::min(s.size(), (size_t)num(arg(a, 2)));
+        const int mode = (int)num(arg(a, 3));
+        std::smatch m;
+        bool ok;
+        if (mode == 1)
+            ok = std::regex_match(s, m, re);
+        else
+        {
+            auto fl = start > 0 ? std::regex_constants::match_prev_avail : std::regex_constants::match_default;
+            if (mode == 2)
+                fl |= std::regex_constants::match_continuous;
+            ok = std::regex_search(s.cbegin() + start, s.cend(), m, re, fl);
+        }
+        auto out = std::make_shared<Array>();
+        if (ok)
+            for (size_t i = 0; i < m.size(); ++i)
+            {
+                out->push_back(QV(m[i].matched ? (double)(m[i].first - s.cbegin()) : -1.0));
+                out->push_back(QV(m[i].matched ? (double)m[i].length() : 0.0));
+            }
+        return QV(out); });
+    reg("__q_re_replace", [](std::vector<QV> a) -> QV
+        {
+        const std::regex &re = regexes().at((size_t)num(arg(a, 0)));
+        auto fl = arg(a, 3).isTruthy() ? std::regex_constants::format_first_only : std::regex_constants::format_default;
+        return QV(std::regex_replace(str(arg(a, 1)), re, str(arg(a, 2)), fl)); });
+}

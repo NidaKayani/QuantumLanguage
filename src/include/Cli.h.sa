@@ -1,0 +1,89 @@
+// quantum: cpp
+#pragma once
+// Command-line surface: the file-running entry points, the REPL, the batch
+// test runner, and the standalone-.exe bundler.
+
+#include "Opcode.h.sa"
+#include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
+
+class ParseError;
+
+// ─── Console output ───────────────────────────────────────────────────────
+void printBanner();
+void printAura();
+void printHelp(const char *prog);
+
+// ─── Global flags ─────────────────────────────────────────────────────────
+// --stage-marker: once the program has compiled, write kStageMarker to stderr
+// before it starts running, so a caller capturing the output (the execution
+// API) can tell a compile error from a runtime one. Diagnostics printed before
+// the marker are compile output; everything after it comes from the program.
+extern bool g_stageMarker;
+inline const char *kStageMarker = "\x1e[quantum:compiled]\x1e\n";
+
+// Removes the global flags (--strict, --stage-marker) that precede the
+// command or file in argv, setting g_strictMode / g_stageMarker. Arguments
+// after the source file belong to the program and are left alone.
+std::vector<char *> takeGlobalFlags(int argc, char *argv[]);
+
+// ─── Running a single file ────────────────────────────────────────────────
+// Interpret in place (no .exe produced). Exits non-zero on error.
+void runFile(const std::string &path, bool debug = false);
+// Parse + type-check only. Returns a process exit code.
+int checkFile(const std::string &path);
+
+// Prints a ParseError with the code it points at. `written` is the file as
+// written, `compiled` the text after applyDialect(): when the dialect passes
+// renumbered lines (a C++ program assembled from its #includes), the line is
+// reported where it sits in `written`, or flagged as coming from an include.
+void printParseError(std::ostream &os, const std::string &path, const std::string &written,
+                     const std::string &compiled, const ParseError &e);
+
+// ─── REPL ─────────────────────────────────────────────────────────────────
+void runREPL(bool debug = false);
+
+// ─── Batch test runner (--test) ───────────────────────────────────────────
+// Runs every supported source file under `dir`, crash-guarded per file, and
+// writes test_results.txt. Returns a process exit code (non-zero if any FAIL).
+int runTestExamples(const std::string &dir);
+
+// Runs exactly one file in THIS process for the batch runner (hidden
+// `--__runone` verb). The parent `--test` runner spawns a fresh child per
+// file so a hard crash (stack overflow / segfault) can only take down the
+// child, never the whole suite. On a handled error it prints a structured
+// marker line to stdout and returns 2; a clean run returns 0.
+int runSingleFileForTest(const std::string &path);
+
+// ─── Self-hosting support (src/, the Quantum-written compiler) ─────────────────────────────────────
+// --dump-tokens: the C++ lexer's tokens, one per line (type, line, col, value).
+int dumpTokens(const std::string &path);
+// --dump-ast: the C++ parser's tree, one node per line (src/tools/astdump.sa).
+int dumpAst(const std::string &path);
+// --emit-qbc: compiles a program and writes its serialized bytecode.
+int emitBytecodeFile(const std::string &path, const std::string &outPath);
+// --emit-qbc-core: the same through lexer, parser and compiler only (no
+// dialect pass or module resolution), as src/tools/selfhost/qbc.cpp does.
+int emitCoreBytecodeFile(const std::string &path, const std::string &outPath);
+// --dis-qbc: disassembles a serialized bytecode file (to diff two compilers' output).
+int disassembleBytecodeFile(const std::string &path);
+// --dump-cpp-ast: the tree the typed C/C++ front-end lowers a program to.
+int dumpCppAst(const std::string &path);
+// --exec: runs a serialized bytecode file (args after it go to sys.argv).
+int execBytecodeFile(const std::string &path);
+
+// ─── Standalone .exe bundling ─────────────────────────────────────────────
+// Path of the currently running executable.
+std::string getExecutablePath();
+// Reads bytecode appended to an .exe by the bundler, or nullptr if absent.
+std::shared_ptr<Chunk> loadEmbeddedBytecode(const std::string &exePath);
+// Compiles `path`, copies quantum_stub.exe, appends the bytecode payload,
+// then runs the result with `runArgs`. Returns a process exit code.
+int bundleAndRun(const std::string &path, const std::string &exePath,
+                 const std::vector<std::string> &runArgs = {});
+
+// Runs `qpm <args...>` (the qpm next to this executable, else on PATH) on
+// this console — `quantum build` is `qpm build`. Returns its exit code.
+int runQpm(const std::vector<std::string> &args, const std::string &exePath);

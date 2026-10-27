@@ -13,20 +13,38 @@ else()
     add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# The compiler's own source is Quantum, in src/: files whose first line is
+# `// quantum: cpp` are Quantum in C++ syntax (X.h.sa declares, X.sa defines).
+# Until Quantum builds its own binaries, g++ compiles those same files as C++.
+include_directories(${CMAKE_SOURCE_DIR}/src/include)
 
 # ── Collect sources ────────────────────────────────────────────────────────────
-file(GLOB_RECURSE QUANTUM_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
-list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*main_vm\\.cpp$")
+file(GLOB_RECURSE ALL_SA CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.sa")
+set(CPP_SA)
+foreach(f ${ALL_SA})
+    if(f MATCHES "/src/tools/" OR f MATCHES "[.]h[.]sa$")
+        continue()
+    endif()
+    file(STRINGS "${f}" first LIMIT_COUNT 1)
+    if(first MATCHES "^// quantum: cpp")
+        list(APPEND CPP_SA "${f}")
+    endif()
+endforeach()
+set_source_files_properties(${CPP_SA} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xc++")
+
+set(QUANTUM_SOURCES ${CPP_SA})
 # qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
-# built from src/qpm/ separately — keep it out of the other 3 targets' sources.
-list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*\\.cpp$")
+# built from src/qpm/ separately — keep it out of the other 3 targets' sources...
+list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*[.]sa$")
 # ...except its self-contained manifest readers: `# @use` package resolution
-# (src/ModuleResolver.cpp) reads package.qon / package.json / requirements.txt.
+# (src/ModuleResolver.sa) reads package.qon / package.json / requirements.txt.
 list(APPEND QUANTUM_SOURCES
-    "${CMAKE_SOURCE_DIR}/src/qpm/QpmJson.cpp"
-    "${CMAKE_SOURCE_DIR}/src/qpm/QpmManifest.cpp"
-    "${CMAKE_SOURCE_DIR}/src/qpm/QpmSemver.cpp")
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmJson.sa"
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmManifest.sa"
+    "${CMAKE_SOURCE_DIR}/src/qpm/QpmSemver.sa")
+
+# The Java prelude and the library headers (lib/cpp, lib/native) are carried as
+# source: src/generated/*.sa, written by src/tools/embed.sa (picked up above).
 
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})
@@ -49,7 +67,8 @@ if(WIN32)
 endif()
 
 # ── qpm  — standalone npm-compatible package manager ──────────────────────────
-file(GLOB QPM_SOURCES CONFIGURE_DEPENDS "src/qpm/*.cpp")
+set(QPM_SOURCES ${CPP_SA})
+list(FILTER QPM_SOURCES INCLUDE REGEX ".*/src/qpm/.*[.]sa$")
 add_executable(qpm ${QPM_SOURCES})
 if(WIN32)
     # z: zlib (statically linked via the -static link flag above, same as the

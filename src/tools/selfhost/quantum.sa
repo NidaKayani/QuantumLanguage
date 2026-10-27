@@ -1,0 +1,184 @@
+// quantum: cpp
+// quantum.exe as Quantum builds it, with no C++ compiler: this program (the
+// whole compiler, src/) compiled by Quantum, bundled with the Quantum VM.
+//
+//   quantum <file> [args...]           compile and run a program
+//   quantum --emit-qbc <file> <out>    write its bytecode
+//   quantum --bundle <file> <out.exe>  a standalone executable of it
+//   quantum --native <file> <out.exe>  native x86-64 code (src/native/)
+//   quantum --build-self <out.exe> [src/tools/selfhost/quantum.sa]
+//                                      rebuild this compiler from src/
+//
+// The VM underneath is the one this executable carries (the seed, seed/);
+// everything else is the bytecode compiled from src/.
+#define QUANTUMC_NO_MAIN
+#include "quantumc.sa"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// VM natives (src/vm/VmCppLib.sa)
+std::string __q_self_exe();
+int __q_run_qbc(const std::string &bytes, const std::vector<std::string> &args);
+
+namespace
+{
+
+const char *const kTrailerMagic = "QNTM_VM!";
+
+// binary: the bytes as they are; text: CRLF line ends read as LF, as the
+// compiler expects its sources
+bool readFile(const std::string &path, std::string &out, bool binary)
+{
+    std::ifstream in(path, binary ? std::ios::binary : std::ios::in);
+    if (!in)
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+// The bytecode of the program at `path`, as a string of its bytes
+bool compileFile(const std::string &path, std::string &bytes)
+{
+    std::string source;
+    if (!readFile(path, source, false))
+    {
+        std::cerr << "[Error] Cannot open file: " << path << "\n";
+        return false;
+    }
+    try
+    {
+        auto chunk = compileSource(applyDialect(source, path), path, false);
+        std::vector<uint8_t> b = Serializer::serialize(chunk);
+        bytes.assign(b.begin(), b.end());
+        return true;
+    }
+    catch (const ParseError &e)
+    {
+        std::cerr << path << ":" << e.line << ": ParseError: " << e.what() << "\n";
+    }
+    catch (const CompileError &e)
+    {
+        std::cerr << e.what();
+    }
+    catch (const QuantumError &e)
+    {
+        std::cerr << path << ":" << e.line << ": " << e.kind << ": " << e.what() << "\n";
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[Error] " << e.what() << "\n";
+    }
+    return false;
+}
+
+// This executable without its embedded bytecode: the bare VM
+bool runtimeImage(std::string &image)
+{
+    if (!readFile(__q_self_exe(), image, true))
+    {
+        std::cerr << "[Error] Cannot read the running executable\n";
+        return false;
+    }
+    size_t n = image.size();
+    if (n >= 12 && image.compare(n - 8, 8, kTrailerMagic) == 0)
+    {
+        uint32_t size = 0;
+        for (int i = 3; i >= 0; --i)
+            size = size * 256 + (unsigned char)image[n - 12 + i];
+        if ((size_t)size + 12 <= n)
+            image.resize(n - 12 - size);
+    }
+    return true;
+}
+
+// The VM with `bytes` appended: [payload] [size: uint32 LE] ["QNTM_VM!"]
+bool writeBundle(const std::string &bytes, const std::string &outPath)
+{
+    std::string image;
+    if (!runtimeImage(image))
+        return false;
+    image += bytes;
+    uint32_t size = (uint32_t)bytes.size();
+    for (int i = 0; i < 4; ++i)
+        image.push_back((char)((size >> (8 * i)) & 255));
+    image += kTrailerMagic;
+    std::filesystem::path dir = std::filesystem::path(outPath).parent_path();
+    if (!dir.empty())
+        std::filesystem::create_directories(dir);
+    std::ofstream out(outPath, std::ios::binary);
+    out << image;
+    if (!out)
+    {
+        std::cerr << "[Error] Cannot write " << outPath << "\n";
+        return false;
+    }
+    return true;
+}
+
+int usage()
+{
+    std::cerr << "usage: quantum <file> [args...]\n"
+                 "       quantum --emit-qbc <file> <out.qbc>\n"
+                 "       quantum --bundle <file> <out.exe>\n"
+                 "       quantum --native <file> <out.exe>\n"
+                 "       quantum --build-self <out.exe> [src/tools/selfhost/quantum.sa]\n";
+    return 1;
+}
+
+} // namespace
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+        return usage();
+    const std::string cmd = argv[1];
+    if (cmd == "--version")
+    {
+        std::cout << "Quantum (self-hosted: compiled by Quantum, no C++ compiler)\n";
+        return 0;
+    }
+    if (cmd == "--emit-qbc" && argc >= 4)
+    {
+        std::string bytes;
+        if (!compileFile(argv[2], bytes))
+            return 1;
+        std::ofstream out(argv[3], std::ios::binary);
+        out << bytes;
+        return out ? 0 : 1;
+    }
+    if (cmd == "--bundle" && argc >= 4)
+    {
+        std::string bytes;
+        return compileFile(argv[2], bytes) && writeBundle(bytes, argv[3]) ? 0 : 1;
+    }
+    if (cmd == "--native" && argc >= 4)
+        return nativeCompileFile(argv[2], argv[3]);
+    if (cmd == "--build-self" && argc >= 3)
+    {
+        std::string driver = argc >= 4 ? argv[3] : "src/tools/selfhost/quantum.sa";
+        std::string bytes;
+        if (!compileFile(driver, bytes))
+            return 1;
+        if (!writeBundle(bytes, argv[2]))
+            return 1;
+        std::cout << "built " << argv[2] << " from " << driver << " (" << bytes.size() << " bytes of bytecode)\n";
+        return 0;
+    }
+    if (cmd.size() > 1 && cmd[0] == '-' && cmd[1] == '-')
+        return usage();
+    // run a program: compiled here, executed by the VM
+    std::string bytes;
+    if (!compileFile(cmd, bytes))
+        return 1;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i)
+        args.push_back(argv[i]);
+    return __q_run_qbc(bytes, args);
+}

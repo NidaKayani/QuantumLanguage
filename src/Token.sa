@@ -1,0 +1,9 @@
+// quantum: cpp
+#include "include/Token.h.sa"
+#include <sstream>
+
+std::string Token::toString() const {
+    std::ostringstream oss;
+    oss << "[" << line << ":" << col << " " << value << "]";
+    return oss.str();
+}
